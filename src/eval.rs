@@ -107,6 +107,7 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     "chain" => { trace!("→ special: chain"); return eval_chain(args, env, funcs); }
                     "case" => { trace!("→ special: case"); return eval_case(args, env, funcs); }
                     "foldall" => { trace!("→ special: foldall"); return eval_foldall(args, env, funcs); }
+                    "|->" => { trace!("→ special: lambda"); return eval_lambda(args); }
                     _ => {}
                 }
             }
@@ -196,7 +197,7 @@ fn call_function(
         FunctionKind::UserDefined { clauses } => {
             let mut streams: Vec<NDet> = Vec::new();
             for clause in clauses {
-                match try_match_clause(&clause.patterns, &arg_vals, env)? {
+                match try_match_clause(&clause.patterns, &arg_vals, env, funcs)? {
                     Some(new_env) => {
                         trace!("clause matched, body eval");
                         streams.push(eval(&clause.body, &new_env, funcs)?);
@@ -237,6 +238,7 @@ fn try_match_clause(
     patterns: &[Expr],
     args: &[Atom],
     env: &Env,
+    funcs: &FnTable,
 ) -> Result<Option<Env>, String> {
     if patterns.len() != args.len() {
         return Ok(None);
@@ -246,7 +248,7 @@ fn try_match_clause(
     // outer $N=30 should match $N=29, not fail).
     let mut match_env = Env::new();
     for (pat, arg) in patterns.iter().zip(args.iter()) {
-        match try_match_one(pat, arg, &match_env)? {
+        match try_match_one(pat, arg, &match_env, funcs)? {
             Some(new_env) => match_env = new_env,
             None => return Ok(None),
         }
@@ -278,11 +280,11 @@ fn collect_env_bindings(env: &Env) -> Vec<(String, Atom)> {
 /// - `Num(n)`: matches only `Atom::Num(n)`.
 /// - `Sym(s)`: matches only `Atom::Sym(t)` where `s == t`.
 /// - `List(items)`: structural match — recursively matches each element
-///   against the corresponding element in `Atom::Expr(elems)`.
 fn try_match_one(
     pattern: &Expr,
     atom: &Atom,
     env: &Env,
+    funcs: &FnTable,
 ) -> Result<Option<Env>, String> {
     match pattern {
         Expr::Symbol(s) if s.starts_with('$') => {
@@ -294,10 +296,14 @@ fn try_match_one(
         }
         Expr::Number(n) => match atom {
             Atom::Num(m) if n == m => Ok(Some(env.clone())),
+            // Free variable from term conversion: bind to the literal number.
+            Atom::Sym(s) if s.starts_with('$') => Ok(Some(env.extend(s, Atom::Num(*n)))),
             _ => Ok(None),
         },
         Expr::Symbol(s) => match atom {
             Atom::Sym(t) if s == t => Ok(Some(env.clone())),
+            // Free variable from term conversion: bind to the literal symbol.
+            Atom::Sym(v) if v.starts_with('$') => Ok(Some(env.extend(v, Atom::Sym(s.clone())))),
             _ => Ok(None),
         },
         Expr::List(items) => match atom {
@@ -307,12 +313,24 @@ fn try_match_one(
                 }
                 let mut current = env.clone();
                 for (pat, arg) in items.iter().zip(elems.iter()) {
-                    match try_match_one(pat, arg, &current)? {
+                    match try_match_one(pat, arg, &current, funcs)? {
                         Some(new_env) => current = new_env,
                         None => return Ok(None),
                     }
                 }
                 Ok(Some(current))
+            }
+            // Free variable: evaluate the List pattern as code (computation
+            // in pattern, e.g. `(if (== $x 2) 43 44)`) and bind the result.
+            Atom::Sym(s) if s.starts_with('$') => {
+                let expr = Expr::List(items.clone());
+                match eval(&expr, env, funcs) {
+                    Ok(mut results) => match results.next() {
+                        Some(val) => Ok(Some(env.extend(s, val))),
+                        None => Ok(None),
+                    },
+                    Err(_) => Ok(None),
+                }
             }
             _ => Ok(None),
         },
@@ -396,6 +414,17 @@ fn eval_progn(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String>
     }
     last.ok_or_else(|| "progn: internal — no forms after empty check".into())
 }
+/// Check whether an `Expr` contains any `$`-variables that are not bound
+/// in `env`. When true, the expression must be treated as a data term
+/// rather than evaluated — the free variables will be bound through
+/// pattern matching.
+fn has_free_vars(expr: &Expr, env: &Env) -> bool {
+    match expr {
+        Expr::Symbol(s) if s.starts_with('$') => env.get(s).is_none(),
+        Expr::List(items) => items.iter().any(|e| has_free_vars(e, env)),
+        _ => false,
+    }
+}
 
 /// Evaluate `(let pattern value body)` — nondeterministic pattern matching bind.
 ///
@@ -418,12 +447,19 @@ fn eval_let(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
         ));
     }
     let pattern = &args[0];
-    let values: Vec<Atom> = eval(&args[1], env, funcs)?.collect();
+    // If the value expression has free variables, treat it as a data term
+    // so pattern matching can bind them (PeTTa semantics).
+    let values: Vec<Atom> = if has_free_vars(&args[1], env) {
+        let term = expr_to_atom(&args[1]);
+        vec![term]
+    } else {
+        eval(&args[1], env, funcs)?.collect()
+    };
     let streams: Vec<NDet> = values
         .into_iter()
         .filter_map(|v| {
             // Fresh match env prevents outer variable capture
-            let match_env = try_match_one(pattern, &v, &Env::new()).ok()??;
+            let match_env = try_match_one(pattern, &v, &Env::new(), funcs).ok()??;
             let pairs = collect_env_bindings(&match_env);
             let new_env = env.extend_all(&pairs);
             // REASON: body eval failure in nondet stream is skipped,
@@ -460,12 +496,18 @@ fn eval_let_star(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
         match pair {
             Expr::List(p) if p.len() == 2 => {
                 let pattern = &p[0];
-                let mut val_results = eval(&p[1], &current_env, funcs)?;
-                let val = val_results.next().ok_or_else(|| {
-                    format!("let*: binding {} produced no value", pattern.to_string())
-                })?;
+                // If value has free variables, treat as data term so pattern
+                // matching can bind them against current env.
+                let val = if has_free_vars(&p[1], &current_env) {
+                    expr_to_atom(&p[1])
+                } else {
+                    let mut val_results = eval(&p[1], &current_env, funcs)?;
+                    val_results.next().ok_or_else(|| {
+                        format!("let*: binding {} produced no value", pattern.to_string())
+                    })?
+                };
                 // Fresh match env prevents outer variable capture
-                let match_env = try_match_one(pattern, &val, &Env::new())?
+                let match_env = try_match_one(pattern, &val, &Env::new(), funcs)?
                     .ok_or_else(|| {
                         format!("let*: pattern does not match value: {} vs {}",
                             pattern.to_string(), val.to_sexpr_string())
@@ -486,6 +528,16 @@ fn eval_quote(args: &[Expr]) -> Result<NDet, String> {
         return Err(format!("quote: expected 1 arg, got {}", args.len()));
     }
     let atom = expr_to_atom(&args[0]);
+    Ok(NDet::single(atom))
+}
+/// Evaluate `(|-> params body)` — lambda expression.
+///
+/// Returns the lambda form as a quoted data atom without evaluating its body.
+/// PeTTa reference: `|->` creates anonymous functions; the body is not
+/// evaluated at definition time but stored as data for later application.
+fn eval_lambda(args: &[Expr]) -> Result<NDet, String> {
+    let lambda_expr = Expr::List(args.to_vec());
+    let atom = expr_to_atom(&lambda_expr);
     Ok(NDet::single(atom))
 }
 
@@ -666,7 +718,7 @@ fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<V
                 let mut matched = true;
                 let mut match_env = Env::new();
                 for (pat, arg_val) in clause.patterns.iter().zip(concrete_args.iter()) {
-                    match try_match_one(pat, arg_val, &match_env)? {
+                    match try_match_one(pat, arg_val, &match_env, funcs)? {
                         Some(new_env) => match_env = new_env,
                         None => { matched = false; break; }
                     }
@@ -798,7 +850,7 @@ fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> 
         }
 
         // Try pattern match with fresh env
-        if let Some(match_env) = try_match_one(pattern, &val, &Env::new())? {
+        if let Some(match_env) = try_match_one(pattern, &val, &Env::new(), funcs)? {
             let pairs = collect_env_bindings(&match_env);
             let new_env = env.extend_all(&pairs);
             return eval(body, &new_env, funcs);
