@@ -246,16 +246,32 @@ fn test_let_shadowing() {
 }
 
 #[test]
-fn test_let_not_var_error() {
-    let mut funcs = FnTable::new();
-    register_builtins(&mut funcs);
-    let forms = parse_forms("!(let (+ 1 2) 10 (+ 3 4))").unwrap();
-    let expr = match forms.into_iter().next().unwrap() {
-        TopForm::Runnable(e) => e,
-        _ => panic!("expected runnable"),
-    };
-    let result = eval(&expr, &Env::new(), &funcs);
-    assert!(result.is_err());
+fn test_let_pattern_no_match() {
+    // Pattern-matching let: when pattern doesn't match value, produces empty stream
+    let mut rt = Runtime::new();
+    // (let 42 99 'ok) — pattern 42 vs value 99 → no match → empty
+    let code = r#"!(collapse (let 42 99 'ok))"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::expr(vec![])));
+}
+#[test]
+fn test_let_pattern_literal() {
+    let mut rt = Runtime::new();
+    let result = rt.eval_str("!(let 42 42 (quote ok))").unwrap();
+}
+#[test]
+fn test_let_pattern_destructure() {
+    let mut rt = Runtime::new();
+    let code = r#"!(let ($a $b) (superpose ((10 20))) (+ $a $b))"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::Num(30)));
+}
+#[test]
+fn test_let_star_pattern_destructure() {
+    let mut rt = Runtime::new();
+    let code = r#"!(let* ((($x $y) (1 2))) (+ $x $y))"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::Num(3)));
 }
 
 #[test]
@@ -649,6 +665,117 @@ fn test_multi_clause_structured_patterns() {
 (= (fst ($A $B)) $A)
 !(test (fst (1 2)) 1)
 "#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::sym("ok")));
+}
+
+// ========================================================================
+// foldall
+// ========================================================================
+
+#[test]
+fn test_foldall_basic() {
+    // foldall over a multi-clause generator with a named aggregate function
+    let mut rt = Runtime::new();
+    let code = r#"
+(= (f) 2)
+(= (f) 3)
+(= (merge $A $B) (+ $A $B))
+!(test (foldall merge (f) 0) 5)
+"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::sym("ok")));
+}
+
+#[test]
+fn test_foldall_single_value() {
+    let mut rt = Runtime::new();
+    let code = r#"!(foldall + (superpose (42)) 0)"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::Num(42)));
+}
+
+#[test]
+fn test_foldall_empty_generator() {
+    let mut rt = Runtime::new();
+    let code = r#"!(foldall + (superpose ()) 100)"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::Num(100)));
+}
+
+#[test]
+fn test_foldall_error_wrong_args() {
+    let mut rt = Runtime::new();
+    let result = rt.eval_str("!(foldall + (f))");
+    assert!(result.is_err());
+}
+
+// ========================================================================
+// chain
+// ========================================================================
+
+#[test]
+fn test_chain_basic() {
+    let mut rt = Runtime::new();
+    let code = r#"!(test (chain (+ 2 4) $n (* 3 $n)) 18)"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::sym("ok")));
+}
+
+#[test]
+fn test_chain_nested() {
+    let mut rt = Runtime::new();
+    let code = r#"!(test (chain (+ 1 3) $n (chain (* 2 $n) $m (+ $n $m))) 12)"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::sym("ok")));
+}
+
+#[test]
+fn test_chain_single_expr() {
+    let mut rt = Runtime::new();
+    let result = rt.eval_str("!(chain 42)").unwrap();
+    assert_eq!(result, Some(Atom::Num(42)));
+}
+
+#[test]
+fn test_chain_error_even_args() {
+    let mut rt = Runtime::new();
+    let result = rt.eval_str("!(chain 42 $n 99 $m)");
+    assert!(result.is_err());
+}
+
+// ========================================================================
+// case
+// ========================================================================
+
+#[test]
+fn test_case_basic() {
+    let mut rt = Runtime::new();
+    let code = r#"!(case (quote (1 2)) ((($a $b) (+ $a $b))))"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::Num(3)));
+}
+
+#[test]
+fn test_case_catch_all() {
+    let mut rt = Runtime::new();
+    let code = r#"!(case 42 (($else (quote nothing))))"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::sym("nothing")));
+}
+
+#[test]
+fn test_case_no_match_error() {
+    let mut rt = Runtime::new();
+    let code = r#"!(case 99 ((1 a) (2 b)))"#;
+    let result = rt.eval_str(code);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_case_multiple_clauses() {
+    let mut rt = Runtime::new();
+    let code = r#"!(test (case 2 ((1 (quote one)) (2 (quote two)) (3 (quote three)))) two)"#;
     let result = rt.eval_str(code).unwrap();
     assert_eq!(result, Some(Atom::sym("ok")));
 }
