@@ -92,12 +92,12 @@ pub fn atom_to_expr(atom: &Atom) -> Result<Expr, String> {
             }
             Ok(Expr::List(exprs))
         }
-        Atom::Closure { params, body, .. } => {
+        Atom::Closure(c) => {
             // Convert closure back to (|-> params body) form
             let mut items = Vec::with_capacity(3);
             items.push(Expr::Symbol("|->".to_string()));
-            items.push(Expr::List(params.clone()));
-            items.push((**body).clone());
+            items.push(Expr::List(c.params.clone()));
+            items.push(c.body.clone());
             Ok(Expr::List(items))
         }
     }

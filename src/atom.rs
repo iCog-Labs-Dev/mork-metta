@@ -20,6 +20,14 @@
 use crate::env::Env;
 use crate::parser::Expr;
 
+/// Heap-allocated closure fields — boxed so `Atom` stays 32 bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClosureData {
+    pub params: Vec<Expr>,
+    pub body: Expr,
+    pub env: Env,
+}
+
 #[derive(Clone, Debug)]
 pub enum Atom {
     /// A symbolic name: function names, variable names (with $ prefix), data symbols.
@@ -28,15 +36,8 @@ pub enum Atom {
     Num(i64),
     /// An S-expression — ordered list of atoms.
     Expr(Vec<Atom>),
-    /// An anonymous function created by `|->`.
-    Closure {
-        /// Parameter patterns (e.g. `[$x, $y]`).
-        params: Vec<Expr>,
-        /// Body expression.
-        body: Box<Expr>,
-        /// Captured lexical environment at definition site.
-        env: Box<Env>,
-    },
+    /// An anonymous function created by `|->`. Boxed to keep Atom at 32 bytes.
+    Closure(Box<ClosureData>),
 }
 
 impl PartialEq for Atom {
@@ -45,10 +46,7 @@ impl PartialEq for Atom {
             (Atom::Sym(a), Atom::Sym(b)) => a == b,
             (Atom::Num(a), Atom::Num(b)) => a == b,
             (Atom::Expr(a), Atom::Expr(b)) => a == b,
-            (
-                Atom::Closure { params: p1, body: b1, env: e1 },
-                Atom::Closure { params: p2, body: b2, env: e2 },
-            ) => p1 == p2 && b1 == b2 && e1 == e2,
+            (Atom::Closure(a), Atom::Closure(b)) => a == b,
             _ => false,
         }
     }
@@ -67,9 +65,9 @@ impl Atom {
                 let inner: Vec<String> = items.iter().map(|a| a.to_sexpr_string()).collect();
                 format!("({})", inner.join(" "))
             }
-            Atom::Closure { params, body, .. } => {
-                let param_strs: Vec<String> = params.iter().map(|p| p.to_string()).collect();
-                format!("(|-> ({}) {})", param_strs.join(" "), body.to_string())
+            Atom::Closure(c) => {
+                let param_strs: Vec<String> = c.params.iter().map(|p| p.to_string()).collect();
+                format!("(|-> ({}) {})", param_strs.join(" "), c.body.to_string())
             }
         }
     }

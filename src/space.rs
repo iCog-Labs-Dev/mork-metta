@@ -13,25 +13,28 @@ use crate::parser::Expr;
 /// A pattern for matching against atoms in a space.
 ///
 /// Supports:
-/// - `Any` — matches anything, no binding
-/// - `Exact(a)` — matches the exact atom `a`
-/// - `Expr(pats)` — matches an `Atom::Expr` where each element matches recursively
+/// - `Any`       — anonymous wildcard, matches anything, no binding
+/// - `Var(name)` — named wildcard ($x), matches anything, binds name → atom
+/// - `Exact(a)`  — must match atom `a` exactly
+/// - `Expr(pats)`— matches an `Atom::Expr` structurally
 ///
-/// (Variables are not needed here — they're handled at the evaluator level
-/// by converting `$x` symbol atoms into `Any` during query construction.)
+/// Stored atoms that contain `$var` symbols are treated as Prolog-style
+/// unification variables: they match any query pattern and are substituted
+/// with the matched value throughout the returned atom.
 #[derive(Clone, Debug)]
 pub enum Pattern {
     Any,
+    Var(String),
     Exact(Atom),
     Expr(Vec<Pattern>),
 }
 
 impl Pattern {
     /// Construct a pattern from a parsed Expr tree.
-    /// Variables ($-prefixed symbols) become `Any`.
+    /// `$`-prefixed symbols become `Var(name)`; others become `Exact`.
     pub fn from_expr(expr: &Expr) -> Self {
         match expr {
-            Expr::Symbol(s) if s.starts_with('$') => Pattern::Any,
+            Expr::Symbol(s) if s.starts_with('$') => Pattern::Var(s.clone()),
             Expr::Symbol(s) => Pattern::Exact(Atom::Sym(s.clone())),
             Expr::Number(n) => Pattern::Exact(Atom::Num(*n)),
             Expr::List(items) => {
@@ -41,10 +44,12 @@ impl Pattern {
     }
 }
 
-/// A match result: the matched atom plus variable bindings.
+/// A match result: the matched atom (stored vars substituted) plus query bindings.
 #[derive(Clone, Debug)]
 pub struct MatchResult {
+    /// The matched atom with any stored `$var` symbols replaced by their matched values.
     pub atom: Atom,
+    /// Bindings for query `$var` patterns: name → matched (and substituted) atom.
     pub bindings: Vec<(String, Atom)>,
 }
 
@@ -81,6 +86,9 @@ impl LocalSpace {
     pub fn new() -> Self {
         LocalSpace { atoms: Vec::new() }
     }
+    pub fn new_box() -> Box<dyn Space> {
+        Box::new(LocalSpace { atoms: Vec::new() })
+    }
 }
 
 impl Space for LocalSpace {
@@ -96,17 +104,7 @@ impl Space for LocalSpace {
     }
 
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
-        let mut results = Vec::new();
-        for atom in &self.atoms {
-            let mut bindings = Vec::new();
-            if unify(pattern, atom, &mut bindings) {
-                results.push(MatchResult {
-                    atom: atom.clone(),
-                    bindings,
-                });
-            }
-        }
-        results
+        self.atoms.iter().filter_map(|atom| match_one(pattern, atom)).collect()
     }
 
     fn get_atoms(&self) -> Vec<Atom> {
@@ -155,21 +153,7 @@ impl Space for MorkSpace {
     }
 
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
-        // Build a query string: "(<pattern> _1)" where _1 captures the match
-        // We need MORK's Expr type for this. Use the space's parser.
-        // For now, fall back to a simple approach: get all atoms and filter
-        let all = self.get_atoms();
-        let mut results = Vec::new();
-        for atom in &all {
-            let mut bindings = Vec::new();
-            if unify(pattern, atom, &mut bindings) {
-                results.push(MatchResult {
-                    atom: atom.clone(),
-                    bindings,
-                });
-            }
-        }
-        results
+        self.get_atoms().iter().filter_map(|atom| match_one(pattern, atom)).collect()
     }
 
     fn get_atoms(&self) -> Vec<Atom> {
@@ -198,14 +182,66 @@ impl Space for MorkSpace {
 // Pattern matching (shared by LocalSpace and MorkSpace fallback)
 // ========================================================================
 
-/// Recursive pattern matching: does `pattern` match `atom`?
-/// If so, populate `bindings` with variable bindings.
-fn unify(pattern: &Pattern, atom: &Atom, bindings: &mut Vec<(String, Atom)>) -> bool {
+/// Try to match a query `pattern` against a stored `atom`.
+///
+/// Returns `Some(MatchResult)` on success, `None` on mismatch.
+///
+/// Two kinds of binding are collected:
+/// - `query_bindings`: `Var(name)` in the query pattern → matched stored atom.
+/// - `stored_bindings`: `$var` symbols IN the stored atom (Prolog-style unification
+///   variables) → value from the query pattern. These are substituted throughout
+///   the returned atom and query bindings so the caller gets fully ground values.
+fn match_one(pattern: &Pattern, atom: &Atom) -> Option<MatchResult> {
+    let mut query_bindings: Vec<(String, Atom)> = Vec::new();
+    let mut stored_bindings: Vec<(String, Atom)> = Vec::new();
+    if unify(pattern, atom, &mut query_bindings, &mut stored_bindings) {
+        // Apply stored-var substitutions to query bindings so bound $vars in the
+        // matched atom (e.g. $L, $a, $b in a function body) have concrete values.
+        let bindings = query_bindings
+            .into_iter()
+            .map(|(n, v)| (n, substitute_stored(&v, &stored_bindings)))
+            .collect();
+        Some(MatchResult {
+            atom: substitute_stored(atom, &stored_bindings),
+            bindings,
+        })
+    } else {
+        None
+    }
+}
+
+/// Recursive unify: populates `query_bindings` (for Var patterns) and
+/// `stored_bindings` (for $var atoms in the stored side).
+fn unify(
+    pattern: &Pattern,
+    atom: &Atom,
+    query_bindings: &mut Vec<(String, Atom)>,
+    stored_bindings: &mut Vec<(String, Atom)>,
+) -> bool {
+    // Stored atom is a $var (Prolog-style wildcard) — unless the pattern is
+    // Any/Var, bind the stored var to what the pattern specifies.
+    if let Atom::Sym(s) = atom {
+        if s.starts_with('$') && !matches!(pattern, Pattern::Any | Pattern::Var(_)) {
+            let pat_atom = pattern_to_atom(pattern);
+            if let Some((_, bound)) = stored_bindings.iter().find(|(n, _)| n == s) {
+                return bound == &pat_atom;
+            }
+            stored_bindings.push((s.clone(), pat_atom));
+            return true;
+        }
+    }
     match pattern {
         Pattern::Any => true,
-
+        Pattern::Var(name) => {
+            // Non-linear: if already bound, must equal
+            if let Some((_, bound)) = query_bindings.iter().find(|(n, _)| n == name) {
+                bound == atom
+            } else {
+                query_bindings.push((name.clone(), atom.clone()));
+                true
+            }
+        }
         Pattern::Exact(expected) => atoms_equal(expected, atom),
-
         Pattern::Expr(pats) => match atom {
             Atom::Expr(items) => {
                 if pats.len() != items.len() {
@@ -213,14 +249,40 @@ fn unify(pattern: &Pattern, atom: &Atom, bindings: &mut Vec<(String, Atom)>) -> 
                 }
                 pats.iter()
                     .zip(items.iter())
-                    .all(|(p, a)| unify(p, a, bindings))
+                    .all(|(p, a)| unify(p, a, query_bindings, stored_bindings))
             }
             _ => false,
         },
     }
 }
 
-/// Deep equality for atoms.
+/// Substitute stored-var bindings throughout an atom tree.
+fn substitute_stored(atom: &Atom, bindings: &[(String, Atom)]) -> Atom {
+    match atom {
+        Atom::Sym(s) if s.starts_with('$') => bindings
+            .iter()
+            .find(|(name, _)| name == s)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| atom.clone()),
+        Atom::Expr(items) => {
+            Atom::Expr(items.iter().map(|a| substitute_stored(a, bindings)).collect())
+        }
+        _ => atom.clone(),
+    }
+}
+
+/// Convert a query pattern back to an Atom (used when a stored $var must
+/// be bound to a pattern value, e.g. `Pattern::Exact(Num(2))` → `Atom::Num(2)`).
+fn pattern_to_atom(pattern: &Pattern) -> Atom {
+    match pattern {
+        Pattern::Any => Atom::sym("_"),
+        Pattern::Var(name) => Atom::sym(name),
+        Pattern::Exact(a) => a.clone(),
+        Pattern::Expr(pats) => Atom::Expr(pats.iter().map(pattern_to_atom).collect()),
+    }
+}
+
+/// Deep structural equality for atoms.
 fn atoms_equal(a: &Atom, b: &Atom) -> bool {
     match (a, b) {
         (Atom::Sym(a), Atom::Sym(b)) => a == b,
@@ -351,7 +413,7 @@ mod tests {
         match pat {
             Pattern::Expr(ref items) => {
                 assert_eq!(items.len(), 3);
-                assert!(matches!(items[2], Pattern::Any));
+                assert!(matches!(items[2], Pattern::Var(_)));
             }
             _ => panic!("expected Expr pattern"),
         }

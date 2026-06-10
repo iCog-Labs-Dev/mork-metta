@@ -117,6 +117,8 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     "foldall" => { trace!("→ special: foldall"); return eval_foldall(args, env, funcs); }
                     "map-atom" => { trace!("→ special: map-atom"); return eval_map_atom(args, env, funcs); }
                     "|->" => { trace!("→ special: lambda"); return eval_lambda(args, env); }
+                    // empty produces no results (Prolog fail / empty nondeterminism)
+                    "empty" => { trace!("→ special: empty"); return Ok(NDet::stream(std::iter::empty())); }
                     _ => {}
                 }
             }
@@ -148,7 +150,7 @@ fn try_call_or_data(
             // SAFETY: args.len() is the number of parsed function arguments —
             // never exceeds practical limits (<10 in real usage). The cast to
             // u8 is safe because no MeTTa function has >255 args.
-            if funcs.get(s, args.len() as u8).is_some() {
+            if funcs.has(s, args.len() as u8) {
                 return call_function(s, args, env, funcs);
             }
             // Unknown plain symbol → data list (single Expr atom)
@@ -166,13 +168,13 @@ fn try_call_or_data(
     };
     if let Atom::Sym(fname) = &op_val {
         // SAFETY: args.len() is small — see note above.
-        if funcs.get(fname, args.len() as u8).is_some() {
+        if funcs.has(fname, args.len() as u8) {
             return call_function(fname, args, env, funcs);
         }
     }
     // Case 3: closure application — operator evaluated to a Closure.
-    if let Atom::Closure { params, body, env: capture_env } = &op_val {
-        return apply_closure(params, body, capture_env, args, env, funcs);
+    if let Atom::Closure(c) = &op_val {
+        return apply_closure(&c.params, &c.body, &c.env, args, env, funcs);
     }
     // Fallback: data list — collect evaluated elements into one Expr atom.
     trace!("→ fallback: data list");
@@ -202,6 +204,7 @@ fn apply_closure(
         })?;
         arg_vals.push(val);
     }
+    #[cfg(feature = "trace")]
     let arg_strs: Vec<String> = arg_vals.iter().map(|a| a.to_sexpr_string()).collect();
     trace!("closure args: [{}]", arg_strs.join(", "));
     // Match args against params
@@ -211,9 +214,9 @@ fn apply_closure(
             eval(body, &match_env, funcs)
         }
         None => Err(format!(
-            "closure: params do not match args: ({})) vs [{}]",
+            "closure: params do not match args: ({}) vs [{}]",
             params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" "),
-            arg_strs.join(", ")
+            arg_vals.iter().map(|a| a.to_sexpr_string()).collect::<Vec<_>>().join(", ")
         )),
     }
 }
@@ -228,7 +231,9 @@ fn call_function(
 ) -> Result<NDet, String> {
     trace_enter!("call: {} ({} args)", op_name, args.len());
     // SAFETY: args.len() is small (no function has >255 args). See try_call_or_data.
-    let func = funcs.get(op_name, args.len() as u8).ok_or_else(|| {
+    // get_ref returns a Ref<'_, Function> — zero clone, holds a shared borrow.
+    // Multiple concurrent Refs are fine because RefCell allows many immutable borrows.
+    let func = funcs.get_ref(op_name, args.len() as u8).ok_or_else(|| {
         format!("internal: function {} with {} args disappeared from table",
             op_name, args.len())
     })?;
@@ -241,13 +246,31 @@ fn call_function(
         })?;
         arg_vals.push(val);
     }
+    // arg_strs only needed for trace output — gate behind the feature flag so
+    // normal builds pay zero cost (no string allocations on 2.7M fib calls).
+    #[cfg(feature = "trace")]
     let arg_strs: Vec<String> = arg_vals.iter().map(|a| a.to_sexpr_string()).collect();
     trace!("{} args: [{}]", op_name, arg_strs.join(", "));
     let result = match &func.kind {
         FunctionKind::Native { func: f } => f(&arg_vals, funcs),
         FunctionKind::UserDefined { clauses } => {
+            // Fast path: single clause avoids Vec<NDet> + Box allocation
+            if clauses.len() == 1 {
+                return match try_match_clause(&clauses[0].patterns, &arg_vals, env, funcs)? {
+                    Some(new_env) => {
+                        trace!("clause matched, body eval");
+                        eval(&clauses[0].body, &new_env, funcs)
+                    }
+                    None => Err(format!(
+                        "{}: no matching clause for args [{}]",
+                        op_name,
+                        arg_vals.iter().map(|a| a.to_sexpr_string()).collect::<Vec<_>>().join(", ")
+                    )),
+                };
+            }
+            // Multi-clause: collect all matching results into a nondeterministic stream
             let mut streams: Vec<NDet> = Vec::new();
-            for clause in clauses {
+            for clause in clauses.iter() {
                 match try_match_clause(&clause.patterns, &arg_vals, env, funcs)? {
                     Some(new_env) => {
                         trace!("clause matched, body eval");
@@ -262,7 +285,7 @@ fn call_function(
                 return Err(format!(
                     "{}: no matching clause for args [{}]",
                     op_name,
-                    arg_strs.join(", ")
+                    arg_vals.iter().map(|a| a.to_sexpr_string()).collect::<Vec<_>>().join(", ")
                 ));
             }
             Ok(NDet::stream(streams.into_iter().flatten()))
@@ -304,11 +327,27 @@ fn try_match_clause(
             None => return Ok(None),
         }
     }
-    // Extend the calling env with bindings from the match
-    let bindings = collect_env_bindings(&match_env);
-    Ok(Some(env.extend_all(&bindings)))
+    // Splice match_env (built on Empty) onto the calling env without converting
+    // to Vec<(String, Atom)> — avoids Arc<str>→String→Arc<str> round-trips.
+    Ok(Some(prepend_env(match_env, env)))
 }
+
+/// Walk `match_env` (a chain built on top of Env::Empty) and replace the
+/// Empty terminus with `base`, merging the two chains without any String
+/// allocations — Arc<str> name references are reused as-is.
+fn prepend_env(match_env: Env, base: &Env) -> Env {
+    match match_env {
+        Env::Empty => base.clone(),
+        Env::Cons { name, value, next } => Env::Cons {
+            name,
+            value,
+            next: Box::new(prepend_env(*next, base)),
+        },
+    }
+}
+
 /// Collect all bindings from an environment into a Vec.
+/// Used by case/let match sites that need a `Vec<(String, Atom)>`.
 fn collect_env_bindings(env: &Env) -> Vec<(String, Atom)> {
     let mut result = Vec::new();
     let mut current = env;
@@ -593,12 +632,11 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<NDet, String> {
         Expr::List(items) => items.clone(),
         other => vec![other.clone()],
     };
-    let body = Box::new(args[1].clone());
-    let closure = Atom::Closure {
+    let closure = Atom::Closure(Box::new(crate::atom::ClosureData {
         params,
-        body,
-        env: Box::new(env.clone()),
-    };
+        body: args[1].clone(),
+        env: env.clone(),
+    }));
     Ok(NDet::single(closure))
 }
 
@@ -634,9 +672,11 @@ fn eval_add_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
     let _space_ref = space_results.next().ok_or_else(|| {
         "add-atom: space expression produced no results".to_string()
     })?;
-    // Convert the atom expression to an Atom WITHOUT evaluating it,
-    // so that $ variable names (e.g. $N in (= (fib $N) ...)) are preserved.
-    let atom = expr_to_atom(&args[1]);
+    // Convert the atom expression substituting bound $vars from env.
+    // Bound vars (e.g. $body in evalCustom) get their values; unbound vars
+    // (e.g. $N in (= (fib $N) ...)) stay as $-symbols. Matches PeTTa: add-atom
+    // receives the Prolog term where unified variables already hold their values.
+    let atom = subst_and_atomize(&args[1], env);
     funcs.space.borrow_mut().add_atom(&atom).map_err(|e| format!("add-atom: {}", e))?;
     // If the atom is a function definition (= head body), register the function
     if let Atom::Expr(items) = &atom {
@@ -645,7 +685,12 @@ fn eval_add_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
                 atom_to_expr(&items[1]),
                 atom_to_expr(&items[2]),
             ) {
-                let def_expr = Expr::List(vec![head_expr, body_expr]);
+                // compile_definition expects (= head body) — 3 elements.
+                let def_expr = Expr::List(vec![
+                    Expr::Symbol("=".to_string()),
+                    head_expr,
+                    body_expr,
+                ]);
                 if let Ok((name, clause)) = crate::compile::compile_definition(&def_expr) {
                     funcs.add_clause(name, clause.patterns, clause.body);
                 }
@@ -929,6 +974,29 @@ fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<V
         Some(a) => a,
         None => return Err("generator: operator produced no results".into()),
     };
+    // Closure generator: (closure arg...) — bind params to concrete args (if any),
+    // then eval or recurse on the body with the remaining free variables.
+    if let Atom::Closure(c) = &op_atom {
+        let (params, body, capture_env) = (&c.params, &c.body, &c.env);
+        let mut closure_env = capture_env.clone();
+        for (param, arg_expr) in params.iter().zip(items[1..].iter()) {
+            let is_free = matches!(arg_expr, Expr::Symbol(s) if s.starts_with('$') && env.get(s).is_none());
+            if !is_free {
+                if let Ok(mut evaled) = eval(arg_expr, env, funcs) {
+                    if let Some(val) = evaled.next() {
+                        if let Expr::Symbol(pname) = param {
+                            closure_env = closure_env.extend(pname, val);
+                        }
+                    }
+                }
+            }
+        }
+        let body_results: Vec<Atom> = match eval(body, &closure_env, funcs) {
+            Ok(r) => r.collect(),
+            Err(_) => generate_free_var_values(body, &closure_env, funcs)?,
+        };
+        return Ok(body_results);
+    }
     let fname = match &op_atom {
         Atom::Sym(s) => s.clone(),
         _ => return Err(format!(
@@ -1010,8 +1078,50 @@ fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<V
             }
             Ok(results)
         }
-        FunctionKind::Native { .. } => {
-            Err("generator: native functions don't support free variable resolution".into())
+        FunctionKind::Native { func } => {
+            // For each arg, collect all possible values:
+            // concrete args → one value; free-var args → recurse to get many values.
+            // Then call the native with every combination (cartesian product).
+            let native_fn = *func;
+            let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(arity);
+            for arg_expr in &items[1..] {
+                match eval(arg_expr, env, funcs) {
+                    Ok(nd) => {
+                        let vals: Vec<Atom> = nd.collect();
+                        if vals.is_empty() { return Ok(vec![]); }
+                        arg_options.push(vals);
+                    }
+                    Err(_) => {
+                        let vals = generate_free_var_values(arg_expr, env, funcs)?;
+                        if vals.is_empty() { return Ok(vec![]); }
+                        arg_options.push(vals);
+                    }
+                }
+            }
+            // Cartesian product of all arg options
+            let mut combos: Vec<Vec<Atom>> = vec![vec![]];
+            for opts in &arg_options {
+                combos = combos.into_iter().flat_map(|prefix| {
+                    opts.iter().map(move |v| {
+                        let mut p = prefix.clone();
+                        p.push(v.clone());
+                        p
+                    }).collect::<Vec<_>>()
+                }).collect();
+            }
+            let mut results = Vec::new();
+            for combo in combos {
+                if let Ok(mut nd) = native_fn(&combo, funcs) {
+                    while let Some(atom) = nd.next() {
+                        results.push(atom);
+                    }
+                }
+            }
+            if results.is_empty() {
+                Err(format!("generator: native {} produced no results", fname))
+            } else {
+                Ok(results)
+            }
         }
     }
 }
@@ -1059,9 +1169,9 @@ fn eval_map_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
                     fname, elem.to_sexpr_string()
                 ))?
             }
-            Atom::Closure { params, body, env: capture_env } => {
+            Atom::Closure(c) => {
                 let elem_expr = atom_to_expr(elem)?;
-                let mut r = apply_closure(params, body, capture_env, &[elem_expr], env, funcs)?;
+                let mut r = apply_closure(&c.params, &c.body, &c.env, &[elem_expr], env, funcs)?;
                 r.next().ok_or_else(|| format!(
                     "map-atom: closure returned no result for {}",
                     elem.to_sexpr_string()
@@ -1149,11 +1259,9 @@ fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> 
         ));
     }
 
-    // Evaluate the expression, take first result
+    // Evaluate the scrutinee
     let mut expr_results = eval(&args[0], env, funcs)?;
-    let val = expr_results.next().ok_or_else(|| {
-        "case: expression produced no results".to_string()
-    })?;
+    let opt_val = expr_results.next();
 
     // Get clauses list
     let clauses = match &args[1] {
@@ -1161,7 +1269,25 @@ fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> 
         _ => return Err("case: second arg must be a list of (pattern body) pairs".into()),
     };
 
-    // Try each clause in order
+    // If scrutinee produced no results, look for an (Empty body) clause.
+    // This is PeTTa's empty-set catch: (case (empty) (... (Empty fallback))).
+    if opt_val.is_none() {
+        for clause in clauses {
+            let (pattern, body) = match clause {
+                Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
+                _ => continue,
+            };
+            if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
+                return eval(body, env, funcs);
+            }
+        }
+        // No Empty clause — propagate emptiness
+        return Ok(NDet::stream(std::iter::empty()));
+    }
+
+    let val = opt_val.unwrap();
+
+    // Try each clause in order; skip Empty (only applies to empty scrutinee)
     for clause in clauses {
         let (pattern, body) = match clause {
             Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
@@ -1171,9 +1297,13 @@ fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> 
             )),
         };
 
+        // Skip the Empty catch-all (scrutinee was non-empty)
+        if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
+            continue;
+        }
+
         // $else always matches as catch-all
-        let catch_all = matches!(pattern, Expr::Symbol(s) if s == "$else");
-        if catch_all {
+        if matches!(pattern, Expr::Symbol(s) if s == "$else") {
             return eval(body, env, funcs);
         }
 

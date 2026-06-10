@@ -1,11 +1,10 @@
 /// Public API for the mork-metta evaluator.
 ///
-/// The `Runtime` struct is the top-level entry point: it owns the atom space
-/// and the derived function table. Users create a Runtime, load MeTTa source
-/// with `eval_str` or `load_file`, and inspect the results.
+/// The `Runtime` struct is the top-level entry point: it owns the function
+/// table which in turn owns the atom space and mutable state store.
 ///
 /// # Assumptions
-/// - The atom space (`self_space`) is the single source of truth for both
+/// - The atom space in `funcs.space` is the single source of truth for both
 ///   data atoms and function definitions.
 /// - The function table (`funcs`) is a materialized cache rebuilt from
 ///   the space via `reify_functions()`.
@@ -33,68 +32,69 @@ use crate::builtins::register_builtins;
 use crate::parser::{expr_to_atom, parse_forms, TopForm};
 use crate::space::{Pattern, Space};
 
-/// The MeTTa runtime: owns the atom space and the derived function table.
-///
-/// The `&self` space is the single source of truth — both data atoms and
-/// function definitions live here. The function table is a materialized
-/// cache rebuilt by `reify_functions()`.
+/// The MeTTa runtime: owns the function table (which owns the atom space).
 pub struct Runtime {
-    /// The `&self` atom space — unified storage for data and code.
-    pub self_space: Box<dyn Space>,
-    /// Derived function dispatch table (rebuilt from `self_space`).
+    /// Derived function dispatch table (also owns the atom space + state store).
     pub funcs: FnTable,
 }
 
 impl Runtime {
     /// Create a new runtime with a `LocalSpace` backend.
     pub fn new() -> Self {
-        Runtime::with_space(Box::new(space::LocalSpace::new()))
+        let funcs = FnTable::new();
+        register_builtins(&funcs);
+        Runtime { funcs }
     }
 
     /// Create a new runtime with a specific space backend.
     pub fn with_space(space: Box<dyn Space>) -> Self {
-        let mut funcs = FnTable::new();
-        register_builtins(&mut funcs);
-        Runtime {
-            self_space: space,
-            funcs,
-        }
+        let funcs = FnTable::with_space(space);
+        register_builtins(&funcs);
+        Runtime { funcs }
     }
 
-    /// Rebuild the function table by scanning the self space for `(= ...)` atoms.
-    ///
-    /// This is called automatically after `load_form` for definitions, and can
-    /// be called manually after bulk-loading atoms into the space.
-    ///
-    /// # Assumptions
-    /// - Builtins are re-registered first (they take precedence over user defs).
-    /// - Multi-clause functions are accumulated: each `(= ...)` atom in the space
-    ///   adds one clause, so multiple definitions of the same name produce
-    ///   multi-clause dispatch.
+    /// Rebuild the function table by scanning the space for `(= ...)` atoms.
     pub fn reify_functions(&mut self) {
-        self.funcs = FnTable::new();
-        register_builtins(&mut self.funcs);
-        // Match all (= head body) forms in the self space
         let pat = Pattern::Expr(vec![
             Pattern::Exact(Atom::sym("=")),
-            Pattern::Any, // head expression
-            Pattern::Any, // body expression
+            Pattern::Any,
+            Pattern::Any,
         ]);
-        let mut pending: Vec<(String, Clause)> = Vec::new();
-        for result in self.self_space.match_atoms(&pat) {
+        // Snapshot matches while holding space borrow
+        let matches: Vec<_> = {
+            let space = self.funcs.space.borrow();
+            space.match_atoms(&pat)
+        };
+        // Snapshot state
+        let state: std::collections::HashMap<String, Atom> = {
+            let s = self.funcs.state.borrow();
+            s.clone()
+        };
+        // Move space out of current table
+        let old_space = std::mem::replace(
+            &mut *self.funcs.space.borrow_mut(),
+            crate::space::LocalSpace::new_box(),
+        );
+        // Fresh table
+        let new_table = FnTable::new();
+        register_builtins(&new_table);
+        // Move space and state into new table
+        let _ = std::mem::replace(&mut *new_table.space.borrow_mut(), old_space);
+        let _ = std::mem::replace(&mut *new_table.state.borrow_mut(), state);
+        // Re-register user-defined functions
+        for result in matches {
             if let Ok(expr) = parser::atom_to_expr(&result.atom) {
                 if let Ok((name, clause)) = compile_definition(&expr) {
-                    pending.push((name, clause));
+                    new_table.add_clause(name, clause.patterns, clause.body);
                 }
             }
         }
-        for (name, clause) in pending {
-            self.funcs.add_clause(name, clause.patterns, clause.body);
-        }
+        self.funcs = new_table;
     }
+
     /// Process a single top-level form.
     ///
-    /// - `Definition` → store the atom in the self space, compile the function,
+    /// - `Definition` → store the atom in the space, compile the function,
     ///   and register it. Returns `Ok(None)`.
     /// - `Runnable` → evaluate the expression. Returns `Ok(Some(result))` where
     ///   result is the first atom from the evaluation stream, or `None` if the
@@ -108,9 +108,9 @@ impl Runtime {
         match form {
             TopForm::Definition(expr) => {
                 let (name, clause) = compile_definition(&expr)?;
-                // Store the raw definition atom in the self space
+                // Store the raw definition atom in the space
                 let atom = expr_to_atom(&expr);
-                self.self_space.add_atom(&atom)?;
+                self.funcs.space.borrow_mut().add_atom(&atom)?;
                 // Register clause in the function table
                 self.funcs.add_clause(name, clause.patterns, clause.body);
                 Ok(None)
@@ -124,12 +124,6 @@ impl Runtime {
     }
 
     /// Parse and process a MeTTa source string.
-    ///
-    /// Returns the result of the **last** runnable form's first result, if any.
-    ///
-    /// # Assumptions
-    /// - Only the first result of each runnable form is returned.
-    /// - Definitions in the string are loaded into the space and func table.
     pub fn eval_str(&mut self, code: &str) -> Result<Option<Atom>, String> {
         let forms = parse_forms(code)?;
         let mut last = None;
@@ -140,9 +134,6 @@ impl Runtime {
     }
 
     /// Load and process a `.metta` file.
-    ///
-    /// Reads the file, parses it, and processes all forms.
-    /// Returns the result of the last runnable form, if any.
     pub fn load_file(&mut self, path: &str) -> Result<Option<Atom>, String> {
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read file: {}", e))?;
