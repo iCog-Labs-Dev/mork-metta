@@ -56,7 +56,8 @@
 use crate::atom::Atom;
 use crate::env::Env;
 use crate::func::{FnTable, FunctionKind, NDet};
-use crate::parser::{atom_to_expr, expr_to_atom, Expr};
+use crate::parser::{atom_to_expr, expr_to_atom, parse_forms, Expr, TopForm};
+use crate::space::Pattern;
 use crate::{trace, trace_enter, trace_exit};
 
 /// Evaluate an expression, returning a (possibly empty) stream of results.
@@ -100,13 +101,21 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     "progn" => { trace!("→ special: progn"); return eval_progn(args, env, funcs); }
                     "let" => { trace!("→ special: let"); return eval_let(args, env, funcs); }
                     "let*" => { trace!("→ special: let*"); return eval_let_star(args, env, funcs); }
-                    "quote" => { trace!("→ special: quote"); return eval_quote(args); }
+                    "quote" => { trace!("→ special: quote"); return eval_quote(args, env); }
+                    "call" => { trace!("→ special: call"); return eval_call(args, env, funcs); }
+                    "reduce" => { trace!("→ special: reduce"); return eval_call(args, env, funcs); }
                     "eval" => { trace!("→ special: eval"); return eval_eval(args, env, funcs); }
+                    "add-atom" => { trace!("→ special: add-atom"); return eval_add_atom(args, env, funcs); }
+                    "remove-atom" => { trace!("→ special: remove-atom"); return eval_remove_atom(args, env, funcs); }
+                    "match" => { trace!("→ special: match"); return eval_match(args, env, funcs); }
+                    "import!" => { trace!("→ special: import!"); return eval_import(args, env, funcs); }
+                    "println!" => { trace!("→ special: println!"); return eval_println(args, env, funcs); }
                     "superpose" => { trace!("→ special: superpose"); return eval_superpose(args, env, funcs); }
                     "collapse" => { trace!("→ special: collapse"); return eval_collapse(args, env, funcs); }
                     "chain" => { trace!("→ special: chain"); return eval_chain(args, env, funcs); }
                     "case" => { trace!("→ special: case"); return eval_case(args, env, funcs); }
                     "foldall" => { trace!("→ special: foldall"); return eval_foldall(args, env, funcs); }
+                    "map-atom" => { trace!("→ special: map-atom"); return eval_map_atom(args, env, funcs); }
                     "|->" => { trace!("→ special: lambda"); return eval_lambda(args, env); }
                     _ => {}
                 }
@@ -456,21 +465,6 @@ fn eval_progn(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String>
     }
     last.ok_or_else(|| "progn: internal — no forms after empty check".into())
 }
-/// Check whether an `Expr` contains any `$`-variables that are not bound
-/// in `env`. When true, the expression must be treated as a data term
-/// rather than evaluated — the free variables will be bound through
-/// pattern matching.
-fn has_free_vars(expr: &Expr, env: &Env) -> bool {
-    match expr {
-        Expr::Symbol(s) if s.starts_with('$') => env.get(s).is_none(),
-        // |-> lambda: parameters shadow any $vars in the body
-        Expr::List(items) if !items.is_empty() && matches!(&items[0], Expr::Symbol(s) if s == "|->") => {
-            false
-        }
-        Expr::List(items) => items.iter().any(|e| has_free_vars(e, env)),
-        _ => false,
-    }
-}
 
 /// Evaluate `(let pattern value body)` — nondeterministic pattern matching bind.
 ///
@@ -493,14 +487,8 @@ fn eval_let(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
         ));
     }
     let pattern = &args[0];
-    // If the value expression has free variables, treat it as a data term
-    // so pattern matching can bind them (PeTTa semantics).
-    let values: Vec<Atom> = if has_free_vars(&args[1], env) {
-        let term = expr_to_atom(&args[1]);
-        vec![term]
-    } else {
-        eval(&args[1], env, funcs)?.collect()
-    };
+    // PeTTa: translate_expr(Val, Gv, V) — always evaluate the value expression.
+    let values: Vec<Atom> = eval(&args[1], env, funcs)?.collect();
     let streams: Vec<NDet> = values
         .into_iter()
         .filter_map(|v| {
@@ -542,16 +530,11 @@ fn eval_let_star(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
         match pair {
             Expr::List(p) if p.len() == 2 => {
                 let pattern = &p[0];
-                // If value has free variables, treat as data term so pattern
-                // matching can bind them against current env.
-                let val = if has_free_vars(&p[1], &current_env) {
-                    expr_to_atom(&p[1])
-                } else {
-                    let mut val_results = eval(&p[1], &current_env, funcs)?;
-                    val_results.next().ok_or_else(|| {
-                        format!("let*: binding {} produced no value", pattern.to_string())
-                    })?
-                };
+                // PeTTa: letstar_to_rec_let expands to nested let, which always evaluates.
+                let mut val_results = eval(&p[1], &current_env, funcs)?;
+                let val = val_results.next().ok_or_else(|| {
+                    format!("let*: binding {} produced no value", pattern.to_string())
+                })?;
                 // Fresh match env prevents outer variable capture
                 let match_env = try_match_one(pattern, &val, &Env::new(), funcs)?
                     .ok_or_else(|| {
@@ -568,13 +551,30 @@ fn eval_let_star(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
     }
     eval(&args[1], &current_env, funcs)
 }
-/// Evaluate `(quote expr)` — return expression as data.
-fn eval_quote(args: &[Expr]) -> Result<NDet, String> {
+/// Evaluate `(quote expr)` — return expression as data, substituting bound `$vars`.
+///
+/// PeTTa: `Out = Expr` where Expr is the raw Prolog term. Bound Prolog variables
+/// are already unified, so `(quote $x)` where $x=10 returns 10, not the symbol "$x".
+/// We replicate this by substituting env-bound `$vars` before converting to atom.
+fn eval_quote(args: &[Expr], env: &Env) -> Result<NDet, String> {
     if args.len() != 1 {
         return Err(format!("quote: expected 1 arg, got {}", args.len()));
     }
-    let atom = expr_to_atom(&args[0]);
+    let atom = subst_and_atomize(&args[0], env);
     Ok(NDet::single(atom))
+}
+
+/// Convert an `Expr` to an `Atom`, substituting bound `$vars` from `env`.
+/// Unbound `$vars` are left as `Atom::Sym("$name")`.
+fn subst_and_atomize(expr: &Expr, env: &Env) -> Atom {
+    match expr {
+        Expr::Symbol(s) if s.starts_with('$') => {
+            env.get(s).unwrap_or_else(|| Atom::sym(s))
+        }
+        Expr::List(items) => Atom::Expr(items.iter().map(|e| subst_and_atomize(e, env)).collect()),
+        Expr::Number(n) => Atom::Num(*n),
+        Expr::Symbol(s) => Atom::sym(s),
+    }
 }
 /// Evaluate `(|-> params body)` — lambda expression.
 ///
@@ -601,17 +601,225 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<NDet, String> {
     Ok(NDet::single(closure))
 }
 
-/// Evaluate `(eval expr)` — evaluate, convert result to code, evaluate again.
+/// Evaluate `(call expr)` — evaluate the expression as a function call.
+///
+/// PeTTa semantics: translates to a direct predicate call at compile time.
+/// In our runtime, this is equivalent to evaluating the single argument
+/// as a normal expression (the dispatch loop handles function vs data).
+///
+/// `(reduce expr)` uses the same semantics — runtime dispatch evaluation.
+fn eval_call(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 1 {
+        return Err(format!("call: expected 1 arg, got {}", args.len()));
+    }
+    eval(&args[0], env, funcs)
+}
+
+/// Evaluate `(add-atom space atom)` — add an atom to the space.
+///
+/// This is a special form (not a builtin) because its arguments are NOT
+/// evaluated before being passed — PeTTa semantics: `add-atom` receives
+/// raw expressions so that `$` variable names in definitions are preserved
+/// rather than triggering variable lookup errors.
+fn eval_add_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "add-atom: expected (space atom), got {} args",
+            args.len()
+        ));
+    }
+    // Evaluate space reference (should evaluate to &self or similar)
+    let mut space_results = eval(&args[0], env, funcs)?;
+    let _space_ref = space_results.next().ok_or_else(|| {
+        "add-atom: space expression produced no results".to_string()
+    })?;
+    // Convert the atom expression to an Atom WITHOUT evaluating it,
+    // so that $ variable names (e.g. $N in (= (fib $N) ...)) are preserved.
+    let atom = expr_to_atom(&args[1]);
+    funcs.space.borrow_mut().add_atom(&atom).map_err(|e| format!("add-atom: {}", e))?;
+    // If the atom is a function definition (= head body), register the function
+    if let Atom::Expr(items) = &atom {
+        if items.len() == 3 && items[0] == Atom::sym("=") {
+            if let (Ok(head_expr), Ok(body_expr)) = (
+                atom_to_expr(&items[1]),
+                atom_to_expr(&items[2]),
+            ) {
+                let def_expr = Expr::List(vec![head_expr, body_expr]);
+                if let Ok((name, clause)) = crate::compile::compile_definition(&def_expr) {
+                    funcs.add_clause(name, clause.patterns, clause.body);
+                }
+            }
+        }
+    }
+    Ok(NDet::single(Atom::sym("true")))
+}
+
+/// Evaluate `(remove-atom space atom)` — remove an atom from the space.
+/// Same special-form treatment as add-atom (arguments not pre-evaluated).
+fn eval_remove_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "remove-atom: expected (space atom), got {} args",
+            args.len()
+        ));
+    }
+    // Evaluate space reference
+    let mut space_results = eval(&args[0], env, funcs)?;
+    let _space_ref = space_results.next().ok_or_else(|| {
+        "remove-atom: space expression produced no results".to_string()
+    })?;
+    // Convert to Atom without evaluating (preserve $ vars)
+    let atom = expr_to_atom(&args[1]);
+    let removed = funcs.space.borrow_mut().remove_atom(&atom)
+        .map_err(|e| format!("remove-atom: {}", e))?;
+    Ok(NDet::single(if removed {
+        Atom::sym("true")
+    } else {
+        Atom::Sym(String::new())
+    }))
+}
+
+/// Evaluate `(match space pattern body)` — pattern match atoms in a space.
+///
+/// Evaluates `space` to get the space reference, converts `pattern` to a
+/// `Pattern`, queries the space for matching atoms, then evaluates `body`
+/// once per match with variables bound from the pattern.
+///
+/// PeTTa semantics: `match(Space, Pattern, Out, Out)` — matches atoms in
+/// the space, binds variables from the pattern to the matched atom.
+fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 3 {
+        return Err(format!(
+            "match: expected (space pattern body), got {} args",
+            args.len()
+        ));
+    }
+    // Evaluate space reference (must evaluate to &self or similar)
+    let mut space_results = eval(&args[0], env, funcs)?;
+    let _space_ref = space_results.next().ok_or_else(|| {
+        "match: space expression produced no results".to_string()
+    })?;
+    // Convert pattern expression to a Pattern
+    let pattern = Pattern::from_expr(&args[1]);
+    // Query the space
+    let matches = {
+        let space = funcs.space.borrow();
+        space.match_atoms(&pattern)
+    };
+    if matches.is_empty() {
+        return Ok(NDet::Single(None)); // empty stream — no match
+    }
+    // Evaluate body for each match with variable bindings
+    let streams: Result<Vec<NDet>, String> = matches
+        .into_iter()
+        .map(|result| {
+            // Extend env with bindings from the match
+            let mut match_env = env.clone();
+            for (name, val) in &result.bindings {
+                match_env = match_env.extend(name, val.clone());
+            }
+            eval(&args[2], &match_env, funcs)
+        })
+        .collect();
+    Ok(NDet::stream(streams?.into_iter().flatten()))
+}
+
+/// Evaluate `(import! space path)` — load a MeTTa file into the space.
+///
+/// Loads a `.metta` file relative to the current working directory and
+/// processes its top-level forms, adding definitions to the space.
+fn eval_import(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "import!: expected (space path), got {} args",
+            args.len()
+        ));
+    }
+    // Evaluate space reference
+    let mut space_results = eval(&args[0], env, funcs)?;
+    let _space_ref = space_results.next().ok_or_else(|| {
+        "import!: space expression produced no results".to_string()
+    })?;
+    // Get file path from args[1] — could be a symbol or string
+    let path_str = match &args[1] {
+        Expr::Symbol(s) => s.clone(),
+        Expr::Number(_) => {
+            return Err("import!: file path must be a symbol, not a number".into());
+        }
+        Expr::List(_) => {
+            return Err("import!: file path must be a symbol, not a list".into());
+        }
+    };
+    // Try to load the file — support both .metta and bare paths
+    let content = std::fs::read_to_string(&path_str)
+        .or_else(|_| {
+            let with_ext = format!("{}.metta", path_str);
+            std::fs::read_to_string(&with_ext)
+        })
+        .map_err(|e| format!("import!: cannot read '{}': {}", path_str, e))?;
+    let forms = crate::parser::parse_forms(&content)
+        .map_err(|e| format!("import!: parse error in '{}': {}", path_str, e))?;
+    for form in forms {
+        match form {
+            TopForm::Definition(expr) => {
+                // Store the raw definition atom in the space
+                let atom = expr_to_atom(&expr);
+                if let Err(e) = funcs.space.borrow_mut().add_atom(&atom) {
+                    return Err(format!("import!: add_atom error: {}", e));
+                }
+                // Register the function clause so it's immediately available
+                if let Ok((name, clause)) = crate::compile::compile_definition(&expr) {
+                    funcs.add_clause(name, clause.patterns, clause.body);
+                }
+            }
+            TopForm::Runnable(expr) => {
+                // PeTTa: load_metta_file processes all forms including !(...) runnables.
+                eval(&expr, env, funcs)?;
+            }
+        }
+    }
+    Ok(NDet::single(Atom::sym("true")))
+}
+
+/// Evaluate `(println! arg)` — print a value to stdout (for debugging).
+fn eval_println(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 1 {
+        return Err(format!("println!: expected 1 arg, got {}", args.len()));
+    }
+    let mut results = eval(&args[0], env, funcs)?;
+    let val = results.next().ok_or_else(|| {
+        "println!: argument produced no results".to_string()
+    })?;
+    println!("{}", val.to_sexpr_string());
+    // PeTTa: 'println!'(Arg, true) — return value is always true.
+    Ok(NDet::single(Atom::sym("true")))
+}
+
+/// Evaluate `(eval expr)` — re-evaluate a raw expression as code.
+///
+/// PeTTa: the translator emits `eval(RawArg, Out)` where RawArg is the
+/// *untranslated* source term. `eval/2` then re-translates and runs it.
+/// This means `(eval (quote (fib 5)))` returns `(fib 5)` as data (quote
+/// stops the inner eval), not 5.
+///
+/// For a `$var`, the variable's atom value is treated as code and evaluated.
+/// For any other literal expression, it is passed directly to eval.
 fn eval_eval(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 1 {
         return Err(format!("eval: expected 1 arg, got {}", args.len()));
     }
-    let mut inner_results = eval(&args[0], env, funcs)?;
-    let atom_val = inner_results
-        .next()
-        .ok_or_else(|| "eval: inner expression produced no results".to_string())?;
-    let expr = atom_to_expr(&atom_val)?;
-    eval(&expr, env, funcs)
+    match &args[0] {
+        Expr::Symbol(s) if s.starts_with('$') => {
+            // $var: retrieve the atom it holds, convert to code, evaluate.
+            let val = env
+                .get(s)
+                .ok_or_else(|| format!("eval: unbound variable {}", s))?;
+            let expr = atom_to_expr(&val)?;
+            eval(&expr, env, funcs)
+        }
+        // Literal expression: pass directly to eval — no pre-evaluation.
+        _ => eval(&args[0], env, funcs),
+    }
 }
 
 /// Evaluate `(superpose expr)` — spread elements of a list or atom into a stream.
@@ -805,6 +1013,65 @@ fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<V
             Err("generator: native functions don't support free variable resolution".into())
         }
     }
+}
+
+/// Evaluate `(map-atom list func)` — apply `func` to each element of `list`.
+///
+/// PeTTa runtime: `'map-atom'([H|T], Func, [R|RT]) :- reduce([Func,H], R)`.
+/// `reduce/2` dispatches on Func type:
+///   - registered atom → direct call
+///   - closure         → apply_closure
+///   - anything else   → produce `[Func, H]` as data (no error)
+fn eval_map_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "map-atom: expected (list func), got {} args",
+            args.len()
+        ));
+    }
+    let mut list_results = eval(&args[0], env, funcs)?;
+    let list_atom = list_results.next().ok_or_else(|| {
+        "map-atom: list expression produced no results".to_string()
+    })?;
+    let mut func_results = eval(&args[1], env, funcs)?;
+    let func_atom = func_results.next().ok_or_else(|| {
+        "map-atom: func expression produced no results".to_string()
+    })?;
+    // Move elements out — list_atom not needed after this.
+    let elements = match list_atom {
+        Atom::Expr(items) => items,
+        other => return Err(format!(
+            "map-atom: expected a list (Expr), got {}",
+            other.to_sexpr_string()
+        )),
+    };
+    let mut results = Vec::with_capacity(elements.len());
+    for elem in &elements {
+        // reduce([Func, H], R) dispatch:
+        let result = match &func_atom {
+            Atom::Sym(fname) => {
+                let elem_expr = atom_to_expr(elem)?;
+                let call_expr = Expr::List(vec![Expr::Symbol(fname.clone()), elem_expr]);
+                let mut r = eval(&call_expr, env, funcs)?;
+                r.next().ok_or_else(|| format!(
+                    "map-atom: {} returned no result for {}",
+                    fname, elem.to_sexpr_string()
+                ))?
+            }
+            Atom::Closure { params, body, env: capture_env } => {
+                let elem_expr = atom_to_expr(elem)?;
+                let mut r = apply_closure(params, body, capture_env, &[elem_expr], env, funcs)?;
+                r.next().ok_or_else(|| format!(
+                    "map-atom: closure returned no result for {}",
+                    elem.to_sexpr_string()
+                ))?
+            }
+            // reduce case 3: unknown func → [Func, H] as data
+            _ => Atom::Expr(vec![func_atom.clone(), elem.clone()]),
+        };
+        results.push(result);
+    }
+    Ok(NDet::single(Atom::Expr(results)))
 }
 
 /// Evaluate `(chain expr $var expr $var ... final-expr)` — thread value through

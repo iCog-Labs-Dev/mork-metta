@@ -158,7 +158,7 @@ fn test_space_stores_function_definitions() {
         Pattern::Expr(vec![Pattern::Exact(Atom::sym("f")), Pattern::Any]),
         Pattern::Any,
     ]);
-    let results = rt.self_space.match_atoms(&pat);
+    let results = rt.funcs.space.borrow().match_atoms(&pat);
     assert_eq!(results.len(), 1);
 }
 
@@ -170,7 +170,7 @@ fn test_reify_functions_from_space() {
         Atom::Expr(vec![Atom::sym("g"), Atom::sym("$x")]),
         Atom::Expr(vec![Atom::sym("+"), Atom::sym("$x"), Atom::Num(3)]),
     ]);
-    rt.self_space.add_atom(&def_atom).unwrap();
+    rt.funcs.space.borrow_mut().add_atom(&def_atom).unwrap();
     rt.reify_functions();
     let forms = parse_forms("!(g 5)").unwrap();
     let result = match forms.into_iter().next().unwrap() {
@@ -369,9 +369,14 @@ fn test_quote_nested() {
 
 #[test]
 fn test_eval_quoted() {
+    // PeTTa: (eval (quote (+ 1 2))) returns the quoted form as data, not 3.
+    // eval([quote,[+,1,2]], Out) → translate quote → Out = [+,1,2].
     let mut rt = Runtime::new();
     let result = rt.eval_str("!(eval (quote (+ 1 2)))").unwrap();
-    assert_eq!(result, Some(Atom::Num(3)));
+    assert_eq!(
+        result,
+        Some(Atom::expr(vec![Atom::sym("+"), Atom::Num(1), Atom::Num(2)]))
+    );
 }
 
 #[test]
@@ -390,10 +395,12 @@ fn test_eval_quoted_variable() {
 
 #[test]
 fn test_eval_with_user_function() {
+    // PeTTa: (eval (quote (double 10))) returns (double 10) as data.
+    // To evaluate stored code, use (eval $code) — the $var path re-evaluates the atom.
     let mut rt = Runtime::new();
     let code = r#"
 (= (double $x) (* $x 2))
-!(eval (quote (double 10)))
+!(let $code (quote (double 10)) (eval $code))
 "#;
     let result = rt.eval_str(code).unwrap();
     assert_eq!(result, Some(Atom::Num(20)));
