@@ -142,6 +142,27 @@ impl FnTable {
         });
     }
 
+    /// Remove a specific clause from a user-defined function.
+    /// If no clauses remain after removal, the function entry is dropped entirely.
+    /// Returns true if a matching clause was found and removed.
+    pub fn remove_clause(&self, name: &str, patterns: &[Expr], body: &Expr) -> bool {
+        // SAFETY: patterns.len() < 256 in all MeTTa programs.
+        let arity = patterns.len() as u8;
+        let mut map = self.map.borrow_mut();
+        let Some(inner) = map.get_mut(name) else { return false; };
+        let Some(func) = inner.get_mut(&arity) else { return false; };
+        if let FunctionKind::UserDefined { ref mut clauses } = func.kind {
+            let before = clauses.len();
+            clauses.retain(|c| c.patterns.as_slice() != patterns || c.body != *body);
+            let removed = clauses.len() < before;
+            if clauses.is_empty() {
+                inner.remove(&arity);
+            }
+            return removed;
+        }
+        false
+    }
+
     pub fn insert_native(
         &self,
         name: &str,

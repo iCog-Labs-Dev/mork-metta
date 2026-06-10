@@ -685,6 +685,8 @@ fn eval_add_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
 
 /// Evaluate `(remove-atom space atom)` — remove an atom from the space.
 /// Same special-form treatment as add-atom (arguments not pre-evaluated).
+/// If the atom is a `(= head body)` definition, also removes the compiled clause
+/// from the FnTable so space and cache stay in sync.
 fn eval_remove_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 2 {
         return Err(format!(
@@ -701,6 +703,26 @@ fn eval_remove_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, S
     let atom = expr_to_atom(&args[1]);
     let removed = funcs.space.borrow_mut().remove_atom(&atom)
         .map_err(|e| format!("remove-atom: {}", e))?;
+    // Keep FnTable in sync: if removed atom was a function definition, drop its clause.
+    if removed {
+        if let Atom::Expr(items) = &atom {
+            if items.len() == 3 && items[0] == Atom::sym("=") {
+                if let (Ok(head_expr), Ok(body_expr)) = (
+                    atom_to_expr(&items[1]),
+                    atom_to_expr(&items[2]),
+                ) {
+                    let def_expr = Expr::List(vec![
+                        Expr::Symbol("=".to_string()),
+                        head_expr,
+                        body_expr,
+                    ]);
+                    if let Ok((name, clause)) = crate::compile::compile_definition(&def_expr) {
+                        funcs.remove_clause(&name, &clause.patterns, &clause.body);
+                    }
+                }
+            }
+        }
+    }
     Ok(NDet::single(if removed {
         Atom::sym("true")
     } else {
