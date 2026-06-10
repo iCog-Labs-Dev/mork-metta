@@ -262,7 +262,8 @@ pub fn register_builtins(table: &FnTable) {
     table.insert_native("index-atom", 2, |args, _| {
         expect_n_args(args, 2, "index-atom")?;
         let idx = match &args[1] {
-            Atom::Num(n) => *n as usize,
+            Atom::Num(n) => usize::try_from(*n)
+                .map_err(|_| format!("index-atom: index must be non-negative, got {}", n))?,
             other => return Err(format!("index-atom: index must be a number, got {}", other.to_sexpr_string())),
         };
         match &args[0] {
@@ -324,9 +325,10 @@ fn alpha_equiv(
             let b_var = sb.starts_with('$');
             match (a_var, b_var) {
                 (true, true) => {
-                    let fwd = map_ab.entry(sa.clone()).or_insert_with(|| sb.clone()).clone();
-                    let bwd = map_ba.entry(sb.clone()).or_insert_with(|| sa.clone()).clone();
-                    fwd == *sb && bwd == *sa
+                    let fwd = map_ab.entry(sa.clone()).or_insert_with(|| sb.clone());
+                    let fwd_ok = fwd.as_str() == sb.as_str();
+                    let bwd = map_ba.entry(sb.clone()).or_insert_with(|| sa.clone());
+                    fwd_ok && bwd.as_str() == sa.as_str()
                 }
                 (false, false) => sa == sb,
                 _ => false,
