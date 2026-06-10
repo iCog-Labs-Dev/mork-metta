@@ -175,6 +175,12 @@ pub fn register_builtins(table: &FnTable) {
         }))
     });
 
+    // repr: (repr atom) — return the S-expression string of an atom as a symbol
+    table.insert_native("repr", 1, |args, _| {
+        expect_n_args(args, 1, "repr")?;
+        Ok(NDet::single(Atom::sym(&args[0].to_sexpr_string())))
+    });
+
     // get-state: (get-state key) — retrieves state value
     table.insert_native("get-state", 1, |args, table| {
         expect_n_args(args, 1, "get-state")?;
@@ -218,9 +224,122 @@ pub fn register_builtins(table: &FnTable) {
         table.state.borrow_mut().insert(key, value);
         Ok(NDet::single(Atom::sym("true")))
     });
+
+    // cons-atom: (cons-atom elem list) → prepend elem to list
+    table.insert_native("cons-atom", 2, |args, _| {
+        expect_n_args(args, 2, "cons-atom")?;
+        let mut out = vec![args[0].clone()];
+        match &args[1] {
+            Atom::Expr(items) => out.extend(items.iter().cloned()),
+            other => out.push(other.clone()),
+        }
+        Ok(NDet::single(Atom::Expr(out)))
+    });
+
+    // car-atom: (car-atom list) → first element
+    table.insert_native("car-atom", 1, |args, _| {
+        expect_n_args(args, 1, "car-atom")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
+            Atom::Expr(_) => Err("car-atom: empty list".into()),
+            other => Err(format!("car-atom: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+
+    // cdr-atom: (cdr-atom list) → tail (all but first)
+    table.insert_native("cdr-atom", 1, |args, _| {
+        expect_n_args(args, 1, "cdr-atom")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => {
+                Ok(NDet::single(Atom::Expr(items[1..].to_vec())))
+            }
+            Atom::Expr(_) => Err("cdr-atom: empty list".into()),
+            other => Err(format!("cdr-atom: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+
+    // index-atom: (index-atom list n) → 0-based nth element
+    table.insert_native("index-atom", 2, |args, _| {
+        expect_n_args(args, 2, "index-atom")?;
+        let idx = match &args[1] {
+            Atom::Num(n) => *n as usize,
+            other => return Err(format!("index-atom: index must be a number, got {}", other.to_sexpr_string())),
+        };
+        match &args[0] {
+            Atom::Expr(items) => items.get(idx)
+                .cloned()
+                .map(NDet::single)
+                .ok_or_else(|| format!("index-atom: index {} out of bounds (len {})", idx, items.len())),
+            other => Err(format!("index-atom: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+
+    // id: (id x) → x
+    table.insert_native("id", 1, |args, _| {
+        expect_n_args(args, 1, "id")?;
+        Ok(NDet::single(args[0].clone()))
+    });
+
+    // =alpha: (=alpha expr1 expr2) → True/False — structural equality up to variable renaming
+    table.insert_native("=alpha", 2, |args, _| {
+        expect_n_args(args, 2, "=alpha")?;
+        let mut map_ab = std::collections::HashMap::new();
+        let mut map_ba = std::collections::HashMap::new();
+        let eq = alpha_equiv(&args[0], &args[1], &mut map_ab, &mut map_ba);
+        Ok(NDet::single(if eq { Atom::sym("True") } else { Atom::sym("False") }))
+    });
+
+    // first-from-pair: (first-from-pair (A B)) → A
+    table.insert_native("first-from-pair", 1, |args, _| {
+        expect_n_args(args, 1, "first-from-pair")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
+            Atom::Expr(_) => Err("first-from-pair: empty list".into()),
+            other => Err(format!("first-from-pair: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+
+    // second-from-pair: (second-from-pair (A B)) → B
+    table.insert_native("second-from-pair", 1, |args, _| {
+        expect_n_args(args, 1, "second-from-pair")?;
+        match &args[0] {
+            Atom::Expr(items) if items.len() >= 2 => Ok(NDet::single(items[1].clone())),
+            Atom::Expr(_) => Err("second-from-pair: list too short".into()),
+            other => Err(format!("second-from-pair: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
 }
 
 // ---- Helpers ----
+
+fn alpha_equiv(
+    a: &Atom,
+    b: &Atom,
+    map_ab: &mut std::collections::HashMap<String, String>,
+    map_ba: &mut std::collections::HashMap<String, String>,
+) -> bool {
+    match (a, b) {
+        (Atom::Sym(sa), Atom::Sym(sb)) => {
+            let a_var = sa.starts_with('$');
+            let b_var = sb.starts_with('$');
+            match (a_var, b_var) {
+                (true, true) => {
+                    let fwd = map_ab.entry(sa.clone()).or_insert_with(|| sb.clone()).clone();
+                    let bwd = map_ba.entry(sb.clone()).or_insert_with(|| sa.clone()).clone();
+                    fwd == *sb && bwd == *sa
+                }
+                (false, false) => sa == sb,
+                _ => false,
+            }
+        }
+        (Atom::Num(a), Atom::Num(b)) => a == b,
+        (Atom::Expr(as_), Atom::Expr(bs)) => {
+            as_.len() == bs.len()
+                && as_.iter().zip(bs.iter()).all(|(x, y)| alpha_equiv(x, y, map_ab, map_ba))
+        }
+        _ => false,
+    }
+}
 
 fn expect_n_args(args: &[Atom], n: usize, name: &str) -> Result<(), String> {
     if args.len() != n {
