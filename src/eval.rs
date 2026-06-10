@@ -118,6 +118,7 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     "foldall" => { trace!("→ special: foldall"); return eval_foldall(args, env, funcs); }
                     "map-atom" => { trace!("→ special: map-atom"); return eval_map_atom(args, env, funcs); }
                     "|->" => { trace!("→ special: lambda"); return eval_lambda(args, env); }
+                    "forall" => { trace!("→ special: forall"); return eval_forall(args, env, funcs); }
                     // empty produces no results (Prolog fail / empty nondeterminism)
                     "empty" => { trace!("→ special: empty"); return Ok(NDet::stream(std::iter::empty())); }
                     _ => {}
@@ -539,6 +540,48 @@ fn eval_constrained(
             }
         }
     }
+    // Dynamic operator (closure via $var or inline lambda expr): e.g. ($f $z) or ((|-> ...) $z)
+    if let Expr::List(items) = expr {
+        if !items.is_empty() {
+            let head = &items[0];
+            // Skip if already handled above (plain non-$ symbol)
+            let is_plain_fn = matches!(head, Expr::Symbol(s) if !s.starts_with('$'));
+            if !is_plain_fn {
+                let args = &items[1..];
+                let op_atom: Option<Atom> = match head {
+                    Expr::Symbol(s) => env.get(s),
+                    other => eval(other, env, funcs)?.next(),
+                };
+                if let Some(Atom::Closure(c)) = op_atom {
+                    let mut arg_streams: Vec<Vec<(Atom, Env)>> = Vec::with_capacity(args.len());
+                    for arg in args {
+                        arg_streams.push(eval_constrained(arg, env, funcs)?);
+                    }
+                    let combos = constrained_cartesian(arg_streams);
+                    let mut out: Vec<(Atom, Env)> = Vec::new();
+                    for (atom_args, arg_bindings) in combos {
+                        if let Some(match_bindings) =
+                            try_match_clause(&c.params, &atom_args, &Env::new(), funcs)?
+                        {
+                            let full_env = prepend_env(match_bindings.clone(), &c.env);
+                            for (atom, body_bindings) in
+                                eval_constrained(&c.body, &full_env, funcs)?
+                            {
+                                let acc = prepend_env(
+                                    body_bindings,
+                                    &prepend_env(match_bindings.clone(), &arg_bindings),
+                                );
+                                out.push((atom, acc));
+                            }
+                        }
+                    }
+                    if !out.is_empty() {
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+    }
     // Fallback: normal eval, wrap each result with empty bindings.
     eval(expr, env, funcs).map(|ndet| ndet.map(|a| (a, Env::new())).collect())
 }
@@ -732,6 +775,48 @@ fn eval_lambda(args: &[Expr], env: &Env) -> Result<NDet, String> {
         env: env.clone(),
     }));
     Ok(NDet::single(closure))
+}
+
+/// Evaluate `(forall gen-expr check)` — universal quantification over NDet results.
+///
+/// Collects all results from `gen-expr`, applies `check` to each, returns
+/// `true` if all pass (or generator is empty), `false` otherwise.
+/// `check` can be a function name symbol or a closure.
+fn eval_forall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 2 {
+        return Err(format!("forall: expected 2 args, got {}", args.len()));
+    }
+    // Use constrained eval for generator so free vars enumerate all clause solutions.
+    let gen_values: Vec<Atom> = eval_constrained(&args[0], env, funcs)?
+        .into_iter()
+        .map(|(a, _)| a)
+        .collect();
+    let check = eval(&args[1], env, funcs)?
+        .next()
+        .ok_or_else(|| "forall: check produced no value".to_string())?;
+
+    let arg_sym = Expr::Symbol("$__fv".to_string());
+    for val in gen_values {
+        let call_env = env.extend("$__fv", val);
+        let results: Vec<Atom> = match &check {
+            Atom::Sym(fname) => {
+                let call = Expr::List(vec![Expr::Symbol(fname.to_string()), arg_sym.clone()]);
+                eval(&call, &call_env, funcs)?.collect()
+            }
+            Atom::Closure(c) => {
+                apply_closure(&c.params, &c.body, &c.env, &[arg_sym.clone()], &call_env, funcs)?
+                    .collect()
+            }
+            other => return Err(format!(
+                "forall: check must be a function or closure, got {}",
+                other.to_sexpr_string()
+            )),
+        };
+        if results.is_empty() || !results.iter().all(|a| a.is_truthy()) {
+            return Ok(NDet::single(Atom::sym("false")));
+        }
+    }
+    Ok(NDet::single(Atom::sym("true")))
 }
 
 /// Evaluate `(call expr)` — evaluate the expression as a function call.
