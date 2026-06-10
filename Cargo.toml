@@ -1,0 +1,11 @@
+[package]
+name = "mork-metta"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["mork"]
+trace = []
+mork = ["dep:mork"]
+[dependencies]
+mork = { workspace = true, optional = true }
