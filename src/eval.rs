@@ -104,6 +104,9 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     "eval" => { trace!("→ special: eval"); return eval_eval(args, env, funcs); }
                     "superpose" => { trace!("→ special: superpose"); return eval_superpose(args, env, funcs); }
                     "collapse" => { trace!("→ special: collapse"); return eval_collapse(args, env, funcs); }
+                    "chain" => { trace!("→ special: chain"); return eval_chain(args, env, funcs); }
+                    "case" => { trace!("→ special: case"); return eval_case(args, env, funcs); }
+                    "foldall" => { trace!("→ special: foldall"); return eval_foldall(args, env, funcs); }
                     _ => {}
                 }
             }
@@ -394,35 +397,49 @@ fn eval_progn(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String>
     last.ok_or_else(|| "progn: internal — no forms after empty check".into())
 }
 
-/// Evaluate `(let $var value body)` — nondeterministic variable binding.
+/// Evaluate `(let pattern value body)` — nondeterministic pattern matching bind.
+///
+/// Evaluates `value` to produce a stream of atoms. For each atom, tries to
+/// match `pattern` against it. On match, extends the environment with the
+/// bindings and evaluates `body`. On mismatch, that branch produces no
+/// results (empty stream contribution).
+///
+/// Pattern syntax (same as multi-clause `try_match_one`):
+/// - `$var` — bind to value, or check equality if already bound by earlier
+///   pattern elements (non-linear patterns)
+/// - `Num(n)` — match only `Atom::Num(n)`
+/// - `Sym(s)` — match only `Atom::Sym(s)` (non-`$` symbols are literal)
+/// - `(pat1 pat2 ...)` — destructuring match against `Atom::Expr`
 fn eval_let(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 3 {
         return Err(format!(
-            "let: expected ($var value body), got {} args",
+            "let: expected (pattern value body), got {} args",
             args.len()
         ));
     }
-    let var_name = match &args[0] {
-        Expr::Symbol(s) if s.starts_with('$') => s.clone(),
-        _ => {
-            return Err(
-                "let: first argument must be a $variable (pattern let not supported)"
-                    .into(),
-            )
-        }
-    };
+    let pattern = &args[0];
     let values: Vec<Atom> = eval(&args[1], env, funcs)?.collect();
     let streams: Vec<NDet> = values
         .into_iter()
         .filter_map(|v| {
-            let new_env = env.extend(&var_name, v);
+            // Fresh match env prevents outer variable capture
+            let match_env = try_match_one(pattern, &v, &Env::new()).ok()??;
+            let pairs = collect_env_bindings(&match_env);
+            let new_env = env.extend_all(&pairs);
+            // REASON: body eval failure in nondet stream is skipped,
+            // not propagated — matches PeTTa's backtracking semantics.
             eval(&args[2], &new_env, funcs).ok()
         })
         .collect();
     Ok(NDet::stream(streams.into_iter().flatten()))
 }
 
-/// Evaluate `(let* ((x a) (y b) ...) body)` — sequential `let`.
+/// Evaluate `(let* ((pat val) (pat2 val2) ...) body)` — sequential pattern let.
+///
+/// Evaluates each value in order. For each value, matches the corresponding
+/// pattern using the same semantics as `try_match_one`. Later bindings see
+/// variables bound by earlier patterns. If any pattern fails to match the
+/// value, returns an error (deterministic binding).
 fn eval_let_star(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 2 {
         return Err(format!(
@@ -434,7 +451,7 @@ fn eval_let_star(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
         Expr::List(items) => items,
         _ => {
             return Err(
-                "let*: first arg must be a list of ($var val) pairs".into(),
+                "let*: first arg must be a list of (pattern val) pairs".into(),
             )
         }
     };
@@ -442,28 +459,27 @@ fn eval_let_star(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
     for pair in bindings {
         match pair {
             Expr::List(p) if p.len() == 2 => {
-                let var_name = match &p[0] {
-                    Expr::Symbol(s) if s.starts_with('$') => s.clone(),
-                    _ => {
-                        return Err(
-                            "let*: each binding must be ($var val) with $var".into(),
-                        )
-                    }
-                };
+                let pattern = &p[0];
                 let mut val_results = eval(&p[1], &current_env, funcs)?;
                 let val = val_results.next().ok_or_else(|| {
-                    format!("let*: binding {} produced no value", var_name)
+                    format!("let*: binding {} produced no value", pattern.to_string())
                 })?;
-                current_env = current_env.extend(&var_name, val);
+                // Fresh match env prevents outer variable capture
+                let match_env = try_match_one(pattern, &val, &Env::new())?
+                    .ok_or_else(|| {
+                        format!("let*: pattern does not match value: {} vs {}",
+                            pattern.to_string(), val.to_sexpr_string())
+                    })?;
+                let pairs = collect_env_bindings(&match_env);
+                current_env = current_env.extend_all(&pairs);
             }
             _ => {
-                return Err("let*: each binding must be a list ($var val)".into())
+                return Err("let*: each binding must be a list (pattern val)".into())
             }
         }
     }
     eval(&args[1], &current_env, funcs)
 }
-
 /// Evaluate `(quote expr)` — return expression as data.
 fn eval_quote(args: &[Expr]) -> Result<NDet, String> {
     if args.len() != 1 {
@@ -523,4 +539,159 @@ fn eval_collapse(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
     }
     let results: Vec<Atom> = eval(&args[0], env, funcs)?.collect();
     Ok(NDet::single(Atom::Expr(results)))
+}
+
+/// Evaluate `(foldall agg-func gen-expr init)` — fold over a nondeterministic stream.
+///
+/// Collects all results from `gen-expr`, then folds them using `agg-func`:
+/// `agg(agg(agg(init, v1), v2), v3) ...`. Returns the final accumulator.
+///
+/// PeTTa reference: `foldall` aggregates over all solutions of a generator.
+/// Args are expressions (not quoted), so `(foldall + (f) 0)` works when
+/// `(f)` is a multi-clause function producing a stream of numbers.
+fn eval_foldall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 3 {
+        return Err(format!(
+            "foldall: expected (agg-func gen-expr init), got {} args",
+            args.len()
+        ));
+    }
+    let agg_func = &args[0];
+
+    // Collect all values from generator
+    let gen_values: Vec<Atom> = eval(&args[1], env, funcs)?.collect();
+
+    // Evaluate init value (first result)
+    let mut init_results = eval(&args[2], env, funcs)?;
+    let init = init_results.next().ok_or_else(|| {
+        "foldall: init expression produced no results".to_string()
+    })?;
+
+    // Fold: accum = agg(accum, next) for each gen value
+    let accum = gen_values.into_iter().try_fold(init, |acc, val| {
+        let acc_expr = atom_to_expr(&acc)?;
+        let val_expr = atom_to_expr(&val)?;
+        let call = Expr::List(vec![agg_func.clone(), acc_expr, val_expr]);
+        let mut results = eval(&call, env, funcs)?;
+        results.next().ok_or_else(|| {
+            "foldall: aggregate function produced no results".to_string()
+        })
+    })?;
+
+    Ok(NDet::single(accum))
+}
+
+/// Evaluate `(chain expr $var expr $var ... final-expr)` — thread value through
+/// a pipeline of expressions.
+///
+/// Each expression is evaluated in order; its first result is bound to the
+/// following `$var`, making it available to subsequent expressions. The final
+/// expression's result is the overall result.
+///
+/// PeTTa reference: `chain(Value, Var, Expr, ...)` compiles to
+/// `substitute(Value, Var, Expr, ChainResult)`.
+///
+/// # Errors
+/// Returns error if any `$var` position is not a `$`-prefixed symbol, if any
+/// expression produces no results, or if arg count is even.
+fn eval_chain(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() == 1 {
+        // Single expression: evaluate and return directly
+        return eval(&args[0], env, funcs);
+    }
+    if args.len() < 3 || args.len() % 2 == 0 {
+        return Err(format!(
+            "chain: expected odd number of args (expr $var expr ...), got {}",
+            args.len()
+        ));
+    }
+    let mut current_env = env.clone();
+    let last_idx = args.len() - 1;
+
+    // Process (expr, $var) pairs up to the last expression
+    let pairs = args.len() / 2; // integer division
+    for i in 0..pairs {
+        let expr = &args[i * 2];
+        let var = &args[i * 2 + 1];
+
+        // Var must be a $variable
+        let var_name = match var {
+            Expr::Symbol(s) if s.starts_with('$') => s.clone(),
+            _ => return Err(format!(
+                "chain: arg {} must be a $variable, got {}",
+                i * 2 + 1, var.to_string()
+            )),
+        };
+
+        // Evaluate expression, take first result
+        let mut results = eval(expr, &current_env, funcs)?;
+        let val = results.next().ok_or_else(|| {
+            format!("chain: expression {} produced no results", i * 2)
+        })?;
+
+        current_env = current_env.extend(&var_name, val);
+    }
+
+    // Evaluate final expression
+    eval(&args[last_idx], &current_env, funcs)
+}
+
+/// Evaluate `(case expr (pattern1 body1) (pattern2 body2) ...)` — pattern match dispatch.
+///
+/// Evaluates `expr`, takes the first result, then tries each clause's pattern
+/// against it (in order). The first matching clause's body is evaluated with
+/// the matched bindings. `$else` always matches as a catch-all.
+///
+/// PeTTa reference: `case(Value, PatternBodyPairs)` compiles to
+/// match-then-evaluate over the list of (pattern, body) pairs.
+///
+/// # Errors
+/// Returns error if no clause matches the value.
+fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "case: expected (expr (clauses...)), got {} args",
+            args.len()
+        ));
+    }
+
+    // Evaluate the expression, take first result
+    let mut expr_results = eval(&args[0], env, funcs)?;
+    let val = expr_results.next().ok_or_else(|| {
+        "case: expression produced no results".to_string()
+    })?;
+
+    // Get clauses list
+    let clauses = match &args[1] {
+        Expr::List(items) => items,
+        _ => return Err("case: second arg must be a list of (pattern body) pairs".into()),
+    };
+
+    // Try each clause in order
+    for clause in clauses {
+        let (pattern, body) = match clause {
+            Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
+            _ => return Err(format!(
+                "case: each clause must be (pattern body), got {}",
+                clause.to_string()
+            )),
+        };
+
+        // $else always matches as catch-all
+        let catch_all = matches!(pattern, Expr::Symbol(s) if s == "$else");
+        if catch_all {
+            return eval(body, env, funcs);
+        }
+
+        // Try pattern match with fresh env
+        if let Some(match_env) = try_match_one(pattern, &val, &Env::new())? {
+            let pairs = collect_env_bindings(&match_env);
+            let new_env = env.extend_all(&pairs);
+            return eval(body, &new_env, funcs);
+        }
+    }
+
+    Err(format!(
+        "case: no clause matched value {}", val.to_sexpr_string()
+    ))
 }
