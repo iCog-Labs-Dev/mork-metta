@@ -31,6 +31,7 @@ fn f64_to_atom(f: f64) -> Atom {
 macro_rules! num_binary {
     ($table:ident, $name:expr, $int_op:expr, $float_op:expr) => {
         $table.insert_native($name, 2, |args, _| {
+            // SAFETY: arity dispatch guarantees exactly 2 args reach this closure.
             Ok(NDet::single(match (&args[0], &args[1]) {
                 // Both integers — stay integer (preserves truncating division etc.)
                 (Atom::Num(a), Atom::Num(b)) => Atom::Num($int_op(*a, *b)),
@@ -127,7 +128,11 @@ pub fn register_builtins(table: &FnTable) {
                     crate::parser::atom_to_expr(&items[1]),
                     crate::parser::atom_to_expr(&items[2]),
                 ) {
-                    let def_expr = Expr::List(vec![head_expr, body_expr]);
+                    let def_expr = Expr::List(vec![
+                        Expr::Symbol("=".to_string()),
+                        head_expr,
+                        body_expr,
+                    ]);
                     if let Ok((name, clause)) = crate::compile::compile_definition(&def_expr) {
                         table.add_clause(name, clause.patterns, clause.body);
                     }

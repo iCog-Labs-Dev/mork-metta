@@ -53,9 +53,10 @@
 /// - Function arguments are deterministic: only the first result of each
 ///   argument evaluation is used.
 
+use std::cell::Ref;
 use crate::atom::Atom;
 use crate::env::Env;
-use crate::func::{FnTable, FunctionKind, NDet};
+use crate::func::{FnTable, Function, FunctionKind, NDet};
 use crate::parser::{atom_to_expr, expr_to_atom, parse_forms, Expr, TopForm};
 use crate::space::Pattern;
 use crate::{trace, trace_enter, trace_exit};
@@ -144,18 +145,20 @@ fn try_call_or_data(
     env: &Env,
     funcs: &FnTable,
 ) -> Result<NDet, String> {
-    // Case 1: plain (non-$) symbol — either a known function or a data list.
+    // Case 1: plain (non-$) symbol — single get_ref lookup decides call vs data.
+    // No double-lookup: the Ref from get_ref is passed directly into call_with_ref.
     if let Expr::Symbol(s) = op {
         if !s.starts_with('$') {
             // SAFETY: args.len() is the number of parsed function arguments —
             // never exceeds practical limits (<10 in real usage). The cast to
             // u8 is safe because no MeTTa function has >255 args.
-            if funcs.has(s, args.len() as u8) {
-                return call_function(s, args, env, funcs);
-            }
-            // Unknown plain symbol → data list (single Expr atom)
-            trace!("→ unknown symbol '{}', treating as data list", s);
-            return eval_data_list(all_items, env, funcs);
+            return match funcs.get_ref(s, args.len() as u8) {
+                Some(func_ref) => call_with_ref(func_ref, s, args, env, funcs),
+                None => {
+                    trace!("→ unknown symbol '{}', treating as data list", s);
+                    eval_data_list(all_items, env, funcs)
+                }
+            };
         }
     }
 
@@ -168,8 +171,8 @@ fn try_call_or_data(
     };
     if let Atom::Sym(fname) = &op_val {
         // SAFETY: args.len() is small — see note above.
-        if funcs.has(fname, args.len() as u8) {
-            return call_function(fname, args, env, funcs);
+        if let Some(func_ref) = funcs.get_ref(fname, args.len() as u8) {
+            return call_with_ref(func_ref, fname, args, env, funcs);
         }
     }
     // Case 3: closure application — operator evaluated to a Closure.
@@ -221,22 +224,20 @@ fn apply_closure(
     }
 }
 
-/// Call a known function with the given arguments.
-/// Arguments are evaluated deterministically (first result of each).
-fn call_function(
+/// Dispatch a function call using a pre-retrieved reference — zero extra HashMap lookup.
+///
+/// Holding `func: Ref<'_, Function>` while evaluating args and body is safe:
+/// all concurrent borrows of `funcs.map` via `get_ref` are shared (immutable),
+/// and `borrow_mut` on `funcs.map` only occurs during initialization (add_clause /
+/// insert_native), never during eval.
+fn call_with_ref(
+    func: Ref<'_, Function>,
     op_name: &str,
     args: &[Expr],
     env: &Env,
     funcs: &FnTable,
 ) -> Result<NDet, String> {
     trace_enter!("call: {} ({} args)", op_name, args.len());
-    // SAFETY: args.len() is small (no function has >255 args). See try_call_or_data.
-    // get_ref returns a Ref<'_, Function> — zero clone, holds a shared borrow.
-    // Multiple concurrent Refs are fine because RefCell allows many immutable borrows.
-    let func = funcs.get_ref(op_name, args.len() as u8).ok_or_else(|| {
-        format!("internal: function {} with {} args disappeared from table",
-            op_name, args.len())
-    })?;
     // Evaluate arguments (take first result of each)
     let mut arg_vals = Vec::with_capacity(args.len());
     for (i, arg) in args.iter().enumerate() {
@@ -346,22 +347,6 @@ fn prepend_env(match_env: Env, base: &Env) -> Env {
     }
 }
 
-/// Collect all bindings from an environment into a Vec.
-/// Used by case/let match sites that need a `Vec<(String, Atom)>`.
-fn collect_env_bindings(env: &Env) -> Vec<(String, Atom)> {
-    let mut result = Vec::new();
-    let mut current = env;
-    loop {
-        match current {
-            Env::Empty => break,
-            Env::Cons { name, value, next } => {
-                result.push((name.to_string(), value.clone()));
-                current = next;
-            }
-        }
-    }
-    result
-}
 /// Match a single pattern against a single atom.
 ///
 /// Pattern kinds:
@@ -534,8 +519,7 @@ fn eval_let(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
         .filter_map(|v| {
             // Fresh match env prevents outer variable capture
             let match_env = try_match_one(pattern, &v, &Env::new(), funcs).ok()??;
-            let pairs = collect_env_bindings(&match_env);
-            let new_env = env.extend_all(&pairs);
+            let new_env = prepend_env(match_env, env);
             // REASON: body eval failure in nondet stream is skipped,
             // not propagated — matches PeTTa's backtracking semantics.
             eval(&args[2], &new_env, funcs).ok()
@@ -581,8 +565,7 @@ fn eval_let_star(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
                         format!("let*: pattern does not match value: {} vs {}",
                             pattern.to_string(), val.to_sexpr_string())
                     })?;
-                let pairs = collect_env_bindings(&match_env);
-                current_env = current_env.extend_all(&pairs);
+                current_env = prepend_env(match_env, &current_env);
             }
             _ => {
                 return Err("let*: each binding must be a list (pattern val)".into())
@@ -1003,10 +986,11 @@ fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<V
             "generator: expected function name, got {}", op_atom.to_sexpr_string()
         )),
     };
-    let func = funcs.get(&fname, arity as u8).ok_or_else(|| {
+    // SAFETY: arity = items.len() - 1; items is non-empty (guarded above), so arity < 256.
+    let func_ref = funcs.get_ref(&fname, arity as u8).ok_or_else(|| {
         format!("generator: unknown function {} with {} args", fname, arity)
     })?;
-    match &func.kind {
+    match &func_ref.kind {
         FunctionKind::UserDefined { clauses } => {
             let mut results = Vec::new();
             for clause in clauses {
@@ -1063,8 +1047,7 @@ fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<V
                 if !matched {
                     continue;
                 }
-                let bindings = collect_env_bindings(&match_env);
-                let new_env = env.extend_all(&bindings);
+                let new_env = prepend_env(match_env, env);
                 let mut body_results = eval(&clause.body, &new_env, funcs)?;
                 while let Some(atom) = body_results.next() {
                     results.push(atom);
@@ -1269,23 +1252,25 @@ fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> 
         _ => return Err("case: second arg must be a list of (pattern body) pairs".into()),
     };
 
-    // If scrutinee produced no results, look for an (Empty body) clause.
-    // This is PeTTa's empty-set catch: (case (empty) (... (Empty fallback))).
-    if opt_val.is_none() {
-        for clause in clauses {
-            let (pattern, body) = match clause {
-                Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
-                _ => continue,
-            };
-            if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
-                return eval(body, env, funcs);
+    // Match on whether scrutinee produced a value — handles the (Empty body) catch case.
+    let val = match opt_val {
+        None => {
+            // Scrutinee produced no results: look for an (Empty body) clause.
+            // This is PeTTa's empty-set catch: (case (empty) (... (Empty fallback))).
+            for clause in clauses {
+                let (pattern, body) = match clause {
+                    Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
+                    _ => continue,
+                };
+                if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
+                    return eval(body, env, funcs);
+                }
             }
+            // No Empty clause — propagate emptiness
+            return Ok(NDet::stream(std::iter::empty()));
         }
-        // No Empty clause — propagate emptiness
-        return Ok(NDet::stream(std::iter::empty()));
-    }
-
-    let val = opt_val.unwrap();
+        Some(v) => v,
+    };
 
     // Try each clause in order; skip Empty (only applies to empty scrutinee)
     for clause in clauses {
@@ -1309,8 +1294,7 @@ fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> 
 
         // Try pattern match with fresh env
         if let Some(match_env) = try_match_one(pattern, &val, &Env::new(), funcs)? {
-            let pairs = collect_env_bindings(&match_env);
-            let new_env = env.extend_all(&pairs);
+            let new_env = prepend_env(match_env, env);
             return eval(body, &new_env, funcs);
         }
     }

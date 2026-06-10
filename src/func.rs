@@ -73,7 +73,7 @@ pub enum FunctionKind {
         clauses: Vec<Clause>,
     },
     Native {
-        #[allow(clippy::type_complexity)]
+        #[allow(clippy::type_complexity)] // REASON: fn pointer in enum variant — a type alias would obscure the actual signature without adding clarity
         func: fn(&[Atom], &FnTable) -> Result<NDet, String>,
     },
 }
@@ -125,6 +125,7 @@ impl FnTable {
     }
 
     pub fn add_clause(&self, name: String, patterns: Vec<Expr>, body: Expr) {
+        // SAFETY: no MeTTa function has >255 parameters in practice.
         let arity = patterns.len() as u8;
         let clause = Clause { patterns, body };
         let mut map = self.map.borrow_mut();
