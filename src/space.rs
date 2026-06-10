@@ -7,6 +7,7 @@
 /// - `LocalSpace` — simple `Vec`-based storage (no dependencies)
 /// - `MorkSpace` — wraps MORK's `PathMap` trie (requires `mork` feature)
 
+use std::collections::HashMap;
 use crate::atom::Atom;
 use crate::parser::Expr;
 
@@ -72,61 +73,120 @@ pub trait Space {
 }
 
 // ========================================================================
-// LocalSpace — simple Vec-based storage, no dependencies
+// LocalSpace — HashMap-indexed storage, no dependencies
 // ========================================================================
 
-/// A simple in-memory space backed by a `Vec<Atom>`.
-/// Used when the `mork` feature is not available.
-#[derive(Clone)]
+/// Extract the index key `(functor, list_len)` for an atom, if it has one.
+/// Only `Atom::Expr` starting with a `Sym` is indexable.
+fn index_key(atom: &Atom) -> Option<(String, usize)> {
+    if let Atom::Expr(items) = atom {
+        if let Some(Atom::Sym(f)) = items.first() {
+            return Some((f.clone(), items.len()));
+        }
+    }
+    None
+}
+
+/// Extract the index key a pattern can use for O(1) candidate lookup.
+/// Returns `None` when the first position is a wildcard/variable — full scan required.
+fn pattern_index_key(pattern: &Pattern) -> Option<(String, usize)> {
+    match pattern {
+        Pattern::Expr(pats) => match pats.first()? {
+            Pattern::Exact(Atom::Sym(f)) => Some((f.clone(), pats.len())),
+            _ => None,
+        },
+        Pattern::Exact(Atom::Expr(items)) => match items.first()? {
+            Atom::Sym(f) => Some((f.clone(), items.len())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// In-memory space indexed by `(functor, list_length)` for O(1) candidate lookup.
+///
+/// `(foo arg1 arg2)` atoms are stored in a bucket keyed by `("foo", 3)`.
+/// A pattern `(foo $x $y)` resolves to that bucket directly instead of scanning
+/// the entire space — matching k candidates instead of n total atoms.
+/// Bare `Sym`, `Num`, and non-symbol-headed `Expr` atoms fall into a scalar fallback.
+#[derive(Clone, Default)]
 pub struct LocalSpace {
-    atoms: Vec<Atom>,
+    indexed: HashMap<(String, usize), Vec<Atom>>,
+    scalars: Vec<Atom>,
 }
 
 impl LocalSpace {
-    pub fn new() -> Self {
-        LocalSpace { atoms: Vec::new() }
-    }
-    pub fn new_box() -> Box<dyn Space> {
-        Box::new(LocalSpace { atoms: Vec::new() })
-    }
+    pub fn new() -> Self { Self::default() }
+    pub fn new_box() -> Box<dyn Space> { Box::new(Self::default()) }
 }
 
 impl Space for LocalSpace {
     fn add_atom(&mut self, atom: &Atom) -> Result<(), String> {
-        self.atoms.push(atom.clone());
+        if let Some(key) = index_key(atom) {
+            self.indexed.entry(key).or_default().push(atom.clone());
+        } else {
+            self.scalars.push(atom.clone());
+        }
         Ok(())
     }
 
     fn remove_atom(&mut self, atom: &Atom) -> Result<bool, String> {
-        let len_before = self.atoms.len();
-        self.atoms.retain(|a| a != atom);
-        Ok(self.atoms.len() != len_before)
+        if let Some(key) = index_key(atom) {
+            if let Some(vec) = self.indexed.get_mut(&key) {
+                let before = vec.len();
+                vec.retain(|a| a != atom);
+                let removed = vec.len() < before;
+                if vec.is_empty() { self.indexed.remove(&key); }
+                return Ok(removed);
+            }
+            return Ok(false);
+        }
+        let before = self.scalars.len();
+        self.scalars.retain(|a| a != atom);
+        Ok(self.scalars.len() < before)
     }
 
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
-        self.atoms.iter().filter_map(|atom| match_one(pattern, atom)).collect()
+        if let Some(key) = pattern_index_key(pattern) {
+            // Hot path: only unify against atoms in the matching bucket.
+            return self.indexed.get(&key)
+                .map(|atoms| atoms.iter().filter_map(|a| match_one(pattern, a)).collect())
+                .unwrap_or_default();
+        }
+        // Full scan: wildcard or variable at functor position.
+        self.indexed.values()
+            .flat_map(|v| v.iter())
+            .chain(self.scalars.iter())
+            .filter_map(|a| match_one(pattern, a))
+            .collect()
     }
 
     fn get_atoms(&self) -> Vec<Atom> {
-        self.atoms.clone()
+        self.indexed.values()
+            .flat_map(|v| v.iter().cloned())
+            .chain(self.scalars.iter().cloned())
+            .collect()
     }
 
-    fn description(&self) -> &str {
-        "LocalSpace (Vec)"
-    }
+    fn description(&self) -> &str { "LocalSpace (indexed by functor+arity)" }
 }
 
 // ========================================================================
 // MorkSpace — wraps MORK's PathMap trie
 // ========================================================================
 
-/// Space backed by MORK's hypergraph trie.
+/// Space backed by MORK's hypergraph trie, with a shadow `LocalSpace` for queries.
 ///
-/// Atoms are serialized to S-expression strings for MORK's text-based API,
-/// and results are parsed back into our `Atom` type.
+/// Writes go to the kernel PathMap (byte-encoded S-expressions) for persistence.
+/// Reads are served from the shadow — zero serialization round-trip, and first-
+/// argument indexing via `LocalSpace`'s HashMap buckets. The previous design
+/// called `dump_all_sexpr()` on every query, re-parsing the entire space each time.
 #[cfg(feature = "mork")]
 pub struct MorkSpace {
     inner: mork::space::Space<mork::weightedsweep::U64AtomHeader>,
+    /// Mirrors `inner` in Rust form — serves all read operations without going
+    /// through the serialization round-trip.
+    shadow: LocalSpace,
 }
 
 #[cfg(feature = "mork")]
@@ -134,6 +194,7 @@ impl MorkSpace {
     pub fn new() -> Self {
         MorkSpace {
             inner: mork::space::Space::new(),
+            shadow: LocalSpace::new(),
         }
     }
 }
@@ -143,39 +204,26 @@ impl Space for MorkSpace {
     fn add_atom(&mut self, atom: &Atom) -> Result<(), String> {
         let sexpr = atom.to_sexpr_string();
         self.inner.add_all_sexpr(sexpr.as_bytes())?;
-        Ok(())
+        self.shadow.add_atom(atom)
     }
 
     fn remove_atom(&mut self, atom: &Atom) -> Result<bool, String> {
         let sexpr = atom.to_sexpr_string();
         let count = self.inner.remove_all_sexpr(sexpr.as_bytes())?;
+        self.shadow.remove_atom(atom)?;
         Ok(count > 0)
     }
 
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
-        self.get_atoms().iter().filter_map(|atom| match_one(pattern, atom)).collect()
+        // Shadow: no dump_all_sexpr, no parse loop, first-arg indexed.
+        self.shadow.match_atoms(pattern)
     }
 
     fn get_atoms(&self) -> Vec<Atom> {
-        let mut buf = Vec::new();
-        if self.inner.dump_all_sexpr(&mut buf).is_err() {
-            return Vec::new();
-        }
-        let text = String::from_utf8(buf).unwrap_or_default();
-        text.lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                if line.is_empty() {
-                    return None;
-                }
-                parse_one_atom(line).ok()
-            })
-            .collect()
+        self.shadow.get_atoms()
     }
 
-    fn description(&self) -> &str {
-        "MorkSpace (PathMap trie)"
-    }
+    fn description(&self) -> &str { "MorkSpace (PathMap trie + indexed shadow)" }
 }
 
 // ========================================================================
