@@ -7,6 +7,16 @@ use crate::atom::Atom;
 use crate::func::{FnTable, NDet};
 use crate::parser::Expr;
 
+macro_rules! bool_clause {
+    ($table:ident, $name:expr, [$($p:expr),+], $body:expr) => {
+        $table.add_clause(
+            $name.to_string(),
+            vec![$( Expr::Symbol($p.to_string()) ),+],
+            Expr::Symbol($body.to_string()),
+        );
+    };
+}
+
 /// Extract a numeric value: Atom::Num(n) → n as f64, or a symbol that looks
 /// like a float (e.g. "40.7") → parsed f64. Integers stay exact.
 fn atom_as_f64(atom: &Atom, name: &str) -> Result<f64, String> {
@@ -24,7 +34,7 @@ fn f64_to_atom(f: f64) -> Atom {
     if f.fract() == 0.0 && f >= i128::MIN as f64 && f <= i128::MAX as f64 {
         Atom::Num(f as i128)
     } else {
-        Atom::Sym(format!("{}", f))
+        Atom::sym(&f.to_string())
     }
 }
 
@@ -54,7 +64,7 @@ macro_rules! cmp_binary {
             Ok(NDet::single(if $op(a, b) {
                 Atom::sym("True")
             } else {
-                Atom::Sym(String::new())
+                Atom::sym("")
             }))
         });
     };
@@ -62,6 +72,18 @@ macro_rules! cmp_binary {
 
 /// Register all built-in functions into the given function table.
 pub fn register_builtins(table: &FnTable) {
+    // Boolean truth tables (user-defined clauses so constraint eval threads bindings)
+    bool_clause!(table, "or",  ["True",  "True"],  "True");
+    bool_clause!(table, "or",  ["True",  "False"], "True");
+    bool_clause!(table, "or",  ["False", "True"],  "True");
+    bool_clause!(table, "or",  ["False", "False"], "False");
+    bool_clause!(table, "and", ["True",  "True"],  "True");
+    bool_clause!(table, "and", ["True",  "False"], "False");
+    bool_clause!(table, "and", ["False", "True"],  "False");
+    bool_clause!(table, "and", ["False", "False"], "False");
+    bool_clause!(table, "not", ["True"],           "False");
+    bool_clause!(table, "not", ["False"],          "True");
+
     // Arithmetic: integer ops when both args are Num, float ops otherwise
     num_binary!(table, "+", |a: i128, b: i128| a + b, |a: f64, b: f64| a + b);
     num_binary!(table, "-", |a: i128, b: i128| a - b, |a: f64, b: f64| a - b);
@@ -95,7 +117,7 @@ pub fn register_builtins(table: &FnTable) {
         Ok(NDet::single(if args[0] == args[1] {
             Atom::sym("True")
         } else {
-            Atom::Sym(String::new())
+            Atom::sym("")
         }))
     });
 
@@ -171,7 +193,7 @@ pub fn register_builtins(table: &FnTable) {
         Ok(NDet::single(if removed {
             Atom::sym("true")
         } else {
-            Atom::Sym(String::new()) // false/empty
+            Atom::sym("")
         }))
     });
 
@@ -185,7 +207,7 @@ pub fn register_builtins(table: &FnTable) {
     table.insert_native("get-state", 1, |args, table| {
         expect_n_args(args, 1, "get-state")?;
         let key = match &args[0] {
-            Atom::Sym(s) => s.clone(),
+            Atom::Sym(s) => s.to_string(),
             other => return Err(format!("get-state: key must be a symbol, got {}", other.to_sexpr_string())),
         };
         let state = table.state.borrow();
@@ -199,7 +221,7 @@ pub fn register_builtins(table: &FnTable) {
     table.insert_native("change-state!", 2, |args, table| {
         expect_n_args(args, 2, "change-state!")?;
         let key = match &args[0] {
-            Atom::Sym(s) => s.clone(),
+            Atom::Sym(s) => s.to_string(),
             other => return Err(format!("change-state!: key must be a symbol, got {}", other.to_sexpr_string())),
         };
         table.state.borrow_mut().insert(key, args[1].clone());
@@ -211,7 +233,7 @@ pub fn register_builtins(table: &FnTable) {
     table.insert_native("bind!", 2, |args, table| {
         expect_n_args(args, 2, "bind!")?;
         let key = match &args[0] {
-            Atom::Sym(s) => s.clone(),
+            Atom::Sym(s) => s.to_string(),
             other => return Err(format!("bind!: key must be a symbol, got {}", other.to_sexpr_string())),
         };
         // PeTTa semantics: destructure (new-state value) wrapper
@@ -316,8 +338,8 @@ pub fn register_builtins(table: &FnTable) {
 fn alpha_equiv(
     a: &Atom,
     b: &Atom,
-    map_ab: &mut std::collections::HashMap<String, String>,
-    map_ba: &mut std::collections::HashMap<String, String>,
+    map_ab: &mut std::collections::HashMap<std::sync::Arc<str>, std::sync::Arc<str>>,
+    map_ba: &mut std::collections::HashMap<std::sync::Arc<str>, std::sync::Arc<str>>,
 ) -> bool {
     match (a, b) {
         (Atom::Sym(sa), Atom::Sym(sb)) => {
@@ -326,9 +348,9 @@ fn alpha_equiv(
             match (a_var, b_var) {
                 (true, true) => {
                     let fwd = map_ab.entry(sa.clone()).or_insert_with(|| sb.clone());
-                    let fwd_ok = fwd.as_str() == sb.as_str();
+                    let fwd_ok = fwd == sb;
                     let bwd = map_ba.entry(sb.clone()).or_insert_with(|| sa.clone());
-                    fwd_ok && bwd.as_str() == sa.as_str()
+                    fwd_ok && bwd == sa
                 }
                 (false, false) => sa == sb,
                 _ => false,

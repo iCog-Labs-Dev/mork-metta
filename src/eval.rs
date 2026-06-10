@@ -376,9 +376,9 @@ fn try_match_one(
             _ => Ok(None),
         },
         Expr::Symbol(s) => match atom {
-            Atom::Sym(t) if s == t => Ok(Some(env.clone())),
+            Atom::Sym(t) if s.as_str() == t.as_ref() => Ok(Some(env.clone())),
             // Free variable from term conversion: bind to the literal symbol.
-            Atom::Sym(v) if v.starts_with('$') => Ok(Some(env.extend(v, Atom::Sym(s.clone())))),
+            Atom::Sym(v) if v.starts_with('$') => Ok(Some(env.extend(v, Atom::sym(s)))),
             _ => Ok(None),
         },
         Expr::List(items) => match atom {
@@ -458,25 +458,136 @@ fn eval_data_list(items: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, St
 // Special form evaluators
 // ========================================================================
 
+/// Evaluate `expr` returning (result, bindings) pairs.
+///
+/// When a UserDefined function is called with free-variable atoms as arguments
+/// (atoms whose name starts with `$`), every clause is tried via reversed
+/// unification and the bindings collected from each successful match travel
+/// alongside the result. Those bindings let `eval_if` extend the environment
+/// for template evaluation (constraint-style: `(if (and (or $x True) $y) ($x $y))`).
+///
+/// For native functions and non-call expressions the behaviour is identical to
+/// `eval` — each result is wrapped with an empty `Env`.
+fn eval_constrained(
+    expr: &Expr,
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<Vec<(Atom, Env)>, String> {
+    // Free variable: return the atom (bound or self-evaluated) with no new bindings.
+    if let Expr::Symbol(s) = expr {
+        if s.starts_with('$') {
+            let val = env.get(s).unwrap_or_else(|| Atom::sym(s));
+            return Ok(vec![(val, Env::new())]);
+        }
+    }
+    // UserDefined function call: propagate bindings through clause matching.
+    if let Expr::List(items) = expr {
+        if !items.is_empty() {
+            if let Expr::Symbol(fname) = &items[0] {
+                if !fname.starts_with('$') {
+                    let arity = (items.len() - 1) as u8;
+                    let args = &items[1..];
+                    if let Some(func) = funcs.get(fname, arity) {
+                        if let FunctionKind::UserDefined { clauses } = func.kind {
+                            // Evaluate each arg with constraint awareness.
+                            let mut arg_streams: Vec<Vec<(Atom, Env)>> =
+                                Vec::with_capacity(args.len());
+                            for arg in args {
+                                arg_streams.push(eval_constrained(arg, env, funcs)?);
+                            }
+                            let combos = constrained_cartesian(arg_streams);
+                            let mut out: Vec<(Atom, Env)> = Vec::new();
+                            for (atom_args, arg_bindings) in combos {
+                                for clause in &clauses {
+                                    // Pass Env::new() so the returned Env is *only* new bindings.
+                                    match try_match_clause(
+                                        &clause.patterns,
+                                        &atom_args,
+                                        &Env::new(),
+                                        funcs,
+                                    )? {
+                                        Some(clause_bindings) => {
+                                            let full_env =
+                                                prepend_env(clause_bindings.clone(), env);
+                                            let body_results = eval_constrained(
+                                                &clause.body,
+                                                &full_env,
+                                                funcs,
+                                            )?;
+                                            for (atom, body_bindings) in body_results {
+                                                let accumulated = prepend_env(
+                                                    body_bindings,
+                                                    &prepend_env(
+                                                        clause_bindings.clone(),
+                                                        &arg_bindings,
+                                                    ),
+                                                );
+                                                out.push((atom, accumulated));
+                                            }
+                                        }
+                                        None => {}
+                                    }
+                                }
+                            }
+                            if !out.is_empty() {
+                                return Ok(out);
+                            }
+                            // No clause matched — fall through to eval for error message.
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: normal eval, wrap each result with empty bindings.
+    eval(expr, env, funcs).map(|ndet| ndet.map(|a| (a, Env::new())).collect())
+}
+
+/// Build the cartesian product of per-argument result streams, accumulating bindings.
+fn constrained_cartesian(streams: Vec<Vec<(Atom, Env)>>) -> Vec<(Vec<Atom>, Env)> {
+    let mut result: Vec<(Vec<Atom>, Env)> = vec![(vec![], Env::new())];
+    for stream in streams {
+        let mut next: Vec<(Vec<Atom>, Env)> = Vec::new();
+        for (atoms, env_acc) in result {
+            for (atom, bindings) in &stream {
+                let mut new_atoms = atoms.clone();
+                new_atoms.push(atom.clone());
+                let new_env = prepend_env(bindings.clone(), &env_acc);
+                next.push((new_atoms, new_env));
+            }
+        }
+        result = next;
+    }
+    result
+}
+
 /// Evaluate `(if cond then else)`.
 fn eval_if(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
-    if args.len() != 3 {
+    if args.len() < 2 || args.len() > 3 {
         return Err(format!(
-            "if: expected 3 args (cond then else), got {}",
+            "if: expected 2 or 3 args, got {}",
             args.len()
         ));
     }
-    let mut cond_results = eval(&args[0], env, funcs)?;
-    let cond = cond_results
-        .next()
-        .ok_or_else(|| "if: condition produced no results".to_string())?;
-    if cond.is_truthy() {
-        trace!("if: cond truthy, taking then branch");
-        eval(&args[1], env, funcs)
-    } else {
-        trace!("if: cond falsy, taking else branch");
-        eval(&args[2], env, funcs)
+    // Use constraint-aware evaluation for the condition so free-variable bindings
+    // (e.g. $x→True from clause matching) are threaded into the template.
+    let mut out: Vec<Atom> = Vec::new();
+    for (cond, cond_bindings) in eval_constrained(&args[0], env, funcs)? {
+        if cond.is_truthy() {
+            let then_env = prepend_env(cond_bindings, env);
+            out.extend(eval(&args[1], &then_env, funcs)?);
+        } else if let Some(else_expr) = args.get(2) {
+            out.extend(eval(else_expr, env, funcs)?);
+        }
+        // 2-arg form: false condition contributes nothing
     }
+    Ok(match out.len() {
+        0 => NDet::stream(std::iter::empty()),
+        1 => NDet::single(out.remove(0)),
+        // Multiple constraint solutions: collect into a single list atom so
+        // (test (if cond tmpl) ((sol1) (sol2))) comparisons work directly.
+        _ => NDet::single(Atom::Expr(out)),
+    })
 }
 
 /// Evaluate `(progn e1 e2 ...)` — sequence.
@@ -726,7 +837,7 @@ fn eval_remove_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, S
     Ok(NDet::single(if removed {
         Atom::sym("true")
     } else {
-        Atom::Sym(String::new())
+        Atom::sym("")
     }))
 }
 
@@ -860,14 +971,14 @@ pub fn load_metta_file(
     path: &std::path::Path,
     env: &Env,
     funcs: &FnTable,
-) -> Result<Option<Atom>, String> {
+) -> Result<Vec<Atom>, String> {
     use std::io::{BufRead, BufReader};
     let file = std::fs::File::open(path)
         .map_err(|e| format!("cannot open '{}': {}", path.display(), e))?;
     let mut form_buf = String::with_capacity(256);
     let mut depth: i32 = 0;
     let mut saw_bang = false;
-    let mut last_result: Option<Atom> = None;
+    let mut results: Vec<Atom> = Vec::new();
     for (line_no, line_result) in BufReader::new(file).lines().enumerate() {
         let line = line_result
             .map_err(|e| format!("read error at line {} in '{}': {}", line_no + 1, path.display(), e))?;
@@ -880,8 +991,11 @@ pub fn load_metta_file(
                     depth -= 1;
                     form_buf.push(ch);
                     if depth == 0 {
-                        last_result = process_form(&form_buf, saw_bang, env, funcs)
-                            .map_err(|e| format!("{} (in '{}' near line {})", e, path.display(), line_no + 1))?;
+                        if let Some(result) = process_form(&form_buf, saw_bang, env, funcs)
+                            .map_err(|e| format!("{} (in '{}' near line {})", e, path.display(), line_no + 1))?
+                        {
+                            results.push(result);
+                        }
                         form_buf.clear();
                         saw_bang = false;
                     }
@@ -895,7 +1009,7 @@ pub fn load_metta_file(
     if depth != 0 {
         return Err(format!("unclosed '(' in '{}'", path.display()));
     }
-    Ok(last_result)
+    Ok(results)
 }
 
 /// Parse a single buffered form string and dispatch it.
@@ -1140,7 +1254,7 @@ fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<V
                                     has_free = true;
                                 }
                                 Expr::Symbol(sym) if !sym.starts_with('$') => {
-                                    concrete_args.push(Atom::Sym(sym.clone()));
+                                    concrete_args.push(Atom::sym(sym));
                                     has_free = true;
                                 }
                                 _ => {
@@ -1273,7 +1387,7 @@ fn eval_map_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
         let result = match &func_atom {
             Atom::Sym(fname) => {
                 let elem_expr = atom_to_expr(elem)?;
-                let call_expr = Expr::List(vec![Expr::Symbol(fname.clone()), elem_expr]);
+                let call_expr = Expr::List(vec![Expr::Symbol(fname.to_string()), elem_expr]);
                 let mut r = eval(&call_expr, env, funcs)?;
                 r.next().ok_or_else(|| format!(
                     "map-atom: {} returned no result for {}",
@@ -1370,64 +1484,64 @@ fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> 
         ));
     }
 
-    // Evaluate the scrutinee
-    let mut expr_results = eval(&args[0], env, funcs)?;
-    let opt_val = expr_results.next();
-
-    // Get clauses list
+    // Get clauses list up front
     let clauses = match &args[1] {
         Expr::List(items) => items,
         _ => return Err("case: second arg must be a list of (pattern body) pairs".into()),
     };
 
-    // Match on whether scrutinee produced a value — handles the (Empty body) catch case.
-    let val = match opt_val {
-        None => {
-            // Scrutinee produced no results: look for an (Empty body) clause.
-            // This is PeTTa's empty-set catch: (case (empty) (... (Empty fallback))).
-            for clause in clauses {
-                let (pattern, body) = match clause {
-                    Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
-                    _ => continue,
-                };
-                if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
-                    return eval(body, env, funcs);
-                }
+    // Collect all scrutinee values (may be nondeterministic)
+    let vals: Vec<Atom> = eval(&args[0], env, funcs)?.collect();
+
+    // Empty scrutinee: look for (Empty body) clause
+    if vals.is_empty() {
+        for clause in clauses {
+            let (pattern, body) = match clause {
+                Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
+                _ => continue,
+            };
+            if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
+                return eval(body, env, funcs);
             }
-            // No Empty clause — propagate emptiness
-            return Ok(NDet::stream(std::iter::empty()));
         }
-        Some(v) => v,
-    };
-
-    // Try each clause in order; skip Empty (only applies to empty scrutinee)
-    for clause in clauses {
-        let (pattern, body) = match clause {
-            Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
-            _ => return Err(format!(
-                "case: each clause must be (pattern body), got {}",
-                clause.to_string()
-            )),
-        };
-
-        // Skip the Empty catch-all (scrutinee was non-empty)
-        if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
-            continue;
-        }
-
-        // $else always matches as catch-all
-        if matches!(pattern, Expr::Symbol(s) if s == "$else") {
-            return eval(body, env, funcs);
-        }
-
-        // Try pattern match with fresh env
-        if let Some(match_env) = try_match_one(pattern, &val, &Env::new(), funcs)? {
-            let new_env = prepend_env(match_env, env);
-            return eval(body, &new_env, funcs);
-        }
+        return Ok(NDet::stream(std::iter::empty()));
     }
 
-    Err(format!(
-        "case: no clause matched value {}", val.to_sexpr_string()
-    ))
+    // Fan out: for each scrutinee value, match clauses and collect results
+    let mut out: Vec<Atom> = Vec::new();
+    for val in vals {
+        let mut matched = false;
+        for clause in clauses {
+            let (pattern, body) = match clause {
+                Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
+                _ => return Err(format!(
+                    "case: each clause must be (pattern body), got {}",
+                    clause.to_string()
+                )),
+            };
+
+            if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
+                continue;
+            }
+
+            if matches!(pattern, Expr::Symbol(s) if s == "$else") {
+                out.extend(eval(body, env, funcs)?);
+                matched = true;
+                break;
+            }
+
+            if let Some(match_env) = try_match_one(pattern, &val, &Env::new(), funcs)? {
+                let new_env = prepend_env(match_env, env);
+                out.extend(eval(body, &new_env, funcs)?);
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return Err(format!(
+                "case: no clause matched value {}", val.to_sexpr_string()
+            ));
+        }
+    }
+    Ok(NDet::stream(out.into_iter()))
 }
