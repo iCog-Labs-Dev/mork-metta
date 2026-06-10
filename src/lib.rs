@@ -107,12 +107,14 @@ impl Runtime {
     pub fn load_form(&mut self, form: TopForm) -> Result<Option<Atom>, String> {
         match form {
             TopForm::Definition(expr) => {
-                let (name, clause) = compile_definition(&expr)?;
-                // Store the raw definition atom in the space
+                // Store the atom in the space unconditionally — plain data atoms
+                // like `(kb 1)` are valid top-level forms that go into &self.
                 let atom = expr_to_atom(&expr);
                 self.funcs.space.borrow_mut().add_atom(&atom)?;
-                // Register clause in the function table
-                self.funcs.add_clause(name, clause.patterns, clause.body);
+                // Only compile as a function if it's a (= head body) form.
+                if let Ok((name, clause)) = compile_definition(&expr) {
+                    self.funcs.add_clause(name, clause.patterns, clause.body);
+                }
                 Ok(None)
             }
             TopForm::Runnable(expr) => {
