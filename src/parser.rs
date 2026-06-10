@@ -33,8 +33,8 @@ pub enum TopForm {
 pub enum Expr {
     /// A symbolic token: `fib`, `$N`, `+`, `if`, `=`
     Symbol(String),
-    /// An integer literal: `30`, `-1`, `0`
-    Number(i64),
+    /// An integer literal: `30`, `-1`, `354224848179261915075`
+    Number(i128),
     /// A parenthesized list: `(fib 30)`, `(+ $N 1)`
     List(Vec<Expr>),
 }
@@ -181,7 +181,7 @@ fn parse_sexpr_body(
             }
             Some(&_c) => {
                 let token = read_token(chars);
-                if let Ok(n) = token.parse::<i64>() {
+                if let Ok(n) = token.parse::<i128>() {
                     items.push(Expr::Number(n));
                 } else {
                     items.push(Expr::Symbol(token));

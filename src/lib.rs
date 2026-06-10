@@ -135,10 +135,17 @@ impl Runtime {
         Ok(last)
     }
 
-    /// Load and process a `.metta` file.
+    /// Load and process a `.metta` file with streaming form-by-form parsing.
+    ///
+    /// Unlike `eval_str`, this never loads the whole file into memory — safe for
+    /// files with millions of atom assertions. Sets `import_dir` to the file's
+    /// parent directory so that `import!` inside the file resolves paths relative
+    /// to the file, not the caller's CWD.
     pub fn load_file(&mut self, path: &str) -> Result<Option<Atom>, String> {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("cannot read file: {}", e))?;
-        self.eval_str(&content)
+        let path = std::path::Path::new(path);
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        *self.funcs.import_dir.borrow_mut() = dir.to_path_buf();
+        let env = crate::env::Env::new();
+        crate::eval::load_metta_file(path, &env, &self.funcs)
     }
 }

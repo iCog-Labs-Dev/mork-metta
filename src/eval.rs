@@ -777,8 +777,14 @@ fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String>
 
 /// Evaluate `(import! space path)` — load a MeTTa file into the space.
 ///
-/// Loads a `.metta` file relative to the current working directory and
-/// processes its top-level forms, adding definitions to the space.
+/// Path resolution order (first match wins, each tried with and without `.metta`):
+///   1. As-is from CWD
+///   2. Relative to the importing file's directory (`funcs.import_dir`)
+///
+/// Files are loaded with a streaming form-by-form parser — only one balanced
+/// expression is held in memory at a time, so billion-line data files are safe.
+/// `import_dir` is updated for the duration of the nested load so that imports
+/// inside an imported file also resolve relative to their own location.
 fn eval_import(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 2 {
         return Err(format!(
@@ -791,45 +797,130 @@ fn eval_import(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String
     let _space_ref = space_results.next().ok_or_else(|| {
         "import!: space expression produced no results".to_string()
     })?;
-    // Get file path from args[1] — could be a symbol or string
+    // Extract path string
     let path_str = match &args[1] {
         Expr::Symbol(s) => s.clone(),
-        Expr::Number(_) => {
-            return Err("import!: file path must be a symbol, not a number".into());
-        }
-        Expr::List(_) => {
-            return Err("import!: file path must be a symbol, not a list".into());
-        }
+        Expr::Number(_) => return Err("import!: file path must be a symbol, not a number".into()),
+        Expr::List(_)   => return Err("import!: file path must be a symbol, not a list".into()),
     };
-    // Try to load the file — support both .metta and bare paths
-    let content = std::fs::read_to_string(&path_str)
-        .or_else(|_| {
-            let with_ext = format!("{}.metta", path_str);
-            std::fs::read_to_string(&with_ext)
-        })
-        .map_err(|e| format!("import!: cannot read '{}': {}", path_str, e))?;
-    let forms = crate::parser::parse_forms(&content)
-        .map_err(|e| format!("import!: parse error in '{}': {}", path_str, e))?;
-    for form in forms {
-        match form {
-            TopForm::Definition(expr) => {
-                // Store the raw definition atom in the space
-                let atom = expr_to_atom(&expr);
-                if let Err(e) = funcs.space.borrow_mut().add_atom(&atom) {
-                    return Err(format!("import!: add_atom error: {}", e));
+    // Resolve path: CWD first, then relative to the importing file's directory.
+    let import_dir = funcs.import_dir.borrow().clone();
+    let resolved = resolve_import_path(&path_str, &import_dir)
+        .ok_or_else(|| format!(
+            "import!: cannot find '{}' (searched CWD and '{}')",
+            path_str, import_dir.display()
+        ))?;
+    // Push the imported file's directory so nested imports resolve relative to it.
+    let new_dir = resolved.parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let prev_dir = funcs.import_dir.replace(new_dir);
+    let result = load_metta_file(&resolved, env, funcs);
+    funcs.import_dir.replace(prev_dir);
+    result?;
+    Ok(NDet::single(Atom::sym("true")))
+}
+
+/// Resolve an import path: try as-is from CWD, then relative to `import_dir`.
+/// Both variants are tried with and without the `.metta` extension.
+fn resolve_import_path(
+    path_str: &str,
+    import_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let candidates = [
+        std::path::PathBuf::from(path_str),
+        std::path::PathBuf::from(format!("{}.metta", path_str)),
+        import_dir.join(path_str),
+        import_dir.join(format!("{}.metta", path_str)),
+    ];
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// Stream-load a `.metta` file: parse one balanced form at a time and process
+/// it immediately, so only O(1-form) memory is used regardless of file size.
+///
+/// Returns the first result of the last runnable form, or `None` if the file
+/// ends with a definition (matching the semantics of `load_form`).
+pub fn load_metta_file(
+    path: &std::path::Path,
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<Option<Atom>, String> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("cannot open '{}': {}", path.display(), e))?;
+    let mut form_buf = String::with_capacity(256);
+    let mut depth: i32 = 0;
+    let mut saw_bang = false;
+    let mut last_result: Option<Atom> = None;
+    for (line_no, line_result) in BufReader::new(file).lines().enumerate() {
+        let line = line_result
+            .map_err(|e| format!("read error at line {} in '{}': {}", line_no + 1, path.display(), e))?;
+        for ch in line.chars() {
+            match ch {
+                ';' => break,           // rest of line is a comment
+                '!' if depth == 0 => saw_bang = true,
+                '(' => { depth += 1; form_buf.push(ch); }
+                ')' if depth > 0 => {
+                    depth -= 1;
+                    form_buf.push(ch);
+                    if depth == 0 {
+                        last_result = process_form(&form_buf, saw_bang, env, funcs)
+                            .map_err(|e| format!("{} (in '{}' near line {})", e, path.display(), line_no + 1))?;
+                        form_buf.clear();
+                        saw_bang = false;
+                    }
                 }
-                // Register the function clause so it's immediately available
-                if let Ok((name, clause)) = crate::compile::compile_definition(&expr) {
-                    funcs.add_clause(name, clause.patterns, clause.body);
-                }
-            }
-            TopForm::Runnable(expr) => {
-                // PeTTa: load_metta_file processes all forms including !(...) runnables.
-                eval(&expr, env, funcs)?;
+                ')' => return Err(format!("unmatched ')' in '{}' at line {}", path.display(), line_no + 1)),
+                _ if depth > 0 => form_buf.push(ch),
+                _ => {}                 // whitespace / other between forms
             }
         }
     }
-    Ok(NDet::single(Atom::sym("true")))
+    if depth != 0 {
+        return Err(format!("unclosed '(' in '{}'", path.display()));
+    }
+    Ok(last_result)
+}
+
+/// Parse a single buffered form string and dispatch it.
+fn process_form(
+    form: &str,
+    is_runnable: bool,
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<Option<Atom>, String> {
+    let prefixed;
+    let src: &str = if is_runnable {
+        prefixed = format!("!{}", form);
+        &prefixed
+    } else {
+        form
+    };
+    let mut last = None;
+    for top_form in crate::parser::parse_forms(src)? {
+        last = process_top_form(top_form, env, funcs)?;
+    }
+    Ok(last)
+}
+
+/// Process a single top-level form: store+compile definitions, eval runnables.
+fn process_top_form(form: TopForm, env: &Env, funcs: &FnTable) -> Result<Option<Atom>, String> {
+    match form {
+        TopForm::Definition(expr) => {
+            let atom = expr_to_atom(&expr);
+            funcs.space.borrow_mut().add_atom(&atom)
+                .map_err(|e| format!("add_atom: {}", e))?;
+            if let Ok((name, clause)) = crate::compile::compile_definition(&expr) {
+                funcs.add_clause(name, clause.patterns, clause.body);
+            }
+            Ok(None)
+        }
+        TopForm::Runnable(expr) => {
+            let mut results = eval(&expr, env, funcs)?;
+            Ok(results.next())
+        }
+    }
 }
 
 /// Evaluate `(println! arg)` — print a value to stdout (for debugging).

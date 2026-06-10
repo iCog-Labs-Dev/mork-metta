@@ -397,7 +397,7 @@ fn parse_value(chars: &[char], pos: &mut usize) -> Result<Atom, String> {
                 *pos += 1;
             }
             let num_str: String = chars[start..*pos].iter().collect();
-            let n: i64 = num_str.parse().map_err(|_| format!("invalid number: {}", num_str))?;
+            let n: i128 = num_str.parse().map_err(|_| format!("invalid number: {}", num_str))?;
             Ok(Atom::Num(n))
         }
         c if c.is_alphanumeric() || "$!?<>=+-*/_".contains(c) => {

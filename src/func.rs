@@ -15,6 +15,7 @@
 
 use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use crate::parser::Expr;
 use crate::atom::Atom;
 use crate::space::Space;
@@ -95,6 +96,10 @@ pub struct FnTable {
     pub space: RefCell<Box<dyn Space>>,
     /// Mutable state store for `get-state`, `change-state!`, `bind!`.
     pub state: RefCell<HashMap<String, Atom>>,
+    /// Directory of the file currently being loaded.
+    /// Updated before each file load and restored after — forms a stack
+    /// across nested imports so relative paths always resolve correctly.
+    pub import_dir: RefCell<PathBuf>,
 }
 
 impl Clone for FnTable {
@@ -103,6 +108,7 @@ impl Clone for FnTable {
             map: RefCell::new(self.map.borrow().clone()),
             space: RefCell::new(crate::space::LocalSpace::new_box()),
             state: RefCell::new(HashMap::new()),
+            import_dir: RefCell::new(self.import_dir.borrow().clone()),
         }
     }
 }
@@ -113,6 +119,7 @@ impl FnTable {
             map: RefCell::new(HashMap::new()),
             space: RefCell::new(crate::space::LocalSpace::new_box()),
             state: RefCell::new(HashMap::new()),
+            import_dir: RefCell::new(PathBuf::from(".")),
         }
     }
 
@@ -121,6 +128,7 @@ impl FnTable {
             map: RefCell::new(HashMap::new()),
             space: RefCell::new(space),
             state: RefCell::new(HashMap::new()),
+            import_dir: RefCell::new(PathBuf::from(".")),
         }
     }
 

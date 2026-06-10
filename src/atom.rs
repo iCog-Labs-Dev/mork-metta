@@ -1,7 +1,7 @@
 /// Core value type for the MeTTa evaluator.
 ///
 /// Every value in MeTTa is an Atom. Atoms are either:
-/// - `Num(i64)` — integer numbers
+/// - `Num(i128)` — integer numbers (i128 handles fib(100) = 354224848179261915075)
 /// - `Sym(String)` — symbolic names (functions, variables, bare symbols)
 /// - `Expr(Vec<Atom>)` — S-expressions (nested lists)
 /// - `Closure { params, body, env }` — anonymous functions (|->)
@@ -10,7 +10,7 @@
 /// are replaced by their values from the environment during evaluation.
 ///
 /// # Assumptions
-/// - Numbers are 64-bit signed integers (no floats, no bigints).
+/// - Numbers are 128-bit signed integers (no floats, no bigints).
 /// - Symbols are Unicode strings stored as-is (no interning).
 /// - `Expr` is an owned, fully-evaluated value — not a thunk or promise.
 /// - `Atom::Expr` with no elements represents the empty list `()`.
@@ -32,8 +32,8 @@ pub struct ClosureData {
 pub enum Atom {
     /// A symbolic name: function names, variable names (with $ prefix), data symbols.
     Sym(String),
-    /// A 64-bit signed integer.
-    Num(i64),
+    /// A 128-bit signed integer.
+    Num(i128),
     /// An S-expression — ordered list of atoms.
     Expr(Vec<Atom>),
     /// An anonymous function created by `|->`. Boxed to keep Atom at 32 bytes.
@@ -78,7 +78,7 @@ impl Atom {
     }
 
     /// Convenience: create a number atom.
-    pub fn num(n: i64) -> Self {
+    pub fn num(n: i128) -> Self {
         Atom::Num(n)
     }
 
@@ -91,7 +91,7 @@ impl Atom {
     ///
     /// # Errors
     /// Returns an error description if the atom is not a number.
-    pub fn as_num(&self) -> Result<i64, String> {
+    pub fn as_num(&self) -> Result<i128, String> {
         match self {
             Atom::Num(n) => Ok(*n),
             other => Err(format!("expected number, got {}", other.to_sexpr_string())),

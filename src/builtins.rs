@@ -11,7 +11,7 @@ use crate::parser::Expr;
 /// like a float (e.g. "40.7") → parsed f64. Integers stay exact.
 fn atom_as_f64(atom: &Atom, name: &str) -> Result<f64, String> {
     match atom {
-        Atom::Num(n) => Ok(*n as f64),
+        Atom::Num(n) => Ok(*n as f64), // SAFETY: precision loss for very large i128 but no panic
         Atom::Sym(s) => s.parse::<f64>().map_err(|_| {
             format!("{}: expected number, got {}", name, s)
         }),
@@ -19,10 +19,10 @@ fn atom_as_f64(atom: &Atom, name: &str) -> Result<f64, String> {
     }
 }
 
-/// Convert an f64 back to an Atom: whole numbers → Num(i64), fractions → Sym("n.n").
+/// Convert an f64 back to an Atom: whole numbers → Num(i128), fractions → Sym("n.n").
 fn f64_to_atom(f: f64) -> Atom {
-    if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
-        Atom::Num(f as i64)
+    if f.fract() == 0.0 && f >= i128::MIN as f64 && f <= i128::MAX as f64 {
+        Atom::Num(f as i128)
     } else {
         Atom::Sym(format!("{}", f))
     }
@@ -63,11 +63,11 @@ macro_rules! cmp_binary {
 /// Register all built-in functions into the given function table.
 pub fn register_builtins(table: &FnTable) {
     // Arithmetic: integer ops when both args are Num, float ops otherwise
-    num_binary!(table, "+", |a: i64, b: i64| a + b, |a: f64, b: f64| a + b);
-    num_binary!(table, "-", |a: i64, b: i64| a - b, |a: f64, b: f64| a - b);
-    num_binary!(table, "*", |a: i64, b: i64| a * b, |a: f64, b: f64| a * b);
-    num_binary!(table, "/", |a: i64, b: i64| a / b, |a: f64, b: f64| a / b);
-    num_binary!(table, "%", |a: i64, b: i64| a % b, |a: f64, b: f64| a % b);
+    num_binary!(table, "+", |a: i128, b: i128| a + b, |a: f64, b: f64| a + b);
+    num_binary!(table, "-", |a: i128, b: i128| a - b, |a: f64, b: f64| a - b);
+    num_binary!(table, "*", |a: i128, b: i128| a * b, |a: f64, b: f64| a * b);
+    num_binary!(table, "/", |a: i128, b: i128| a / b, |a: f64, b: f64| a / b);
+    num_binary!(table, "%", |a: i128, b: i128| a % b, |a: f64, b: f64| a % b);
 
     // Comparison — use f64 so floats compare correctly
     cmp_binary!(table, "<",  |a: f64, b: f64| a < b);
