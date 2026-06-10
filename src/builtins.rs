@@ -70,6 +70,25 @@ macro_rules! cmp_binary {
     };
 }
 
+macro_rules! math_unary {
+    ($table:ident, $name:expr, $op:expr) => {
+        $table.insert_native($name, 1, |args, _| {
+            let x = atom_as_f64(&args[0], $name)?;
+            Ok(NDet::single(f64_to_atom($op(x))))
+        });
+    };
+}
+
+macro_rules! math_binary {
+    ($table:ident, $name:expr, $op:expr) => {
+        $table.insert_native($name, 2, |args, _| {
+            let a = atom_as_f64(&args[0], $name)?;
+            let b = atom_as_f64(&args[1], $name)?;
+            Ok(NDet::single(f64_to_atom($op(a, b))))
+        });
+    };
+}
+
 /// Register all built-in functions into the given function table.
 pub fn register_builtins(table: &FnTable) {
     // Boolean truth tables (user-defined clauses so constraint eval threads bindings)
@@ -96,6 +115,72 @@ pub fn register_builtins(table: &FnTable) {
     cmp_binary!(table, ">",  |a: f64, b: f64| a > b);
     cmp_binary!(table, "<=", |a: f64, b: f64| a <= b);
     cmp_binary!(table, ">=", |a: f64, b: f64| a >= b);
+
+    // != (negated structural equality)
+    table.insert_native("!=", 2, |args, _| {
+        Ok(NDet::single(if args[0] != args[1] { Atom::sym("True") } else { Atom::sym("False") }))
+    });
+
+    // xor truth table (user-defined so constraint eval threads bindings)
+    bool_clause!(table, "xor", ["True",  "False"], "True");
+    bool_clause!(table, "xor", ["False", "True"],  "True");
+    bool_clause!(table, "xor", ["True",  "True"],  "False");
+    bool_clause!(table, "xor", ["False", "False"], "False");
+
+    // Float unary math — (fn-math x)
+    math_unary!(table, "sqrt-math",  |x: f64| x.sqrt());
+    math_unary!(table, "abs-math",   |x: f64| x.abs());
+    math_unary!(table, "trunc-math", |x: f64| x.trunc());
+    math_unary!(table, "ceil-math",  |x: f64| x.ceil());
+    math_unary!(table, "floor-math", |x: f64| x.floor());
+    math_unary!(table, "round-math", |x: f64| x.round());
+    math_unary!(table, "sin-math",   |x: f64| x.sin());
+    math_unary!(table, "asin-math",  |x: f64| x.asin());
+    math_unary!(table, "cos-math",   |x: f64| x.cos());
+    math_unary!(table, "acos-math",  |x: f64| x.acos());
+    math_unary!(table, "tan-math",   |x: f64| x.tan());
+    math_unary!(table, "atan-math",  |x: f64| x.atan());
+    math_unary!(table, "exp",        |x: f64| x.exp());
+
+    // Float binary math
+    math_binary!(table, "pow-math", |a: f64, b: f64| a.powf(b));
+    math_binary!(table, "log-math", |a: f64, b: f64| a.log(b));
+    math_binary!(table, "min",      |a: f64, b: f64| a.min(b));
+    math_binary!(table, "max",      |a: f64, b: f64| a.max(b));
+
+    // isnan-math / isinf-math predicates
+    table.insert_native("isnan-math", 1, |args, _| {
+        let x = atom_as_f64(&args[0], "isnan-math")?;
+        Ok(NDet::single(if x.is_nan() { Atom::sym("True") } else { Atom::sym("False") }))
+    });
+    table.insert_native("isinf-math", 1, |args, _| {
+        let x = atom_as_f64(&args[0], "isinf-math")?;
+        Ok(NDet::single(if x.is_infinite() { Atom::sym("True") } else { Atom::sym("False") }))
+    });
+
+    // min-atom / max-atom: (min-atom (list...)) → Number
+    table.insert_native("min-atom", 1, |args, _| {
+        let items = match &args[0] {
+            Atom::Expr(v) => v.clone(),
+            a => vec![a.clone()],
+        };
+        let mut best = f64::INFINITY;
+        for item in &items {
+            best = best.min(atom_as_f64(item, "min-atom")?);
+        }
+        Ok(NDet::single(f64_to_atom(best)))
+    });
+    table.insert_native("max-atom", 1, |args, _| {
+        let items = match &args[0] {
+            Atom::Expr(v) => v.clone(),
+            a => vec![a.clone()],
+        };
+        let mut best = f64::NEG_INFINITY;
+        for item in &items {
+            best = best.max(atom_as_f64(item, "max-atom")?);
+        }
+        Ok(NDet::single(f64_to_atom(best)))
+    });
 
     // append: (append list1 list2) → concatenated list
     table.insert_native("append", 2, |args, _| {
