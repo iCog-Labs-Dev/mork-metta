@@ -401,9 +401,10 @@ fn eval_data_list(items: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, St
             Expr::Number(n) => atoms.push(Atom::Num(*n)),
             Expr::Symbol(s) => {
                 if s.starts_with('$') {
-                    let val = env.get(s).ok_or_else(|| {
-                        format!("unbound variable: {}", s)
-                    })?;
+                    // PeTTa: unbound $vars in a data list stay as Prolog variables
+                    // (structural holes). Pattern matching in let/try_match_one
+                    // then binds them via computation-in-pattern or direct unification.
+                    let val = env.get(s).unwrap_or_else(|| Atom::sym(s));
                     atoms.push(val);
                 } else {
                     atoms.push(Atom::sym(s));
