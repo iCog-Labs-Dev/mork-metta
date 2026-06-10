@@ -821,19 +821,34 @@ fn eval_import(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String
     Ok(NDet::single(Atom::sym("true")))
 }
 
-/// Resolve an import path: try as-is from CWD, then relative to `import_dir`.
-/// Both variants are tried with and without the `.metta` extension.
+/// Resolve an import path against a priority-ordered list of base directories.
+///
+/// Search order (first hit wins, each tried with and without `.metta`):
+///   1. CWD — for absolute or CWD-relative paths
+///   2. `import_dir` — relative to the importing file's own directory
+///   3. Parent of CWD — for paths written relative to the project root when
+///      the binary is run from a subdirectory (e.g. `metta/examples/lib_he`
+///      resolves from `MORK/` when `cargo run` is invoked from `MORK/metta/`)
 fn resolve_import_path(
     path_str: &str,
     import_dir: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
-    let candidates = [
-        std::path::PathBuf::from(path_str),
-        std::path::PathBuf::from(format!("{}.metta", path_str)),
-        import_dir.join(path_str),
-        import_dir.join(format!("{}.metta", path_str)),
-    ];
-    candidates.into_iter().find(|p| p.exists())
+    let parent_cwd = std::env::current_dir()
+        .ok()
+        .and_then(|d| d.parent().map(|p| p.to_path_buf()));
+
+    let bases = std::iter::once(std::path::PathBuf::from("."))
+        .chain(std::iter::once(import_dir.to_path_buf()))
+        .chain(parent_cwd);
+
+    for base in bases {
+        for candidate in [base.join(path_str), base.join(format!("{}.metta", path_str))] {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// Stream-load a `.metta` file: parse one balanced form at a time and process
