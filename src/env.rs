@@ -21,7 +21,7 @@ use std::sync::Arc;
 ///
 /// Implemented as an immutable linked list: each `extend()` prepends a
 /// new binding. Lookup walks the chain from most recent to oldest.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Env {
     /// Empty environment (no bindings).
     Empty,

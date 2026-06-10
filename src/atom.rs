@@ -4,6 +4,7 @@
 /// - `Num(i64)` — integer numbers
 /// - `Sym(String)` — symbolic names (functions, variables, bare symbols)
 /// - `Expr(Vec<Atom>)` — S-expressions (nested lists)
+/// - `Closure { params, body, env }` — anonymous functions (|->)
 ///
 /// Variables like `$N` are represented as `Sym("$N")` at the parsing stage and
 /// are replaced by their values from the environment during evaluation.
@@ -13,9 +14,13 @@
 /// - Symbols are Unicode strings stored as-is (no interning).
 /// - `Expr` is an owned, fully-evaluated value — not a thunk or promise.
 /// - `Atom::Expr` with no elements represents the empty list `()`.
-/// - Equality is structural: `Atom::PartialEq` compares recursively.
+/// - Equality is structural (recursive).
 /// - Empty symbol `Sym("")` represents MeTTa's `Empty` / false / unit value.
-#[derive(Clone, Debug, PartialEq)]
+/// - `Closure` equality compares params, body, and captured env structurally.
+use crate::env::Env;
+use crate::parser::Expr;
+
+#[derive(Clone, Debug)]
 pub enum Atom {
     /// A symbolic name: function names, variable names (with $ prefix), data symbols.
     Sym(String),
@@ -23,6 +28,30 @@ pub enum Atom {
     Num(i64),
     /// An S-expression — ordered list of atoms.
     Expr(Vec<Atom>),
+    /// An anonymous function created by `|->`.
+    Closure {
+        /// Parameter patterns (e.g. `[$x, $y]`).
+        params: Vec<Expr>,
+        /// Body expression.
+        body: Box<Expr>,
+        /// Captured lexical environment at definition site.
+        env: Box<Env>,
+    },
+}
+
+impl PartialEq for Atom {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Atom::Sym(a), Atom::Sym(b)) => a == b,
+            (Atom::Num(a), Atom::Num(b)) => a == b,
+            (Atom::Expr(a), Atom::Expr(b)) => a == b,
+            (
+                Atom::Closure { params: p1, body: b1, env: e1 },
+                Atom::Closure { params: p2, body: b2, env: e2 },
+            ) => p1 == p2 && b1 == b2 && e1 == e2,
+            _ => false,
+        }
+    }
 }
 
 impl Atom {
@@ -37,6 +66,10 @@ impl Atom {
             Atom::Expr(items) => {
                 let inner: Vec<String> = items.iter().map(|a| a.to_sexpr_string()).collect();
                 format!("({})", inner.join(" "))
+            }
+            Atom::Closure { params, body, .. } => {
+                let param_strs: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+                format!("(|-> ({}) {})", param_strs.join(" "), body.to_string())
             }
         }
     }
@@ -94,6 +127,7 @@ impl Atom {
     /// # Assumptions
     /// - `Expr` with any elements is always truthy (PeTTa convention).
     /// - Empty expression `Expr([])` is truthy (non-zero structure).
+    /// - `Closure` is always truthy.
     pub fn is_truthy(&self) -> bool {
         match self {
             Atom::Num(0) => false,

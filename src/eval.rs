@@ -107,7 +107,7 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     "chain" => { trace!("→ special: chain"); return eval_chain(args, env, funcs); }
                     "case" => { trace!("→ special: case"); return eval_case(args, env, funcs); }
                     "foldall" => { trace!("→ special: foldall"); return eval_foldall(args, env, funcs); }
-                    "|->" => { trace!("→ special: lambda"); return eval_lambda(args); }
+                    "|->" => { trace!("→ special: lambda"); return eval_lambda(args, env); }
                     _ => {}
                 }
             }
@@ -161,10 +161,52 @@ fn try_call_or_data(
             return call_function(fname, args, env, funcs);
         }
     }
-
+    // Case 3: closure application — operator evaluated to a Closure.
+    if let Atom::Closure { params, body, env: capture_env } = &op_val {
+        return apply_closure(params, body, capture_env, args, env, funcs);
+    }
     // Fallback: data list — collect evaluated elements into one Expr atom.
     trace!("→ fallback: data list");
     eval_data_list(all_items, env, funcs)
+}
+/// Apply a closure to a list of argument expressions.
+///
+/// 1. Evaluate each argument (first result) to get concrete values.
+/// 2. Match the values against the closure's parameter patterns using
+///    `try_match_clause` semantics.
+/// 3. Evaluate the closure's body in the captured env extended with bindings.
+fn apply_closure(
+    params: &[Expr],
+    body: &Expr,
+    capture_env: &Env,
+    args: &[Expr],
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<NDet, String> {
+    trace_enter!("apply_closure: {} params, {} args", params.len(), args.len());
+    // Evaluate arguments (first result of each)
+    let mut arg_vals = Vec::with_capacity(args.len());
+    for (i, arg) in args.iter().enumerate() {
+        let mut results = eval(arg, env, funcs)?;
+        let val = results.next().ok_or_else(|| {
+            format!("closure: argument {} produced no results", i + 1)
+        })?;
+        arg_vals.push(val);
+    }
+    let arg_strs: Vec<String> = arg_vals.iter().map(|a| a.to_sexpr_string()).collect();
+    trace!("closure args: [{}]", arg_strs.join(", "));
+    // Match args against params
+    match try_match_clause(params, &arg_vals, capture_env, funcs)? {
+        Some(match_env) => {
+            trace!("closure params matched, evaluating body");
+            eval(body, &match_env, funcs)
+        }
+        None => Err(format!(
+            "closure: params do not match args: ({})) vs [{}]",
+            params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" "),
+            arg_strs.join(", ")
+        )),
+    }
 }
 
 /// Call a known function with the given arguments.
@@ -421,6 +463,10 @@ fn eval_progn(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String>
 fn has_free_vars(expr: &Expr, env: &Env) -> bool {
     match expr {
         Expr::Symbol(s) if s.starts_with('$') => env.get(s).is_none(),
+        // |-> lambda: parameters shadow any $vars in the body
+        Expr::List(items) if !items.is_empty() && matches!(&items[0], Expr::Symbol(s) if s == "|->") => {
+            false
+        }
         Expr::List(items) => items.iter().any(|e| has_free_vars(e, env)),
         _ => false,
     }
@@ -532,13 +578,27 @@ fn eval_quote(args: &[Expr]) -> Result<NDet, String> {
 }
 /// Evaluate `(|-> params body)` — lambda expression.
 ///
-/// Returns the lambda form as a quoted data atom without evaluating its body.
-/// PeTTa reference: `|->` creates anonymous functions; the body is not
-/// evaluated at definition time but stored as data for later application.
-fn eval_lambda(args: &[Expr]) -> Result<NDet, String> {
-    let lambda_expr = Expr::List(args.to_vec());
-    let atom = expr_to_atom(&lambda_expr);
-    Ok(NDet::single(atom))
+/// Creates a closure: captures the current lexical environment and stores
+/// the parameter patterns and body expression. The closure is callable —
+/// when applied, arguments are matched against params and body is evaluated
+/// in the captured environment extended with the bindings.
+fn eval_lambda(args: &[Expr], env: &Env) -> Result<NDet, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "|->: expected (params body), got {} args", args.len()
+        ));
+    }
+    let params = match &args[0] {
+        Expr::List(items) => items.clone(),
+        other => vec![other.clone()],
+    };
+    let body = Box::new(args[1].clone());
+    let closure = Atom::Closure {
+        params,
+        body,
+        env: Box::new(env.clone()),
+    };
+    Ok(NDet::single(closure))
 }
 
 /// Evaluate `(eval expr)` — evaluate, convert result to code, evaluate again.

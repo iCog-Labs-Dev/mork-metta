@@ -29,7 +29,7 @@ pub enum TopForm {
 }
 
 /// A parsed but not-yet-compiled MeTTa expression.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     /// A symbolic token: `fib`, `$N`, `+`, `if`, `=`
     Symbol(String),
@@ -91,6 +91,14 @@ pub fn atom_to_expr(atom: &Atom) -> Result<Expr, String> {
                 exprs.push(atom_to_expr(item)?);
             }
             Ok(Expr::List(exprs))
+        }
+        Atom::Closure { params, body, .. } => {
+            // Convert closure back to (|-> params body) form
+            let mut items = Vec::with_capacity(3);
+            items.push(Expr::Symbol("|->".to_string()));
+            items.push(Expr::List(params.clone()));
+            items.push((**body).clone());
+            Ok(Expr::List(items))
         }
     }
 }
