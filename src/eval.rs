@@ -546,9 +546,13 @@ fn eval_collapse(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
 /// Collects all results from `gen-expr`, then folds them using `agg-func`:
 /// `agg(agg(agg(init, v1), v2), v3) ...`. Returns the final accumulator.
 ///
+/// When `gen-expr` contains unbound `$`-variables (e.g. `(g $x)` where `$x` is
+/// free), the function attempts free-variable resolution: it finds each clause
+/// of the generator's function and extracts literal values from the clause
+/// patterns at the free-variable position, then calls the function with each
+/// concrete value.
+///
 /// PeTTa reference: `foldall` aggregates over all solutions of a generator.
-/// Args are expressions (not quoted), so `(foldall + (f) 0)` works when
-/// `(f)` is a multi-clause function producing a stream of numbers.
 fn eval_foldall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 3 {
         return Err(format!(
@@ -557,16 +561,17 @@ fn eval_foldall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Strin
         ));
     }
     let agg_func = &args[0];
-
-    // Collect all values from generator
-    let gen_values: Vec<Atom> = eval(&args[1], env, funcs)?.collect();
-
+    // Collect all values from generator — try normal eval first, then
+    // fall back to free-variable resolution if the expression has unbound vars.
+    let gen_values: Vec<Atom> = match eval(&args[1], env, funcs) {
+        Ok(results) => results.collect(),
+        Err(_) => generate_free_var_values(&args[1], env, funcs)?,
+    };
     // Evaluate init value (first result)
     let mut init_results = eval(&args[2], env, funcs)?;
     let init = init_results.next().ok_or_else(|| {
         "foldall: init expression produced no results".to_string()
     })?;
-
     // Fold: accum = agg(accum, next) for each gen value
     let accum = gen_values.into_iter().try_fold(init, |acc, val| {
         let acc_expr = atom_to_expr(&acc)?;
@@ -577,8 +582,117 @@ fn eval_foldall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Strin
             "foldall: aggregate function produced no results".to_string()
         })
     })?;
-
     Ok(NDet::single(accum))
+}
+/// Try to generate values from a function call expression with free variables.
+///
+/// When a generator like `(g $x)` contains an unbound `$x`, this function
+/// looks up `g` in the function table, iterates over its clauses, and for
+/// each clause extracts the literal value at the free-variable position.
+/// It then calls `g` with each literal value and collects the results.
+///
+/// Currently only handles the single-free-variable case with literal (number
+/// or symbol) patterns. Nested patterns or multiple free variables are not
+/// supported and return an error.
+fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<Vec<Atom>, String> {
+    let items = match expr {
+        Expr::List(items) if !items.is_empty() => items,
+        _ => return Err(format!(
+            "generator: expected a function call, got {}", expr.to_string()
+        )),
+    };
+    let op = &items[0];
+    let arity = items.len() - 1;
+    // Evaluate the operator to get the function name
+    let op_atom = match eval(op, env, funcs)?.next() {
+        Some(a) => a,
+        None => return Err("generator: operator produced no results".into()),
+    };
+    let fname = match &op_atom {
+        Atom::Sym(s) => s.clone(),
+        _ => return Err(format!(
+            "generator: expected function name, got {}", op_atom.to_sexpr_string()
+        )),
+    };
+    let func = funcs.get(&fname, arity as u8).ok_or_else(|| {
+        format!("generator: unknown function {} with {} args", fname, arity)
+    })?;
+    match &func.kind {
+        FunctionKind::UserDefined { clauses } => {
+            let mut results = Vec::new();
+            for clause in clauses {
+                if clause.patterns.len() != arity {
+                    continue;
+                }
+                // Build concrete arg values: for each position, if the arg expr
+                // is an unbound $var, use the clause pattern's literal value;
+                // otherwise evaluate the arg normally.
+                let mut concrete_args = Vec::with_capacity(arity);
+                let mut has_free = false;
+                for (i, arg_expr) in items[1..].iter().enumerate() {
+                    if let Expr::Symbol(s) = arg_expr {
+                        if s.starts_with('$') && env.get(s).is_none() {
+                            // Free variable: extract literal from clause pattern
+                            match &clause.patterns[i] {
+                                Expr::Number(n) => {
+                                    concrete_args.push(Atom::Num(*n));
+                                    has_free = true;
+                                }
+                                Expr::Symbol(sym) if !sym.starts_with('$') => {
+                                    concrete_args.push(Atom::Sym(sym.clone()));
+                                    has_free = true;
+                                }
+                                _ => {
+                                    // Pattern is another $var or nested list —
+                                    // can't extract a single literal value
+                                    concrete_args.clear();
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    // Normal evaluation
+                    let mut evaled = eval(arg_expr, env, funcs)?;
+                    match evaled.next() {
+                        Some(a) => concrete_args.push(a),
+                        None => { concrete_args.clear(); break; }
+                    }
+                }
+                if !has_free || concrete_args.len() != arity {
+                    continue;
+                }
+                // Call the function with concrete args using direct clause dispatch
+                let mut matched = true;
+                let mut match_env = Env::new();
+                for (pat, arg_val) in clause.patterns.iter().zip(concrete_args.iter()) {
+                    match try_match_one(pat, arg_val, &match_env)? {
+                        Some(new_env) => match_env = new_env,
+                        None => { matched = false; break; }
+                    }
+                }
+                if !matched {
+                    continue;
+                }
+                let bindings = collect_env_bindings(&match_env);
+                let new_env = env.extend_all(&bindings);
+                let mut body_results = eval(&clause.body, &new_env, funcs)?;
+                while let Some(atom) = body_results.next() {
+                    results.push(atom);
+                }
+            }
+            if results.is_empty() {
+                return Err(format!(
+                    "generator: {}: no clauses with literal patterns for free variables",
+                    fname
+                ));
+            }
+            Ok(results)
+        }
+        FunctionKind::Native { .. } => {
+            Err("generator: native functions don't support free variable resolution".into())
+        }
+    }
 }
 
 /// Evaluate `(chain expr $var expr $var ... final-expr)` — thread value through
