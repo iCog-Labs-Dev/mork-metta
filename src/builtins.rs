@@ -221,67 +221,6 @@ pub fn register_builtins(table: &FnTable) {
     });
 
 
-    // add-atom: (add-atom &space atom)
-    // PeTTa semantics: if the atom is a (= head body) definition, also registers
-    // the function so subsequent expressions can call it.
-    table.insert_native("add-atom", 2, |args, table| {
-        expect_n_args(args, 2, "add-atom")?;
-        let atom = &args[1];
-        table.space.borrow_mut().add_atom(atom).map_err(|e| format!("add-atom: {}", e))?;
-        // If the atom is a function definition (= head body), register it
-        if let Atom::Expr(items) = atom {
-            if items.len() == 3 && items[0] == Atom::sym("=") {
-                if let (Ok(head_expr), Ok(body_expr)) = (
-                    crate::parser::atom_to_expr(&items[1]),
-                    crate::parser::atom_to_expr(&items[2]),
-                ) {
-                    let def_expr = Expr::List(vec![
-                        Expr::Symbol("=".to_string()),
-                        head_expr,
-                        body_expr,
-                    ]);
-                    if let Ok((name, clause)) = crate::compile::compile_definition(&def_expr) {
-                        table.add_clause(name, clause.patterns, clause.body);
-                    }
-                }
-            }
-        }
-        Ok(NDet::single(Atom::sym("true")))
-    });
-
-    // remove-atom: (remove-atom &space atom) — removes an atom, returns true/false
-    table.insert_native("remove-atom", 2, |args, table| {
-        expect_n_args(args, 2, "remove-atom")?;
-        let atom = &args[1];
-        let removed = table.space.borrow_mut().remove_atom(atom)
-            .map_err(|e| format!("remove-atom: {}", e))?;
-        // Keep FnTable in sync: if removed atom was a function definition, drop its clause.
-        if removed {
-            if let Atom::Expr(items) = atom {
-                if items.len() == 3 && items[0] == Atom::sym("=") {
-                    if let (Ok(head_expr), Ok(body_expr)) = (
-                        crate::parser::atom_to_expr(&items[1]),
-                        crate::parser::atom_to_expr(&items[2]),
-                    ) {
-                        let def_expr = Expr::List(vec![
-                            Expr::Symbol("=".to_string()),
-                            head_expr,
-                            body_expr,
-                        ]);
-                        if let Ok((name, clause)) = crate::compile::compile_definition(&def_expr) {
-                            table.remove_clause(&name, &clause.patterns, &clause.body);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(NDet::single(if removed {
-            Atom::sym("true")
-        } else {
-            Atom::sym("")
-        }))
-    });
-
     // repr: (repr atom) — return the S-expression string of an atom as a symbol
     table.insert_native("repr", 1, |args, _| {
         expect_n_args(args, 1, "repr")?;

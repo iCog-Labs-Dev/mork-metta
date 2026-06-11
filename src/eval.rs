@@ -304,23 +304,9 @@ fn call_with_ref(
     }
     // UserDefined: for each combination of arg values, try each clause
     let mut streams: Vec<NDet> = Vec::new();
-    for arg_vals in cartesian {
-        if clauses.len() == 1 {
-            match try_match_clause(&clauses[0].patterns, &arg_vals, env, funcs)? {
-                Some(new_env) => {
-                    streams.push(eval(&clauses[0].body, &new_env, funcs)?);
-                }
-                None => {}
-            }
-            continue;
-        }
-        for clause in clauses.iter() {
-            match try_match_clause(&clause.patterns, &arg_vals, env, funcs)? {
-                Some(new_env) => {
-                    streams.push(eval(&clause.body, &new_env, funcs)?);
-                }
-                None => {}
-            }
+    for arg_vals in &cartesian {
+        for (new_env, clause) in match_clauses(&clauses, arg_vals, env, funcs)? {
+            streams.push(eval(&clause.body, &new_env, funcs)?);
         }
     }
     if streams.is_empty() {
@@ -456,6 +442,29 @@ fn try_match_one(
     }
 }
 
+/// Try every clause against `arg_vals`, returning `(match_env, &Clause)` for
+/// each match.  This is the single call-site for `try_match_clause` across
+/// both `call_with_ref` and `eval_constrained`, ensuring the two dispatch paths
+/// can never diverge in their clause-selection logic.
+///
+/// `base_env` controls what outer variables are visible during matching:
+/// - pass the calling `env` in `call_with_ref` (outer bindings in scope),
+/// - pass `&Env::new()` in `eval_constrained` (isolates new bindings for accumulation).
+fn match_clauses<'c>(
+    clauses: &'c [Clause],
+    arg_vals: &[Atom],
+    base_env: &Env,
+    funcs: &FnTable,
+) -> Result<Vec<(Env, &'c Clause)>, String> {
+    let mut matched = Vec::new();
+    for clause in clauses {
+        if let Some(env) = try_match_clause(&clause.patterns, arg_vals, base_env, funcs)? {
+            matched.push((env, clause));
+        }
+    }
+    Ok(matched)
+}
+
 /// Evaluate a list as data: each element is evaluated and collected into a
 /// single `Atom::Expr`. This replaces the old "tuple" semantics.
 ///
@@ -541,35 +550,20 @@ fn eval_constrained(
                             }
                             let combos = constrained_cartesian(arg_streams);
                             let mut out: Vec<(Atom, Env)> = Vec::new();
-                            for (atom_args, arg_bindings) in combos {
-                                for clause in &clauses {
-                                    // Pass Env::new() so the returned Env is *only* new bindings.
-                                    match try_match_clause(
-                                        &clause.patterns,
-                                        &atom_args,
-                                        &Env::new(),
-                                        funcs,
-                                    )? {
-                                        Some(clause_bindings) => {
-                                            let full_env =
-                                                prepend_env(clause_bindings.clone(), env);
-                                            let body_results = eval_constrained(
-                                                &clause.body,
-                                                &full_env,
-                                                funcs,
-                                            )?;
-                                            for (atom, body_bindings) in body_results {
-                                                let accumulated = prepend_env(
-                                                    body_bindings,
-                                                    &prepend_env(
-                                                        clause_bindings.clone(),
-                                                        &arg_bindings,
-                                                    ),
-                                                );
-                                                out.push((atom, accumulated));
-                                            }
-                                        }
-                                        None => {}
+                            for (atom_args, arg_bindings) in &combos {
+                                // Env::new() isolates new bindings for accumulation.
+                                for (clause_bindings, clause) in
+                                    match_clauses(&clauses, atom_args, &Env::new(), funcs)?
+                                {
+                                    let full_env = prepend_env(clause_bindings.clone(), env);
+                                    for (atom, body_bindings) in
+                                        eval_constrained(&clause.body, &full_env, funcs)?
+                                    {
+                                        let accumulated = prepend_env(
+                                            body_bindings,
+                                            &prepend_env(clause_bindings.clone(), arg_bindings),
+                                        );
+                                        out.push((atom, accumulated));
                                     }
                                 }
                             }
