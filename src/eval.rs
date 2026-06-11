@@ -52,15 +52,13 @@
 /// - Truthiness: `Num(0)` and empty `Sym("")` are false; all else is true.
 /// - Function arguments are deterministic: only the first result of each
 ///   argument evaluation is used.
-
 use std::cell::Ref;
 use crate::atom::Atom;
 use crate::env::Env;
-use crate::func::{FnTable, Function, FunctionKind, NDet};
+use crate::func::{Clause, FnTable, Function, FunctionKind, NDet};
 use crate::parser::{atom_to_expr, expr_to_atom, parse_forms, Expr, TopForm};
 use crate::space::Pattern;
 use crate::{trace, trace_enter, trace_exit};
-
 /// Evaluate an expression, returning a (possibly empty) stream of results.
 pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     trace_enter!("eval: {}", expr_to_atom(expr).to_sexpr_string());
@@ -238,63 +236,75 @@ fn call_with_ref(
     env: &Env,
     funcs: &FnTable,
 ) -> Result<NDet, String> {
-    trace_enter!("call: {} ({} args)", op_name, args.len());
+    // Clone necessary data out of the Ref BEFORE evaluating args/body, because
+    // body evaluation may trigger add_clause/remove_clause which borrow_mut() on
+    // funcs.map — would panic if the Ref still holds an immutable borrow.
+    let name = func.name.clone();
+    let is_native = matches!(&func.kind, FunctionKind::Native { .. });
+    let clauses: Vec<Clause> = match &func.kind {
+        FunctionKind::UserDefined { clauses } => clauses.clone(),
+        FunctionKind::Native { .. } => vec![],
+    };
+    let native_func: Option<fn(&[Atom], &FnTable) -> Result<NDet, String>> = match &func.kind {
+        FunctionKind::Native { func: f } => Some(*f),
+        FunctionKind::UserDefined { .. } => None,
+    };
+    drop(func); // Release the RefCell borrow before any recursive eval calls.
+    trace_enter!("call: {} ({} args)", name, args.len());
     // Evaluate arguments (take first result of each)
     let mut arg_vals = Vec::with_capacity(args.len());
     for (i, arg) in args.iter().enumerate() {
         let mut results = eval(arg, env, funcs)?;
         let val = results.next().ok_or_else(|| {
-            format!("{}: argument {} produced no results", op_name, i + 1)
+            format!("{}: argument {} produced no results", name, i + 1)
         })?;
         arg_vals.push(val);
     }
-    // arg_strs only needed for trace output — gate behind the feature flag so
-    // normal builds pay zero cost (no string allocations on 2.7M fib calls).
     #[cfg(feature = "trace")]
     let arg_strs: Vec<String> = arg_vals.iter().map(|a| a.to_sexpr_string()).collect();
-    trace!("{} args: [{}]", op_name, arg_strs.join(", "));
-    let result = match &func.kind {
-        FunctionKind::Native { func: f } => f(&arg_vals, funcs),
-        FunctionKind::UserDefined { clauses } => {
-            // Fast path: single clause avoids Vec<NDet> + Box allocation
-            if clauses.len() == 1 {
-                return match try_match_clause(&clauses[0].patterns, &arg_vals, env, funcs)? {
-                    Some(new_env) => {
-                        trace!("clause matched, body eval");
-                        eval(&clauses[0].body, &new_env, funcs)
-                    }
-                    None => Err(format!(
-                        "{}: no matching clause for args [{}]",
-                        op_name,
-                        arg_vals.iter().map(|a| a.to_sexpr_string()).collect::<Vec<_>>().join(", ")
-                    )),
-                };
-            }
-            // Multi-clause: collect all matching results into a nondeterministic stream
-            let mut streams: Vec<NDet> = Vec::new();
-            for clause in clauses.iter() {
-                match try_match_clause(&clause.patterns, &arg_vals, env, funcs)? {
-                    Some(new_env) => {
-                        trace!("clause matched, body eval");
-                        streams.push(eval(&clause.body, &new_env, funcs)?);
-                    }
-                    None => {
-                        trace!("clause did not match, trying next");
-                    }
-                }
-            }
-            if streams.is_empty() {
-                return Err(format!(
-                    "{}: no matching clause for args [{}]",
-                    op_name,
-                    arg_vals.iter().map(|a| a.to_sexpr_string()).collect::<Vec<_>>().join(", ")
-                ));
-            }
-            Ok(NDet::stream(streams.into_iter().flatten()))
+    trace!("{} args: [{}]", name, arg_strs.join(", "));
+    if is_native {
+        if let Some(f) = native_func {
+            let result = f(&arg_vals, funcs);
+            trace_exit!();
+            return result;
         }
-    };
+    }
+    // UserDefined: try each clause
+    if clauses.len() == 1 {
+        return match try_match_clause(&clauses[0].patterns, &arg_vals, env, funcs)? {
+            Some(new_env) => {
+                trace!("clause matched, body eval");
+                eval(&clauses[0].body, &new_env, funcs)
+            }
+            None => Err(format!(
+                "{}: no matching clause for args [{}]",
+                name,
+                arg_vals.iter().map(|a| a.to_sexpr_string()).collect::<Vec<_>>().join(", ")
+            )),
+        };
+    }
+    let mut streams: Vec<NDet> = Vec::new();
+    for clause in clauses.iter() {
+        match try_match_clause(&clause.patterns, &arg_vals, env, funcs)? {
+            Some(new_env) => {
+                trace!("clause matched, body eval");
+                streams.push(eval(&clause.body, &new_env, funcs)?);
+            }
+            None => {
+                trace!("clause did not match, trying next");
+            }
+        }
+    }
+    if streams.is_empty() {
+        return Err(format!(
+            "{}: no matching clause for args [{}]",
+            name,
+            arg_vals.iter().map(|a| a.to_sexpr_string()).collect::<Vec<_>>().join(", ")
+        ));
+    }
     trace_exit!();
-    result
+    Ok(NDet::stream(streams.into_iter().flatten()))
 }
 // ========================================================================
 // Pattern matching for multi-clause functions
@@ -1317,82 +1327,17 @@ fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<V
     let func_ref = funcs.get_ref(&fname, arity as u8).ok_or_else(|| {
         format!("generator: unknown function {} with {} args", fname, arity)
     })?;
-    match &func_ref.kind {
-        FunctionKind::UserDefined { clauses } => {
-            let mut results = Vec::new();
-            for clause in clauses {
-                if clause.patterns.len() != arity {
-                    continue;
-                }
-                // Build concrete arg values: for each position, if the arg expr
-                // is an unbound $var, use the clause pattern's literal value;
-                // otherwise evaluate the arg normally.
-                let mut concrete_args = Vec::with_capacity(arity);
-                let mut has_free = false;
-                for (i, arg_expr) in items[1..].iter().enumerate() {
-                    if let Expr::Symbol(s) = arg_expr {
-                        if s.starts_with('$') && env.get(s).is_none() {
-                            // Free variable: extract literal from clause pattern
-                            match &clause.patterns[i] {
-                                Expr::Number(n) => {
-                                    concrete_args.push(Atom::Num(*n));
-                                    has_free = true;
-                                }
-                                Expr::Symbol(sym) if !sym.starts_with('$') => {
-                                    concrete_args.push(Atom::sym(sym));
-                                    has_free = true;
-                                }
-                                _ => {
-                                    // Pattern is another $var or nested list —
-                                    // can't extract a single literal value
-                                    concrete_args.clear();
-                                    break;
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                    // Normal evaluation
-                    let mut evaled = eval(arg_expr, env, funcs)?;
-                    match evaled.next() {
-                        Some(a) => concrete_args.push(a),
-                        None => { concrete_args.clear(); break; }
-                    }
-                }
-                if !has_free || concrete_args.len() != arity {
-                    continue;
-                }
-                // Call the function with concrete args using direct clause dispatch
-                let mut matched = true;
-                let mut match_env = Env::new();
-                for (pat, arg_val) in clause.patterns.iter().zip(concrete_args.iter()) {
-                    match try_match_one(pat, arg_val, &match_env, funcs)? {
-                        Some(new_env) => match_env = new_env,
-                        None => { matched = false; break; }
-                    }
-                }
-                if !matched {
-                    continue;
-                }
-                let new_env = prepend_env(match_env, env);
-                let mut body_results = eval(&clause.body, &new_env, funcs)?;
-                while let Some(atom) = body_results.next() {
-                    results.push(atom);
-                }
-            }
-            if results.is_empty() {
-                return Err(format!(
-                    "generator: {}: no clauses with literal patterns for free variables",
-                    fname
-                ));
-            }
-            Ok(results)
-        }
-        FunctionKind::Native { func } => {
+    let (clauses, native_func): (Vec<Clause>, Option<fn(&[Atom], &FnTable) -> Result<NDet, String>>) = match &func_ref.kind {
+        FunctionKind::UserDefined { clauses } => (clauses.clone(), None),
+        FunctionKind::Native { func: f } => (vec![], Some(*f)),
+    };
+    let is_native = matches!(&func_ref.kind, FunctionKind::Native { .. });
+    drop(func_ref); // Release RefCell borrow before recursive eval calls.
+    if is_native {
+        if let Some(f) = native_func {
             // For each arg, collect all possible values:
             // concrete args → one value; free-var args → recurse to get many values.
             // Then call the native with every combination (cartesian product).
-            let native_fn = *func;
             let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(arity);
             for arg_expr in &items[1..] {
                 match eval(arg_expr, env, funcs) {
@@ -1402,38 +1347,101 @@ fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<V
                         arg_options.push(vals);
                     }
                     Err(_) => {
-                        let vals = generate_free_var_values(arg_expr, env, funcs)?;
-                        if vals.is_empty() { return Ok(vec![]); }
-                        arg_options.push(vals);
+                        // eval failed — treat as free variable generation
+                        let opts = generate_free_var_values(arg_expr, env, funcs)?;
+                        arg_options.push(opts);
                     }
                 }
             }
-            // Cartesian product of all arg options
-            let mut combos: Vec<Vec<Atom>> = vec![vec![]];
-            for opts in &arg_options {
-                combos = combos.into_iter().flat_map(|prefix| {
-                    opts.iter().map(move |v| {
-                        let mut p = prefix.clone();
-                        p.push(v.clone());
-                        p
-                    }).collect::<Vec<_>>()
-                }).collect();
-            }
+            // Cartesian product
             let mut results = Vec::new();
-            for combo in combos {
-                if let Ok(mut nd) = native_fn(&combo, funcs) {
-                    while let Some(atom) = nd.next() {
-                        results.push(atom);
+            let mut indices = vec![0usize; arg_options.len()];
+            loop {
+                let args_slice: Vec<Atom> = indices.iter().enumerate()
+                    .map(|(i, &idx)| arg_options[i][idx].clone())
+                    .collect();
+                if let Ok(mut nd) = f(&args_slice, funcs) {
+                    while let Some(a) = nd.next() {
+                        results.push(a);
                     }
                 }
-            }
-            if results.is_empty() {
-                Err(format!("generator: native {} produced no results", fname))
-            } else {
-                Ok(results)
+                // Increment indices
+                let mut i = indices.len();
+                while i > 0 {
+                    i -= 1;
+                    indices[i] += 1;
+                    if indices[i] < arg_options[i].len() {
+                        break;
+                    }
+                    indices[i] = 0;
+                    if i == 0 { return Ok(results); }
+                }
             }
         }
+        return Err("generator: unexpected native dispatch failure".into());
     }
+    // UserDefined
+    let mut results = Vec::new();
+    for clause in &clauses {
+        if clause.patterns.len() != arity {
+            continue;
+        }
+        let mut concrete_args = Vec::with_capacity(arity);
+        let mut has_free = false;
+        for (i, arg_expr) in items[1..].iter().enumerate() {
+            if let Expr::Symbol(s) = arg_expr {
+                if s.starts_with('$') && env.get(s).is_none() {
+                    match &clause.patterns[i] {
+                        Expr::Number(n) => {
+                            concrete_args.push(Atom::Num(*n));
+                            has_free = true;
+                        }
+                        Expr::Symbol(sym) if !sym.starts_with('$') => {
+                            concrete_args.push(Atom::sym(&sym));
+                            has_free = true;
+                        }
+                        _ => {
+                            concrete_args.clear();
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            // Normal evaluation
+            let mut evaled = eval(arg_expr, env, funcs)?;
+            match evaled.next() {
+                Some(a) => concrete_args.push(a),
+                None => { concrete_args.clear(); break; }
+            }
+        }
+        if !has_free || concrete_args.len() != arity {
+            continue;
+        }
+        let mut matched = true;
+        let mut match_env = Env::new();
+        for (pat, arg_val) in clause.patterns.iter().zip(concrete_args.iter()) {
+            match try_match_one(pat, arg_val, &match_env, funcs)? {
+                Some(new_env) => match_env = new_env,
+                None => { matched = false; break; }
+            }
+        }
+        if !matched {
+            continue;
+        }
+        let new_env = prepend_env(match_env, env);
+        let mut body_results = eval(&clause.body, &new_env, funcs)?;
+        while let Some(atom) = body_results.next() {
+            results.push(atom);
+        }
+    }
+    if results.is_empty() {
+        return Err(format!(
+            "generator: {}: no clauses with literal patterns for free variables",
+            fname
+        ));
+    }
+    Ok(results)
 }
 
 /// Evaluate `(map-atom list func)` — apply `func` to each element of `list`.
