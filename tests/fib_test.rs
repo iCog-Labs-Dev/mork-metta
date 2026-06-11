@@ -97,6 +97,8 @@ fn test_eval_addition() {
 
 #[test]
 fn test_unbound_variable_error() {
+    // In MeTTa, $var self-evaluates to the variable atom. The error comes from
+    // the numeric operator receiving a non-number, not from "unbound variable".
     let mut funcs = FnTable::new();
     register_builtins(&mut funcs);
     let forms = parse_forms("!(+ $x 1)").unwrap();
@@ -109,7 +111,7 @@ fn test_unbound_variable_error() {
         Err(e) => e,
         Ok(_) => panic!("expected error"),
     };
-    assert!(err.contains("unbound variable"), "error: {}", err);
+    assert!(err.contains("expected number"), "error: {}", err);
 }
 
 #[test]

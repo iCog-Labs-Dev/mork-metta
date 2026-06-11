@@ -71,9 +71,7 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
 
         Expr::Symbol(s) => {
             if s.starts_with('$') {
-                let val = env
-                    .get(s)
-                    .ok_or_else(|| format!("unbound variable: {}", s))?;
+                let val = env.get(s).unwrap_or_else(|| Atom::sym(s));
                 trace!("→ lookup ${} = {}", &s[1..], val.to_sexpr_string());
                 Ok(NDet::single(val))
             } else {
@@ -387,7 +385,8 @@ fn try_match_one(
             _ => Ok(None),
         },
         Expr::Symbol(s) => match atom {
-            Atom::Sym(t) if s.as_str() == t.as_ref() => Ok(Some(env.clone())),
+            // Normalize through Atom::sym() so "True"/"False" patterns match lowercase atoms.
+            Atom::Sym(t) if Atom::sym(s) == Atom::Sym(t.clone()) => Ok(Some(env.clone())),
             // Free variable from term conversion: bind to the literal symbol.
             Atom::Sym(v) if v.starts_with('$') => Ok(Some(env.extend(v, Atom::sym(s)))),
             _ => Ok(None),
@@ -956,8 +955,23 @@ fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String>
     let _space_ref = space_results.next().ok_or_else(|| {
         "match: space expression produced no results".to_string()
     })?;
-    // Convert pattern expression to a Pattern
-    let pattern = Pattern::from_expr(&args[1]);
+    // Build pattern: if args[1] is a $var already bound in env (passed through a
+    // higher-order function), resolve the atom and use Pattern::from_atom so that
+    // the structural variable atoms inside it (e.g. $1) are treated as Var wildcards.
+    // For literal pattern expressions, use Pattern::from_expr directly.
+    let pattern = if let Expr::Symbol(s) = &args[1] {
+        if s.starts_with('$') {
+            if let Some(atom) = env.get(s) {
+                Pattern::from_atom(&atom)
+            } else {
+                Pattern::from_expr(&args[1])
+            }
+        } else {
+            Pattern::from_expr(&args[1])
+        }
+    } else {
+        Pattern::from_expr(&args[1])
+    };
     // Query the space
     let matches = {
         let space = funcs.space.borrow();
@@ -966,16 +980,30 @@ fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String>
     if matches.is_empty() {
         return Ok(NDet::Single(None)); // empty stream — no match
     }
-    // Evaluate body for each match with variable bindings
+    // Template: if args[2] is a $var bound in env, resolve to atom then convert to
+    // expr so that match bindings (e.g. $1 → 1) are applied when evaluating it.
+    let template: Expr = if let Expr::Symbol(s) = &args[2] {
+        if s.starts_with('$') {
+            if let Some(atom) = env.get(s) {
+                atom_to_expr(&atom)?
+            } else {
+                args[2].clone()
+            }
+        } else {
+            args[2].clone()
+        }
+    } else {
+        args[2].clone()
+    };
+    // Evaluate template for each match with variable bindings
     let streams: Result<Vec<NDet>, String> = matches
         .into_iter()
         .map(|result| {
-            // Extend env with bindings from the match
             let mut match_env = env.clone();
             for (name, val) in &result.bindings {
                 match_env = match_env.extend(name, val.clone());
             }
-            eval(&args[2], &match_env, funcs)
+            eval(&template, &match_env, funcs)
         })
         .collect();
     Ok(NDet::stream(streams?.into_iter().flatten()))

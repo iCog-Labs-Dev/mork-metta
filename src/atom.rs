@@ -11,12 +11,13 @@
 ///
 /// # Assumptions
 /// - Numbers are 128-bit signed integers (no floats, no bigints).
-/// - Symbols are Unicode strings stored as-is (no interning).
+/// - Symbols are Unicode strings stored as `Arc<str>` (shared, O(1) clone).
 /// - `Expr` is an owned, fully-evaluated value — not a thunk or promise.
 /// - `Atom::Expr` with no elements represents the empty list `()`.
 /// - Equality is structural (recursive).
 /// - Empty symbol `Sym("")` represents MeTTa's `Empty` / false / unit value.
 /// - `Closure` equality compares params, body, and captured env structurally.
+use std::sync::Arc;
 use crate::env::Env;
 use crate::parser::Expr;
 
@@ -31,7 +32,8 @@ pub struct ClosureData {
 #[derive(Clone, Debug)]
 pub enum Atom {
     /// A symbolic name: function names, variable names (with $ prefix), data symbols.
-    Sym(String),
+    /// Stored as Arc<str> so cloning is O(1) — hot paths clone symbols frequently.
+    Sym(Arc<str>),
     /// A 128-bit signed integer.
     Num(i128),
     /// An S-expression — ordered list of atoms.
@@ -59,7 +61,7 @@ impl Atom {
     /// - The result is valid MeTTa (can be re-parsed by a compliant reader).
     pub fn to_sexpr_string(&self) -> String {
         match self {
-            Atom::Sym(s) => s.clone(),
+            Atom::Sym(s) => s.to_string(),
             Atom::Num(n) => n.to_string(),
             Atom::Expr(items) => {
                 let inner: Vec<String> = items.iter().map(|a| a.to_sexpr_string()).collect();
@@ -73,8 +75,14 @@ impl Atom {
     }
 
     /// Convenience: create a symbol atom.
+    /// Normalizes boolean literals to canonical lowercase (PeTTa convention).
     pub fn sym(s: &str) -> Self {
-        Atom::Sym(s.to_string())
+        let canonical = match s {
+            "True" => "true",
+            "False" => "false",
+            other => other,
+        };
+        Atom::Sym(Arc::from(canonical))
     }
 
     /// Convenience: create a number atom.
@@ -104,7 +112,7 @@ impl Atom {
     /// Returns an error description if the atom is not a symbol.
     pub fn as_sym(&self) -> Result<&str, String> {
         match self {
-            Atom::Sym(s) => Ok(s.as_str()),
+            Atom::Sym(s) => Ok(s.as_ref()),
             other => Err(format!("expected symbol, got {}", other.to_sexpr_string())),
         }
     }
@@ -129,7 +137,7 @@ impl Atom {
     pub fn is_truthy(&self) -> bool {
         match self {
             Atom::Num(0) => false,
-            Atom::Sym(s) if s.is_empty() => false,
+            Atom::Sym(s) if s.is_empty() || s.as_ref() == "false" => false,
             _ => true,
         }
     }

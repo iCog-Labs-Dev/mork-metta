@@ -36,11 +36,22 @@ impl Pattern {
     pub fn from_expr(expr: &Expr) -> Self {
         match expr {
             Expr::Symbol(s) if s.starts_with('$') => Pattern::Var(s.clone()),
-            Expr::Symbol(s) => Pattern::Exact(Atom::Sym(s.clone())),
+            Expr::Symbol(s) => Pattern::Exact(Atom::sym(s)),
             Expr::Number(n) => Pattern::Exact(Atom::Num(*n)),
             Expr::List(items) => {
                 Pattern::Expr(items.iter().map(Self::from_expr).collect())
             }
+        }
+    }
+
+    /// Construct a pattern from a runtime Atom (e.g. a pattern passed through a function arg).
+    /// `$`-prefixed Sym atoms become `Var(name)`; others become `Exact`.
+    pub fn from_atom(atom: &Atom) -> Self {
+        match atom {
+            Atom::Sym(s) if s.starts_with('$') => Pattern::Var(s.to_string()),
+            Atom::Sym(_) | Atom::Num(_) => Pattern::Exact(atom.clone()),
+            Atom::Expr(items) => Pattern::Expr(items.iter().map(Self::from_atom).collect()),
+            _ => Pattern::Exact(atom.clone()),
         }
     }
 }
@@ -81,7 +92,7 @@ pub trait Space {
 fn index_key(atom: &Atom) -> Option<(String, usize)> {
     if let Atom::Expr(items) = atom {
         if let Some(Atom::Sym(f)) = items.first() {
-            return Some((f.clone(), items.len()));
+            return Some((f.to_string(), items.len()));
         }
     }
     None
@@ -92,11 +103,11 @@ fn index_key(atom: &Atom) -> Option<(String, usize)> {
 fn pattern_index_key(pattern: &Pattern) -> Option<(String, usize)> {
     match pattern {
         Pattern::Expr(pats) => match pats.first()? {
-            Pattern::Exact(Atom::Sym(f)) => Some((f.clone(), pats.len())),
+            Pattern::Exact(Atom::Sym(f)) => Some((f.to_string(), pats.len())),
             _ => None,
         },
         Pattern::Exact(Atom::Expr(items)) => match items.first()? {
-            Atom::Sym(f) => Some((f.clone(), items.len())),
+            Atom::Sym(f) => Some((f.to_string(), items.len())),
             _ => None,
         },
         _ => None,
@@ -271,10 +282,10 @@ fn unify(
     if let Atom::Sym(s) = atom {
         if s.starts_with('$') && !matches!(pattern, Pattern::Any | Pattern::Var(_)) {
             let pat_atom = pattern_to_atom(pattern);
-            if let Some((_, bound)) = stored_bindings.iter().find(|(n, _)| n == s) {
+            if let Some((_, bound)) = stored_bindings.iter().find(|(n, _)| n.as_str() == s.as_ref()) {
                 return bound == &pat_atom;
             }
-            stored_bindings.push((s.clone(), pat_atom));
+            stored_bindings.push((s.to_string(), pat_atom));
             return true;
         }
     }
@@ -309,7 +320,7 @@ fn substitute_stored(atom: &Atom, bindings: &[(String, Atom)]) -> Atom {
     match atom {
         Atom::Sym(s) if s.starts_with('$') => bindings
             .iter()
-            .find(|(name, _)| name == s)
+            .find(|(name, _)| name.as_str() == s.as_ref())
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| atom.clone()),
         Atom::Expr(items) => {
@@ -386,7 +397,7 @@ fn parse_value(chars: &[char], pos: &mut usize) -> Result<Atom, String> {
                 return Err("unterminated string".into());
             }
             *pos += 1; // consume '"'
-            Ok(Atom::Sym(s))
+            Ok(Atom::sym(&s))
         }
         '-' | '0'..='9' => {
             let start = *pos;
@@ -409,7 +420,7 @@ fn parse_value(chars: &[char], pos: &mut usize) -> Result<Atom, String> {
                 *pos += 1;
             }
             let sym: String = chars[start..*pos].iter().collect();
-            Ok(Atom::Sym(sym))
+            Ok(Atom::sym(&sym))
         }
         c => Err(format!("unexpected character '{}'", c)),
     }
