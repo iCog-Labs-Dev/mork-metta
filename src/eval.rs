@@ -249,56 +249,90 @@ fn call_with_ref(
     };
     drop(func); // Release the RefCell borrow before any recursive eval calls.
     trace_enter!("call: {} ({} args)", name, args.len());
-    // Evaluate arguments (take first result of each)
-    let mut arg_vals = Vec::with_capacity(args.len());
+    // Collect ALL results from each arg, don't truncate to first.
+    // Nondeterminism threads through function calls: if an arg produces
+    // multiple values (e.g. (g $z) → [2,3]), the function is called with
+    // every combination (cartesian product).  This matches PeTTa semantics
+    // where backtracking through args generates all solutions.
+    let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(args.len());
     for (i, arg) in args.iter().enumerate() {
         let mut results = eval(arg, env, funcs)?;
-        let val = results.next().ok_or_else(|| {
-            format!("{}: argument {} produced no results", name, i + 1)
-        })?;
-        arg_vals.push(val);
+        let vals: Vec<Atom> = results.collect();
+        if vals.is_empty() {
+            return Err(format!(
+                "{}: argument {} produced no results",
+                name, i + 1
+            ));
+        }
+        arg_options.push(vals);
     }
+    // Compute cartesian product of arg values
     #[cfg(feature = "trace")]
-    let arg_strs: Vec<String> = arg_vals.iter().map(|a| a.to_sexpr_string()).collect();
-    trace!("{} args: [{}]", name, arg_strs.join(", "));
+    {
+        let opt_strs: Vec<String> = arg_options.iter()
+            .map(|opts| format!("[{}]", opts.iter().map(|a| a.to_sexpr_string()).collect::<Vec<_>>().join(", ")))
+            .collect();
+        trace!("{} arg options: [{}]", name, opt_strs.join(", "));
+    }
+    let cartesian = cartesian_product(&arg_options);
     if is_native {
         if let Some(f) = native_func {
-            let result = f(&arg_vals, funcs);
+            let mut results = Vec::new();
+            let mut last_err: Option<String> = None;
+            for args_slice in cartesian {
+                match f(&args_slice, funcs) {
+                    Ok(mut nd) => {
+                        while let Some(a) = nd.next() {
+                            results.push(a);
+                        }
+                    }
+                    Err(e) => { last_err = Some(e); }
+                }
+            }
+            // If every combination failed, propagate the error.
+            // If at least one succeeded, silently skip errors (matches
+            // PeTTa semantics where failing branches are discarded).
+            if results.is_empty() {
+                if let Some(e) = last_err {
+                    trace_exit!();
+                    return Err(e);
+                }
+            }
             trace_exit!();
-            return result;
+            return Ok(NDet::Stream(Box::new(results.into_iter())));
         }
     }
-    // UserDefined: try each clause
-    if clauses.len() == 1 {
-        return match try_match_clause(&clauses[0].patterns, &arg_vals, env, funcs)? {
-            Some(new_env) => {
-                trace!("clause matched, body eval");
-                eval(&clauses[0].body, &new_env, funcs)
-            }
-            None => Err(format!(
-                "{}: no matching clause for args [{}]",
-                name,
-                arg_vals.iter().map(|a| a.to_sexpr_string()).collect::<Vec<_>>().join(", ")
-            )),
-        };
-    }
+    // UserDefined: for each combination of arg values, try each clause
     let mut streams: Vec<NDet> = Vec::new();
-    for clause in clauses.iter() {
-        match try_match_clause(&clause.patterns, &arg_vals, env, funcs)? {
-            Some(new_env) => {
-                trace!("clause matched, body eval");
-                streams.push(eval(&clause.body, &new_env, funcs)?);
+    for arg_vals in cartesian {
+        if clauses.len() == 1 {
+            match try_match_clause(&clauses[0].patterns, &arg_vals, env, funcs)? {
+                Some(new_env) => {
+                    streams.push(eval(&clauses[0].body, &new_env, funcs)?);
+                }
+                None => {}
             }
-            None => {
-                trace!("clause did not match, trying next");
+            continue;
+        }
+        for clause in clauses.iter() {
+            match try_match_clause(&clause.patterns, &arg_vals, env, funcs)? {
+                Some(new_env) => {
+                    streams.push(eval(&clause.body, &new_env, funcs)?);
+                }
+                None => {}
             }
         }
     }
     if streams.is_empty() {
+        // Build helpful error message from the first arg-option (all should have same arity)
+        let example: Vec<String> = arg_options.iter()
+            .filter_map(|opts| opts.first())
+            .map(|a| a.to_sexpr_string())
+            .collect();
         return Err(format!(
             "{}: no matching clause for args [{}]",
             name,
-            arg_vals.iter().map(|a| a.to_sexpr_string()).collect::<Vec<_>>().join(", ")
+            example.join(", ")
         ));
     }
     trace_exit!();
@@ -595,6 +629,25 @@ fn eval_constrained(
     eval(expr, env, funcs).map(|ndet| ndet.map(|a| (a, Env::new())).collect())
 }
 
+/// Build the cartesian product of per-argument value lists, producing every
+/// combination as a Vec<Atom>.  Used by `call_with_ref` to thread
+/// nondeterminism through function calls.
+fn cartesian_product(options: &[Vec<Atom>]) -> Vec<Vec<Atom>> {
+    let mut result: Vec<Vec<Atom>> = vec![vec![]];
+    for opts in options {
+        let mut next: Vec<Vec<Atom>> = Vec::with_capacity(result.len() * opts.len());
+        for prefix in &result {
+            for val in opts {
+                let mut combined = prefix.clone();
+                combined.push(val.clone());
+                next.push(combined);
+            }
+        }
+        result = next;
+    }
+    result
+}
+
 /// Build the cartesian product of per-argument result streams, accumulating bindings.
 fn constrained_cartesian(streams: Vec<Vec<(Atom, Env)>>) -> Vec<(Vec<Atom>, Env)> {
     let mut result: Vec<(Vec<Atom>, Env)> = vec![(vec![], Env::new())];
@@ -624,7 +677,11 @@ fn eval_if(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     // Use constraint-aware evaluation for the condition so free-variable bindings
     // (e.g. $x→True from clause matching) are threaded into the template.
     let mut out: Vec<Atom> = Vec::new();
+    let mut had_bindings = false;
     for (cond, cond_bindings) in eval_constrained(&args[0], env, funcs)? {
+        if !matches!(cond_bindings, crate::env::Env::Empty) {
+            had_bindings = true;
+        }
         if cond.is_truthy() {
             let then_env = prepend_env(cond_bindings, env);
             out.extend(eval(&args[1], &then_env, funcs)?);
@@ -636,9 +693,11 @@ fn eval_if(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     Ok(match out.len() {
         0 => NDet::stream(std::iter::empty()),
         1 => NDet::single(out.remove(0)),
-        // Multiple constraint solutions: collect into a single list atom so
-        // (test (if cond tmpl) ((sol1) (sol2))) comparisons work directly.
-        _ => NDet::single(Atom::Expr(out)),
+        // Constraint-solving produced multiple solutions (bindings were non-empty):
+        // collect into a single list atom so (test (if cond tmpl) ((s1) (s2))) works.
+        // Non-det condition (superpose etc.) with empty bindings: stream results.
+        _ if had_bindings => NDet::single(Atom::Expr(out)),
+        _ => NDet::stream(out.into_iter()),
     })
 }
 
