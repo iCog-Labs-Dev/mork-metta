@@ -804,3 +804,65 @@ fn test_multi_clause_compile() {
         _ => panic!("expected definition"),
     }
 }
+
+// ========================================================================
+// Lambda closure tests  (regression: ensure lambda application stays correct)
+// ========================================================================
+
+#[test]
+fn test_lambda_direct_application() {
+    // ((|-> ($x $y) (+ $x $y)) 2 3) should apply the lambda directly
+    let mut rt = Runtime::new();
+    let code = r#"
+!(test ((|-> ($x $y) (+ $x $y)) 2 3) 5)
+"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::sym("true")));
+}
+
+#[test]
+fn test_lambda_bound_to_variable() {
+    // let-bound lambda applied as a function
+    let mut rt = Runtime::new();
+    let code = r#"
+!(let $f (|-> ($x) (+ $x 1))
+   (test ($f 5) 6))
+"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::sym("true")));
+}
+
+#[test]
+fn test_lambda_as_foldall_aggregator() {
+    // lambda as foldall aggregation function over superpose generator
+    let mut rt = Runtime::new();
+    let code = r#"
+!(test (foldall (|-> ($x $y) (+ $x $y)) (superpose (2 3)) 0) 5)
+"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::sym("true")));
+}
+
+#[test]
+fn test_lambda_with_let_bound_in_foldall() {
+    // let-bound lambda used as foldall aggregator over superpose generator
+    let mut rt = Runtime::new();
+    let code = r#"
+!(let $f (|-> ($x $y) (+ $x $y))
+   (test (foldall $f (superpose (2 3)) 0) 5))
+"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::sym("true")));
+}
+
+#[test]
+fn test_lambda_multi_arg_closure() {
+    // lambda with multiple params and body using them
+    let mut rt = Runtime::new();
+    let code = r#"
+!(let $f (|-> ($x $y $z) (+ $x (* $y $z)))
+   (test ($f 1 2 3) 7))
+"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::sym("true")));
+}
