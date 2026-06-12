@@ -4,7 +4,7 @@
 /// macro-registered — one line per function.
 
 use crate::atom::Atom;
-use crate::func::{FnTable, FunctionKind, NDet};
+use crate::func::{Clause, FnTable, FunctionKind, NDet};
 use crate::parser::Expr;
 
 macro_rules! bool_clause {
@@ -699,33 +699,52 @@ pub fn register_builtins(table: &FnTable) {
         Ok(NDet::single(acc))
     });
 
-    // foldl-atom: (foldl-atom func init list) → left fold over a list — alias for foldl
+    // foldl-atom: (foldl-atom list init func) → left fold over a list
+    // Also supports (foldl-atom list init $acc $x body) — inline lambda form.
     table.insert_native("foldl-atom", 3, |args, table| {
         expect_n_args(args, 3, "foldl-atom")?;
-        let items = match &args[2] {
+        let items = match &args[0] {
             Atom::Expr(v) => v.clone(),
             other => vec![other.clone()],
         };
         let mut acc = args[1].clone();
+        let fname = match &args[2] {
+            Atom::Sym(s) => s.clone(),
+            _ => return Err("foldl-atom: last arg must be a symbol (function name)".into()),
+        };
+        let func = table.get(&fname, 2)
+            .ok_or_else(|| format!("foldl-atom: function {} with arity 2 not found", fname))?;
+        if let FunctionKind::Native { func: func_ptr } = &func.kind {
+            for item in &items {
+                let mut result = func_ptr(&[acc, item.clone()], table)?;
+                acc = result.next().ok_or_else(|| "foldl-atom: function produced no results".to_string())?;
+            }
+            return Ok(NDet::single(acc));
+        }
+        let clauses = match &func.kind {
+            FunctionKind::UserDefined { clauses } => clauses.clone(),
+            _ => return Err("foldl-atom: unsupported function kind".into()),
+        };
+        drop(func);
         for item in &items {
-            let fname = match &args[0] {
-                Atom::Sym(s) => s.clone(),
-                _ => return Err("foldl-atom: first arg must be a symbol (function name)".into()),
-            };
-            let func_ref = table.get(&fname, 2)
-                .ok_or_else(|| format!("foldl-atom: function {} with arity 2 not found", fname))?;
-            let func_ptr = match &func_ref.kind {
-                FunctionKind::Native { func } => func.clone(),
-                FunctionKind::UserDefined { .. } => {
-                    return Err("foldl-atom: only native functions supported as first argument".into());
+            let args = [acc.clone(), item.clone()];
+            let mut matched = None;
+            for clause in &clauses {
+                if let Some(match_env) = crate::eval_parts::pattern::try_match_clause(
+                    &clause.patterns, &args, &crate::env::Env::new(), table
+                )? {
+                    matched = Some((clause, match_env));
+                    break;
                 }
-            };
-            drop(func_ref);
-            let mut result = func_ptr(&[acc, item.clone()], table)?;
-            acc = result.next().ok_or_else(|| "foldl-atom: function produced no results".to_string())?;
+            }
+            let (clause, match_env) = matched.ok_or_else(|| "foldl-atom: no matching clause for args".to_string())?;
+            let mut result = crate::eval_parts::core::eval(&clause.body, &match_env, table)?;
+            acc = result.next().ok_or_else(|| "foldl-atom: clause body produced no results".to_string())?;
         }
         Ok(NDet::single(acc))
     });
+
+
 
     // decons-atom: (decons-atom list) → (first rest) — split list into head and tail, alias for decons
     table.insert_native("decons-atom", 1, |args, _| {
