@@ -890,35 +890,61 @@ pub(crate) fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDe
         _ => return Err("case: second arg must be a list of (pattern body) pairs".into()),
     };
 
-    // Collect all scrutinee values (may be nondeterministic)
-    let vals: Vec<Atom> = super::core::eval(&args[0], env, funcs)?.collect();
+    // Evaluate scrutinee lazily — peek at first value to handle empty case.
+    let mut stream = super::core::eval(&args[0], env, funcs)?;
+    let first_val = stream.next();
 
     // Empty scrutinee: look for (Empty body) clause
-    if vals.is_empty() {
-        for clause in clauses {
-            let (pattern, body) = match clause {
-                Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
-                _ => continue,
-            };
-            if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
-                return super::core::eval(body, env, funcs);
+    let first_val = match first_val {
+        None => {
+            for clause in clauses {
+                let (pattern, body) = match clause {
+                    Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
+                    _ => continue,
+                };
+                if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
+                    return super::core::eval(body, env, funcs);
+                }
             }
+            return Ok(NDet::stream(std::iter::empty()));
         }
-        return Ok(NDet::stream(std::iter::empty()));
+        Some(v) => v,
+    };
+
+    // Check if clause bodies are pure enough for parallel fan-out.
+    // The inner loop (per-value clause matching) stays sequential to preserve
+    // first-match-wins semantics.
+    let bodies_pure = clauses.iter().all(|clause| match clause {
+        Expr::List(items) if items.len() == 2 => {
+            crate::eval_parts::data_list::is_pure_expr(&items[1], funcs)
+        }
+        _ => false,
+    });
+
+    // Parallel path: collect all vals first, then fan-out across workers.
+    if bodies_pure {
+        let mut vals = Vec::new();
+        vals.push(first_val);
+        vals.extend(&mut stream);
+
+        let results: Vec<Result<Vec<Atom>, String>> = if vals.len() > 1 {
+            use rayon::prelude::*;
+            vals.par_iter().map(|val| try_case_value(val, clauses, env, funcs)).collect()
+        } else {
+            vals.iter().map(|val| try_case_value(val, clauses, env, funcs)).collect()
+        };
+        let mut out: Vec<Atom> = Vec::new();
+        for r in results {
+            out.extend(r?);
+        }
+        return Ok(NDet::stream(out.into_iter()));
     }
 
-    // Parallel fan-out: for each scrutinee value, match clauses independently.
-    // The inner loop (per-value clause matching) stays sequential to preserve
-    // first-match-wins semantics. Different values are independent.
-    let results: Vec<Result<Vec<Atom>, String>> = if vals.len() > 1 {
-        use rayon::prelude::*;
-        vals.par_iter().map(|val| try_case_value(val, clauses, env, funcs)).collect()
-    } else {
-        vals.iter().map(|val| try_case_value(val, clauses, env, funcs)).collect()
-    };
-    let mut out: Vec<Atom> = Vec::new();
-    for r in results {
-        out.extend(r?);
+    // Sequential path: process values lazily from the stream, collecting
+    // results directly into the output without an intermediate Vec.
+    let mut out: Vec<Atom> = try_case_value(&first_val, clauses, env, funcs)?;
+    for val in &mut stream {
+        out.extend(try_case_value(&val, clauses, env, funcs)?);
     }
     Ok(NDet::stream(out.into_iter()))
 }

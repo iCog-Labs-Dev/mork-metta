@@ -15,6 +15,7 @@ use crate::atom::Atom;
 use crate::env::Env;
 use crate::eval_parts::core::eval;
 use crate::func::{Clause, FnTable};
+use std::sync::Arc;
 use crate::parser::Expr;
 
 /// Try to match argument atoms against a clause's patterns.
@@ -58,10 +59,13 @@ pub(crate) fn try_match_clause(
 pub(crate) fn prepend_env(match_env: Env, base: &Env) -> Env {
     match match_env {
         Env::Empty => base.clone(),
-        Env::Cons { name, value, next } => Env::Cons {
-            name,
-            value,
-            next: Box::new(prepend_env(*next, base)),
+        Env::Cons { name, value, next } => {
+            let inner = Arc::try_unwrap(next).unwrap_or_else(|arc| (*arc).clone());
+            Env::Cons {
+                name,
+                value,
+                next: Arc::new(prepend_env(inner, base)),
+            }
         },
     }
 }

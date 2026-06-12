@@ -78,7 +78,7 @@ pub struct Function {
 }
 
 /// Two-level function map: name → (arity → Function).
-type FuncMap = HashMap<String, HashMap<u8, Function>>;
+type FuncMap = HashMap<String, HashMap<u8, Arc<Function>>>;
 
 pub struct FnTable {
     /// Read-heavy: many concurrent lookups during eval, writes only at load time.
@@ -123,20 +123,30 @@ impl FnTable {
 
     pub fn add_clause(&self, name: String, patterns: Vec<Expr>, body: Expr) {
         let arity = patterns.len() as u8;
+        // Infer purity from the body before taking the write lock (the check
+        // reads the map). Direct recursion is assumed pure (optimistic);
+        // calls to unknown/impure functions make the clause impure.
+        let clause_pure =
+            crate::eval_parts::data_list::is_pure_expr_assuming(&body, self, &name);
         let clause = Clause { patterns, body };
         let mut map = self.map.write().unwrap();
         let inner = map.entry(name.clone()).or_insert_with(HashMap::new);
-        if let Some(func) = inner.get_mut(&arity) {
-            if let FunctionKind::UserDefined { ref mut clauses } = func.kind {
-                clauses.push(clause);
-                return;
+        if let Some(arc_func) = inner.get_mut(&arity) {
+            // Arc refcount is 1 at load time, so get_mut is zero-copy.
+            if let Some(func) = Arc::get_mut(arc_func) {
+                if let FunctionKind::UserDefined { ref mut clauses } = func.kind {
+                    clauses.push(clause);
+                    // A function is pure only if every clause is.
+                    func.pure = func.pure && clause_pure;
+                    return;
+                }
             }
         }
-        inner.insert(arity, Function {
+        inner.insert(arity, Arc::new(Function {
             name,
             kind: FunctionKind::UserDefined { clauses: vec![clause] },
-            pure: false,
-        });
+            pure: clause_pure,
+        }));
     }
 
     /// Remove a specific clause from a user-defined function.
@@ -145,7 +155,8 @@ impl FnTable {
         let arity = patterns.len() as u8;
         let mut map = self.map.write().unwrap();
         let Some(inner) = map.get_mut(name) else { return false; };
-        let Some(func) = inner.get_mut(&arity) else { return false; };
+        let Some(arc_func) = inner.get_mut(&arity) else { return false; };
+        let Some(func) = Arc::get_mut(arc_func) else { return false; };
         if let FunctionKind::UserDefined { ref mut clauses } = func.kind {
             let before = clauses.len();
             clauses.retain(|c| c.patterns.as_slice() != patterns || c.body != *body);
@@ -164,21 +175,22 @@ impl FnTable {
     {
         self.map.write().unwrap()
             .entry(name.to_string()).or_insert_with(HashMap::new)
-            .insert(arity, Function {
+            .insert(arity, Arc::new(Function {
                 name: name.to_string(),
                 kind: FunctionKind::Native { func: Arc::new(func) },
                 pure: false,
-            });
+            }));
     }
 
     /// Mark a registered function as pure (no side effects).
     /// Pure functions can have arguments evaluated in parallel.
     /// No-op if the function is not found (e.g. not yet loaded).
     pub fn mark_pure(&self, name: &str, arity: u8) {
-        if let Some(func) = self.map.write().unwrap()
+        if let Some(arc_func) = self.map.write().unwrap()
             .get_mut(name).and_then(|inner| inner.get_mut(&arity))
+            .and_then(|a| Arc::get_mut(a))
         {
-            func.pure = true;
+            arc_func.pure = true;
         }
     }
 
@@ -188,9 +200,9 @@ impl FnTable {
             .get(name).map_or(false, |inner| inner.contains_key(&arity))
     }
 
-    /// Clone the Function out — cheap since UserDefined clones Vec<Clause> and
-    /// Native just bumps an Arc refcount.
-    pub fn get(&self, name: &str, arity: u8) -> Option<Function> {
+    /// Return the `Arc<Function>` for a named function at the given arity.
+    /// The Arc clone is O(1).
+    pub fn get(&self, name: &str, arity: u8) -> Option<Arc<Function>> {
         self.map.read().unwrap()
             .get(name).and_then(|inner| inner.get(&arity)).cloned()
     }

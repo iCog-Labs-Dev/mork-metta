@@ -30,7 +30,7 @@ pub enum Env {
     Cons {
         name: Arc<str>,
         value: Atom,
-        next: Box<Env>,
+        next: Arc<Env>,
     },
 }
 
@@ -70,7 +70,7 @@ impl Env {
         Env::Cons {
             name: Arc::from(name),
             value,
-            next: Box::new(self.clone()),
+            next: Arc::new(self.clone()),
         }
     }
 
@@ -89,7 +89,7 @@ impl Env {
             env = Env::Cons {
                 name: Arc::from(name.as_str()),
                 value: value.clone(),
-                next: Box::new(env),
+                next: Arc::new(env),
             };
         }
         env

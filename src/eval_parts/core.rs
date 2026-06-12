@@ -151,7 +151,7 @@ fn try_call_or_data(
                 Atom::Sym(func_name) => {
                     trace!("→ $var op '{}' = '{}'", s, func_name);
                     return match funcs.get(func_name, args.len() as u8) {
-                        Some(func) => call_with_cloned(func, func_name, args, env, funcs),
+                        Some(func) => call_with_cloned(&*func, func_name, args, env, funcs),
                         None => {
                             trace!("→ unknown symbol '{}', treating as data list", s);
                             eval_data_list(all_items, env, funcs)
@@ -176,7 +176,7 @@ fn try_call_or_data(
         Expr::Symbol(s) => {
             if !s.starts_with('$') {
                 return match funcs.get(s, args.len() as u8) {
-                    Some(func) => call_with_cloned(func, s, args, env, funcs),
+                    Some(func) => call_with_cloned(&*func, s, args, env, funcs),
                     None => {
                         trace!("→ unknown symbol '{}', treating as data list", s);
                         eval_data_list(all_items, env, funcs)
@@ -192,7 +192,7 @@ fn try_call_or_data(
             match op_val {
                 Some(Atom::Sym(func_name)) => {
                     match funcs.get(&func_name, args.len() as u8) {
-                        Some(func) => call_with_cloned(func, &func_name, args, env, funcs),
+                        Some(func) => call_with_cloned(&*func, &func_name, args, env, funcs),
                         None => {
                             let head = Some(Atom::Sym(func_name));
                             eval_data_list_with_head(head.unwrap(), args, env, funcs)
@@ -256,9 +256,9 @@ pub(crate) fn apply_closure(
     eval(body, &full_env, funcs)
 }
 
-/// Dispatch a function call using an owned (cloned) Function value.
+/// Dispatch a function call using a borrowed Function.
 pub(crate) fn call_with_cloned(
-    func: Function,
+    func: &Function,
     op_name: &str,
     args: &[Expr],
     env: &Env,
@@ -266,19 +266,30 @@ pub(crate) fn call_with_cloned(
 ) -> Result<NDet, String> {
     let name = func.name.clone();
     let is_native = matches!(&func.kind, FunctionKind::Native { .. });
-    let pure = func.pure;
-    let clauses: Vec<crate::func::Clause> = match &func.kind {
-        FunctionKind::UserDefined { clauses } => clauses.clone(),
-        FunctionKind::Native { .. } => vec![],
+    let clauses: &[crate::func::Clause] = match &func.kind {
+        FunctionKind::UserDefined { clauses } => clauses,
+        FunctionKind::Native { .. } => &[],
     };
     let native_func: Option<Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static>> = match &func.kind {
         FunctionKind::Native { func: f } => Some(Arc::clone(f)),
         FunctionKind::UserDefined { .. } => None,
     };
-    drop(func);
     trace_enter!("call: {} ({} args)", name, args.len());
 
-    let arg_options: Vec<Vec<Atom>> = if pure && args.len() > 1 {
+    // Parallel arg eval is safe only when the ARGUMENT expressions themselves
+    // are pure — the callee's purity is irrelevant here, since impure args
+    // (add-atom, println!, match, ...) must run in program order. It's
+    // worthwhile only when ≥2 args are compound AND the pool isn't already
+    // saturated (try_fork): recursive functions would otherwise fork at every
+    // level, drowning the work in task-scheduling overhead.
+    let fork_guard = if crate::eval_parts::data_list::worth_parallel(args)
+        && args.iter().all(|a| crate::eval_parts::data_list::is_pure_expr(a, funcs))
+    {
+        crate::eval_parts::data_list::try_fork()
+    } else {
+        None
+    };
+    let arg_options: Vec<Vec<Atom>> = if fork_guard.is_some() {
         use rayon::prelude::*;
         let results: Vec<Result<Vec<Atom>, String>> = args.par_iter()
             .map(|arg| {
@@ -291,6 +302,7 @@ pub(crate) fn call_with_cloned(
                 }
             })
             .collect();
+        drop(fork_guard);
         let mut arg_options = Vec::with_capacity(args.len());
         for r in results {
             arg_options.push(r?);
