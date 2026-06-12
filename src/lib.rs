@@ -16,7 +16,11 @@ pub mod atom;
 pub mod trace;
 pub mod compile;
 pub mod env;
-pub mod eval;
+pub mod eval_parts;
+/// Re-export for backward compatibility with tests that import `crate::eval`.
+pub mod eval {
+    pub use crate::eval_parts::*;
+}
 pub mod func;
 pub mod builtins;
 pub mod parser;
@@ -27,7 +31,7 @@ pub mod plugin;
 use crate::atom::Atom;
 use crate::compile::compile_definition;
 use crate::env::Env;
-use crate::eval::{eval, eval_scope};
+use crate::eval_parts::{eval, eval_scope};
 use crate::func::FnTable;
 use crate::func::Clause;
 use crate::builtins::register_builtins;
@@ -148,6 +152,6 @@ impl Runtime {
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
         *self.funcs.import_dir.lock().unwrap() = dir.to_path_buf();
         let env = crate::env::Env::new();
-        crate::eval::load_metta_file(path, &env, &self.funcs)
+        crate::eval_parts::load_metta_file(path, &env, &self.funcs)
     }
 }
