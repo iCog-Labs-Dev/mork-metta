@@ -105,11 +105,41 @@ pub(crate) fn try_match_one(
             Atom::Sym(v) if v.starts_with('$') => Ok(Some(env.extend(v, Atom::sym(s)))),
             _ => Ok(None),
         },
-        Expr::List(items) => match atom {
-            Atom::Expr(elems) => {
-                if items.len() != elems.len() {
-                    return Ok(None);
+        Expr::List(items) => {
+            // (cons $head $tail) destructuring: matches any non-empty list,
+            // binding the first element and the rest as a list.
+            if items.len() >= 2 {
+                if let Expr::Symbol(s) = &items[0] {
+                    if s == "cons" {
+                        return match atom {
+                            Atom::Expr(elems) if !elems.is_empty() => {
+                                let mut current = env.clone();
+                                if items.len() >= 2 {
+                                    match try_match_one(&items[1], &elems[0], &current, funcs)? {
+                                        Some(new_env) => current = new_env,
+                                        None => return Ok(None),
+                                    }
+                                }
+                                if items.len() >= 3 {
+                                    let rest = Atom::Expr(elems[1..].to_vec());
+                                    match try_match_one(&items[2], &rest, &current, funcs)? {
+                                        Some(new_env) => current = new_env,
+                                        None => return Ok(None),
+                                    }
+                                }
+                                // Extra sub-patterns are ignored (arity 2 for cons).
+                                Ok(Some(current))
+                            }
+                            _ => Ok(None),
+                        };
+                    }
                 }
+            }
+            match atom {
+                Atom::Expr(elems) => {
+                    if items.len() != elems.len() {
+                        return Ok(None);
+                    }
                 let mut current = env.clone();
                 for (pat, arg) in items.iter().zip(elems.iter()) {
                     match try_match_one(pat, arg, &current, funcs)? {
@@ -132,7 +162,8 @@ pub(crate) fn try_match_one(
                 }
             }
             _ => Ok(None),
-        },
+        }
+},
     }
 }
 
