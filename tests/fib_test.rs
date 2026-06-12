@@ -24,7 +24,7 @@ fn test_fib_30() {
 !(test (fib 30) 832040)
 "#;
     let result = rt.eval_str(code).unwrap();
-    assert_eq!(result, Some(Atom::sym("ok")));
+    assert_eq!(result, Some(Atom::sym("true")));
 }
 
 #[test]
@@ -296,7 +296,7 @@ fn test_let_inside_function() {
 !(test (add5 10) 15)
 "#;
     let result = rt.eval_str(code).unwrap();
-    assert_eq!(result, Some(Atom::sym("ok")));
+    assert_eq!(result, Some(Atom::sym("true")));
 }
 
 // ========================================================================
@@ -502,7 +502,7 @@ fn test_collapse_empty() {
 fn test_collapse_data_list() {
     let mut rt = Runtime::new();
     let result = rt.eval_str("!(test (collapse (1 2 3)) ((1 2 3)))").unwrap();
-    assert_eq!(result, Some(Atom::sym("ok")));
+    assert_eq!(result, Some(Atom::sym("true")));
 }
 
 // ========================================================================
@@ -517,7 +517,7 @@ fn test_identity_example() {
 !(test (f 1) 1)
 "#;
     let result = rt.eval_str(code).unwrap();
-    assert_eq!(result, Some(Atom::sym("ok")));
+    assert_eq!(result, Some(Atom::sym("true")));
 }
 
 // ========================================================================
@@ -529,7 +529,7 @@ fn test_letstar_example() {
     let mut rt = Runtime::new();
     let code = "!(test (let* (($x 1) ($y 2)) (+ $x $y)) 3)";
     let result = rt.eval_str(code).unwrap();
-    assert_eq!(result, Some(Atom::sym("ok")));
+    assert_eq!(result, Some(Atom::sym("true")));
 }
 
 // ========================================================================
@@ -580,15 +580,14 @@ fn test_quote_tuple() {
 fn test_test_builtin_passes() {
     let mut rt = Runtime::new();
     let result = rt.eval_str("!(test (+ 1 2) 3)").unwrap();
-    assert_eq!(result, Some(Atom::sym("ok")));
+    assert_eq!(result, Some(Atom::sym("true")));
 }
 
 #[test]
 fn test_test_builtin_fails() {
     let mut rt = Runtime::new();
-    let result = rt.eval_str("!(test (+ 1 2) 999)");
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("test failed"));
+    let result = rt.eval_str("!(test (+ 1 2) 999)").unwrap();
+    assert_eq!(result, Some(Atom::sym("False")));
 }
 // ========================================================================
 // Multi-clause functions (pattern matching)
@@ -636,7 +635,7 @@ fn test_multi_clause_literal_symbols() {
 !(test (describe chair) unknown)
 "#;
     let result = rt.eval_str(code).unwrap();
-    assert_eq!(result, Some(Atom::sym("ok")));
+    assert_eq!(result, Some(Atom::sym("true")));
 }
 #[test]
 fn test_multi_clause_no_match_error() {
@@ -675,7 +674,7 @@ fn test_multi_clause_structured_patterns() {
 !(test (fst (1 2)) 1)
 "#;
     let result = rt.eval_str(code).unwrap();
-    assert_eq!(result, Some(Atom::sym("ok")));
+    assert_eq!(result, Some(Atom::sym("true")));
 }
 
 // ========================================================================
@@ -693,7 +692,7 @@ fn test_foldall_basic() {
 !(test (foldall merge (f) 0) 5)
 "#;
     let result = rt.eval_str(code).unwrap();
-    assert_eq!(result, Some(Atom::sym("ok")));
+    assert_eq!(result, Some(Atom::sym("true")));
 }
 
 #[test]
@@ -728,7 +727,7 @@ fn test_chain_basic() {
     let mut rt = Runtime::new();
     let code = r#"!(test (chain (+ 2 4) $n (* 3 $n)) 18)"#;
     let result = rt.eval_str(code).unwrap();
-    assert_eq!(result, Some(Atom::sym("ok")));
+    assert_eq!(result, Some(Atom::sym("true")));
 }
 
 #[test]
@@ -736,7 +735,7 @@ fn test_chain_nested() {
     let mut rt = Runtime::new();
     let code = r#"!(test (chain (+ 1 3) $n (chain (* 2 $n) $m (+ $n $m))) 12)"#;
     let result = rt.eval_str(code).unwrap();
-    assert_eq!(result, Some(Atom::sym("ok")));
+    assert_eq!(result, Some(Atom::sym("true")));
 }
 
 #[test]
@@ -786,7 +785,7 @@ fn test_case_multiple_clauses() {
     let mut rt = Runtime::new();
     let code = r#"!(test (case 2 ((1 (quote one)) (2 (quote two)) (3 (quote three)))) two)"#;
     let result = rt.eval_str(code).unwrap();
-    assert_eq!(result, Some(Atom::sym("ok")));
+    assert_eq!(result, Some(Atom::sym("true")));
 }
 #[test]
 fn test_multi_clause_compile() {
