@@ -8,6 +8,7 @@
 /// - `MorkSpace` — wraps MORK's `PathMap` trie (requires `mork` feature)
 
 use std::collections::HashMap;
+use std::sync::RwLock;
 use crate::atom::Atom;
 use crate::parser::Expr;
 
@@ -66,7 +67,7 @@ pub struct MatchResult {
 }
 
 /// Space trait: abstract atom storage backend.
-pub trait Space {
+pub trait Space: Send {
     /// Add an atom to the space.
     fn add_atom(&mut self, atom: &Atom) -> Result<(), String>;
 
@@ -128,7 +129,7 @@ pub struct LocalSpace {
 
 impl LocalSpace {
     pub fn new() -> Self { Self::default() }
-    pub fn new_box() -> Box<dyn Space> { Box::new(Self::default()) }
+    pub fn new_box() -> Box<dyn Space + Send> { Box::new(Self::default()) }
 }
 
 impl Space for LocalSpace {
@@ -180,6 +181,107 @@ impl Space for LocalSpace {
     }
 
     fn description(&self) -> &str { "LocalSpace (indexed by functor+arity)" }
+}
+
+// ========================================================================
+// ShardedSpace — shard-by-bucket for concurrent read/write
+// ========================================================================
+
+/// Pick a shard index for an atom based on its index key hash.
+/// Atoms without an index key use a fallback hash of the atom itself.
+fn pick_shard(atom: &Atom, n_shards: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let key = index_key(atom);
+    let hash = match &key {
+        Some((f, len)) => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            f.hash(&mut h);
+            len.hash(&mut h);
+            h.finish()
+        }
+        None => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            atom.hash(&mut h);
+            h.finish()
+        }
+    };
+    (hash as usize) % n_shards
+}
+
+/// Space sharded by `(functor, arity)` key hash for concurrent access.
+///
+/// Each shard is an independent `LocalSpace` behind its own `RwLock`.
+/// - `add_atom` / `remove_atom` lock only the atom's shard (single-writer).
+/// - `match_atoms` with an index key queries one shard (no cross-shard scan).
+/// - `match_atoms` for wildcards fans out to all shards in parallel via Rayon.
+/// - Multiple readers can coexist (readers don't block each other).
+///
+/// The default shard count matches the number of CPU cores.
+pub struct ShardedSpace {
+    n_shards: usize,
+    shards: Vec<RwLock<LocalSpace>>,
+}
+
+impl ShardedSpace {
+    /// Create a new sharded space with `n` shards.
+    pub fn new(n: usize) -> Self {
+        let n_shards = n.max(1);
+        let mut shards = Vec::with_capacity(n_shards);
+        for _ in 0..n_shards {
+            shards.push(RwLock::new(LocalSpace::new()));
+        }
+        ShardedSpace { n_shards, shards }
+    }
+
+    /// Create a new sharded space with one shard per CPU core.
+    pub fn new_default() -> Self {
+        Self::new(std::thread::available_parallelism()
+            .map(|n| n.get()).unwrap_or(4))
+    }
+
+    pub fn new_box(n: usize) -> Box<dyn Space + Send> {
+        Box::new(Self::new(n))
+    }
+}
+
+impl Space for ShardedSpace {
+    fn add_atom(&mut self, atom: &Atom) -> Result<(), String> {
+        let shard = pick_shard(atom, self.n_shards);
+        self.shards[shard].write().unwrap().add_atom(atom)
+    }
+
+    fn remove_atom(&mut self, atom: &Atom) -> Result<bool, String> {
+        let shard = pick_shard(atom, self.n_shards);
+        self.shards[shard].write().unwrap().remove_atom(atom)
+    }
+
+    fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
+        if let Some(key) = pattern_index_key(pattern) {
+            // Indexed pattern: only query the relevant shard
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            key.0.hash(&mut h);
+            key.1.hash(&mut h);
+            let shard = (h.finish() as usize) % self.n_shards;
+            return self.shards[shard].read().unwrap().match_atoms(pattern);
+        }
+        // Full scan: query all shards in parallel, merge results
+        use rayon::prelude::*;
+        self.shards.par_iter()
+            .flat_map(|s| s.read().unwrap().match_atoms(pattern))
+            .collect()
+    }
+
+    fn get_atoms(&self) -> Vec<Atom> {
+        // Lock each shard sequentially (parallel would be worse due to contention)
+        let mut all = Vec::new();
+        for shard in &self.shards {
+            all.extend(shard.read().unwrap().get_atoms());
+        }
+        all
+    }
+
+    fn description(&self) -> &str { "ShardedSpace (concurrent, shard-by-bucket)" }
 }
 
 // ========================================================================

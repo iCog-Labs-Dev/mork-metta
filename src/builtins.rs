@@ -41,11 +41,8 @@ fn f64_to_atom(f: f64) -> Atom {
 macro_rules! num_binary {
     ($table:ident, $name:expr, $int_op:expr, $float_op:expr) => {
         $table.insert_native($name, 2, |args, _| {
-            // SAFETY: arity dispatch guarantees exactly 2 args reach this closure.
             Ok(NDet::single(match (&args[0], &args[1]) {
-                // Both integers — stay integer (preserves truncating division etc.)
                 (Atom::Num(a), Atom::Num(b)) => Atom::Num($int_op(*a, *b)),
-                // At least one float-like — use float ops
                 _ => {
                     let a = atom_as_f64(&args[0], $name)?;
                     let b = atom_as_f64(&args[1], $name)?;
@@ -53,6 +50,7 @@ macro_rules! num_binary {
                 }
             }))
         });
+        $table.mark_pure($name, 2);
     };
 }
 macro_rules! cmp_binary {
@@ -67,6 +65,7 @@ macro_rules! cmp_binary {
                 Atom::sym("False")
             }))
         });
+        $table.mark_pure($name, 2);
     };
 }
 
@@ -76,6 +75,7 @@ macro_rules! math_unary {
             let x = atom_as_f64(&args[0], $name)?;
             Ok(NDet::single(f64_to_atom($op(x))))
         });
+        $table.mark_pure($name, 1);
     };
 }
 
@@ -86,6 +86,7 @@ macro_rules! math_binary {
             let b = atom_as_f64(&args[1], $name)?;
             Ok(NDet::single(f64_to_atom($op(a, b))))
         });
+        $table.mark_pure($name, 2);
     };
 }
 
@@ -309,7 +310,7 @@ pub fn register_builtins(table: &FnTable) {
             Atom::Sym(s) => s.to_string(),
             other => return Err(format!("get-state: key must be a symbol, got {}", other.to_sexpr_string())),
         };
-        let state = table.state.borrow();
+        let state = table.state.lock().unwrap();
         match state.get(&key) {
             Some(val) => Ok(NDet::single(val.clone())),
             None => Err(format!("get-state: no value for key '{}'", key)),
@@ -323,7 +324,7 @@ pub fn register_builtins(table: &FnTable) {
             Atom::Sym(s) => s.to_string(),
             other => return Err(format!("change-state!: key must be a symbol, got {}", other.to_sexpr_string())),
         };
-        table.state.borrow_mut().insert(key, args[1].clone());
+                table.state.lock().unwrap().insert(key, args[1].clone());
         Ok(NDet::single(Atom::sym("true")))
     });
 
@@ -342,7 +343,7 @@ pub fn register_builtins(table: &FnTable) {
             }
             other => other.clone(),
         };
-        table.state.borrow_mut().insert(key, value);
+                table.state.lock().unwrap().insert(key, value);
         Ok(NDet::single(Atom::sym("true")))
     });
 
@@ -675,7 +676,7 @@ pub fn register_builtins(table: &FnTable) {
                 Atom::Sym(s) => s.clone(),
                 _ => return Err("foldl: first arg must be a symbol (function name)".into()),
             };
-            let func_ref = table.get_ref(&fname, 2)
+            let func_ref = table.get(&fname, 2)
                 .ok_or_else(|| format!("foldl: function {} with arity 2 not found", fname))?;
             let func_ptr = match &func_ref.kind {
                 FunctionKind::Native { func } => func.clone(),
@@ -703,7 +704,7 @@ pub fn register_builtins(table: &FnTable) {
                 Atom::Sym(s) => s.clone(),
                 _ => return Err("foldl-atom: first arg must be a symbol (function name)".into()),
             };
-            let func_ref = table.get_ref(&fname, 2)
+            let func_ref = table.get(&fname, 2)
                 .ok_or_else(|| format!("foldl-atom: function {} with arity 2 not found", fname))?;
             let func_ptr = match &func_ref.kind {
                 FunctionKind::Native { func } => func.clone(),
@@ -786,7 +787,7 @@ pub fn register_builtins(table: &FnTable) {
         };
         let mut results = Vec::with_capacity(items.len());
         for item in &items {
-            let func_ref = table.get_ref(&fname, 1)
+            let func_ref = table.get(&fname, 1)
                 .ok_or_else(|| format!("maplist: function {} with arity 1 not found", fname))?;
             let func_ptr = match &func_ref.kind {
                 FunctionKind::Native { func } => func.clone(),
@@ -815,7 +816,7 @@ pub fn register_builtins(table: &FnTable) {
         };
         let mut results = Vec::with_capacity(items.len());
         for item in &items {
-            let func_ref = table.get_ref(&fname, 1)
+            let func_ref = table.get(&fname, 1)
                 .ok_or_else(|| format!("filter-atom: function {} with arity 1 not found", fname))?;
             let func_ptr = match &func_ref.kind {
                 FunctionKind::Native { func } => func.clone(),
@@ -911,6 +912,42 @@ pub fn register_builtins(table: &FnTable) {
         // Parse a single atom from string using a simple parser
         Ok(NDet::single(sread_parse(&input)?))
     });
+
+    // Mark pure functions (no side effects on space/state/I/O).
+    // Macro-generated builtins (+ - * / < > <= >= sqrt-math etc.) are
+    // already marked by their macros. Inline insert_native pure functions
+    // are marked here.
+    let pure_list: &[(&str, u8)] = &[
+        ("!=", 2), ("isnan-math", 1), ("isinf-math", 1),
+        ("min-atom", 1), ("max-atom", 1),
+        ("size-atom", 1), ("length", 1), ("append", 2),
+        ("msort", 1), ("sort", 1),
+        ("==", 2), ("=", 2), ("=?", 2),
+        ("test", 2), ("repr", 1),
+        ("cons-atom", 2), ("cons", 2),
+        ("car-atom", 1), ("car", 1),
+        ("cdr-atom", 1), ("cdr", 1),
+        ("index-atom", 2), ("id", 1), ("=alpha", 2),
+        ("first-from-pair", 1), ("first", 1),
+        ("second-from-pair", 1), ("second", 1),
+        ("last", 1), ("decons", 1),
+        ("reverse", 1), ("is-member", 2),
+        ("exclude-item", 2), ("unique-atom", 1),
+        ("union-atom", 2), ("intersection-atom", 2),
+        ("subtraction-atom", 2),
+        ("sort-atom", 1), ("sort-math", 1),
+        ("same", 2),
+        ("decons-atom", 1), ("list_to_set", 1),
+        ("alpha-unique-atom", 1),
+        ("is-var", 1), ("is-expr", 1), ("is-space", 1),
+        ("concat", 2), ("atom_concat", 2), ("atom_chars", 1),
+        ("term_hash", 1), ("sread", 1),
+        // Boolean functions (user-defined clauses, pure)
+        ("or", 2), ("and", 2), ("not", 1), ("xor", 2), ("implies", 2),
+    ];
+    for &(name, arity) in pure_list {
+        table.mark_pure(name, arity);
+    }
 }
 
 // ---- Helpers ----

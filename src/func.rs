@@ -4,17 +4,15 @@
 /// native (grounded) Rust functions. Also owns the atom space reference and
 /// mutable state store for space/state operations.
 ///
-/// # Assumptions
-/// - User-defined functions have a fixed param list (no varargs, no optional args).
-/// - Native functions receive fully-evaluated argument atoms and return an NDet
-///   iterator (possibly with one element for deterministic functions).
-/// - The FnTable is the sole dispatch mechanism — no dynamic dispatch or
-///   multi-method infrastructure.
-/// - Space + state are stored behind `RefCell` for interior mutability — both
-///   builtins and special forms can access them through `&FnTable`.
+/// # Thread safety
+/// `FnTable` is `Send + Sync`:
+/// - `map` uses `RwLock` — concurrent reads during eval, exclusive writes at load time.
+/// - `space`, `state`, `import_dir` use `Mutex` — serialised access, no `Sync` required
+///   from the Space implementors (which may use `Cell` internally, e.g. MorkSpace).
+/// - `FunctionKind::Native` requires `Send + Sync` on the function pointer so that
+///   native closures registered at startup are safe to call from worker threads.
 
-use std::cell::{Ref, RefCell};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use crate::parser::Expr;
@@ -26,25 +24,13 @@ use crate::space::Space;
 /// Allocates a `Box` only for multi-result streams. The common case of
 /// a single result uses the stack-allocated `Single` variant — zero heap
 /// allocation.
-///
-/// # Assumptions
-/// - `NDet` is lazy: results are produced on demand.
-/// - `NDet` can be empty (no results) for failed matches or unsatisfiable forms.
-/// - `Single(atom)` yields one atom then stops.
-/// - `Stream(iter)` delegates to the inner iterator.
 pub enum NDet {
-    /// A single result (common case — no heap allocation).
     Single(Option<Atom>),
-    /// Multiple or lazy results (heap-allocated iterator).
-    Stream(Box<dyn Iterator<Item = Atom>>),
+    Stream(Box<dyn Iterator<Item = Atom> + Send>),
 }
 impl NDet {
-    /// Create an `NDet` that yields exactly one atom (zero heap alloc).
-    pub fn single(atom: Atom) -> Self {
-        NDet::Single(Some(atom))
-    }
-    /// Create an `NDet` from an iterator of atoms.
-    pub fn stream(iter: impl Iterator<Item = Atom> + 'static) -> Self {
+    pub fn single(atom: Atom) -> Self { NDet::Single(Some(atom)) }
+    pub fn stream(iter: impl Iterator<Item = Atom> + Send + 'static) -> Self {
         NDet::Stream(Box::new(iter))
     }
 }
@@ -63,53 +49,55 @@ impl Iterator for NDet {
         }
     }
 }
+
 /// A single clause of a multi-clause (pattern-matching) user-defined function.
 #[derive(Clone, Debug)]
 pub struct Clause {
     pub patterns: Vec<Expr>,
     pub body: Expr,
 }
+
 #[derive(Clone)]
 pub enum FunctionKind {
     UserDefined {
         clauses: Vec<Clause>,
     },
     Native {
-        // REASON: Arc<dyn Fn> allows closures that capture context (e.g. loaded plugin fns).
-        func: Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + 'static>,
+        // REASON: Arc<dyn Fn + Send + Sync> allows closures captured at startup to be
+        // called safely from parallel worker threads.
+        func: Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static>,
     },
 }
+
 /// A named function in the table.
 #[derive(Clone)]
 pub struct Function {
     pub name: String,
     pub kind: FunctionKind,
+    pub pure: bool,
 }
 
-/// The function dispatch table — also owns the atom space + mutable state.
-/// Two-level map: name → (arity → Function).
-/// Outer lookup uses `HashMap::get(&str)` via Borrow<str> — zero allocation.
+/// Two-level function map: name → (arity → Function).
 type FuncMap = HashMap<String, HashMap<u8, Function>>;
 
 pub struct FnTable {
-    map: RefCell<FuncMap>,
-    /// Atom storage space for `add-atom`, `remove-atom`, `match`.
-    pub space: RefCell<Box<dyn Space>>,
+    /// Read-heavy: many concurrent lookups during eval, writes only at load time.
+    map: RwLock<FuncMap>,
+    /// Atom storage — wrapped in Mutex so Space impls don't need to be Sync.
+    pub space: Mutex<Box<dyn Space + Send>>,
     /// Mutable state store for `get-state`, `change-state!`, `bind!`.
-    pub state: RefCell<HashMap<String, Atom>>,
-    /// Directory of the file currently being loaded.
-    /// Updated before each file load and restored after — forms a stack
-    /// across nested imports so relative paths always resolve correctly.
-    pub import_dir: RefCell<PathBuf>,
+    pub state: Mutex<HashMap<String, Atom>>,
+    /// Directory of the file currently being loaded (load-time only).
+    pub import_dir: Mutex<PathBuf>,
 }
 
 impl Clone for FnTable {
     fn clone(&self) -> Self {
         FnTable {
-            map: RefCell::new(self.map.borrow().clone()),
-            space: RefCell::new(crate::space::LocalSpace::new_box()),
-            state: RefCell::new(HashMap::new()),
-            import_dir: RefCell::new(self.import_dir.borrow().clone()),
+            map: RwLock::new(self.map.read().unwrap().clone()),
+            space: Mutex::new(Box::new(crate::space::ShardedSpace::new_default())),
+            state: Mutex::new(HashMap::new()),
+            import_dir: Mutex::new(self.import_dir.lock().unwrap().clone()),
         }
     }
 }
@@ -117,27 +105,26 @@ impl Clone for FnTable {
 impl FnTable {
     pub fn new() -> Self {
         FnTable {
-            map: RefCell::new(HashMap::new()),
-            space: RefCell::new(crate::space::LocalSpace::new_box()),
-            state: RefCell::new(HashMap::new()),
-            import_dir: RefCell::new(PathBuf::from(".")),
+            map: RwLock::new(HashMap::new()),
+            space: Mutex::new(Box::new(crate::space::ShardedSpace::new_default())),
+            state: Mutex::new(HashMap::new()),
+            import_dir: Mutex::new(PathBuf::from(".")),
         }
     }
 
-    pub fn with_space(space: Box<dyn Space>) -> Self {
+    pub fn with_space(space: Box<dyn Space + Send>) -> Self {
         FnTable {
-            map: RefCell::new(HashMap::new()),
-            space: RefCell::new(space),
-            state: RefCell::new(HashMap::new()),
-            import_dir: RefCell::new(PathBuf::from(".")),
+            map: RwLock::new(HashMap::new()),
+            space: Mutex::new(space),
+            state: Mutex::new(HashMap::new()),
+            import_dir: Mutex::new(PathBuf::from(".")),
         }
     }
 
     pub fn add_clause(&self, name: String, patterns: Vec<Expr>, body: Expr) {
-        // SAFETY: no MeTTa function has >255 parameters in practice.
         let arity = patterns.len() as u8;
         let clause = Clause { patterns, body };
-        let mut map = self.map.borrow_mut();
+        let mut map = self.map.write().unwrap();
         let inner = map.entry(name.clone()).or_insert_with(HashMap::new);
         if let Some(func) = inner.get_mut(&arity) {
             if let FunctionKind::UserDefined { ref mut clauses } = func.kind {
@@ -148,16 +135,15 @@ impl FnTable {
         inner.insert(arity, Function {
             name,
             kind: FunctionKind::UserDefined { clauses: vec![clause] },
+            pure: false,
         });
     }
 
     /// Remove a specific clause from a user-defined function.
-    /// If no clauses remain after removal, the function entry is dropped entirely.
-    /// Returns true if a matching clause was found and removed.
+    /// Returns true if found and removed.
     pub fn remove_clause(&self, name: &str, patterns: &[Expr], body: &Expr) -> bool {
-        // SAFETY: patterns.len() < 256 in all MeTTa programs.
         let arity = patterns.len() as u8;
-        let mut map = self.map.borrow_mut();
+        let mut map = self.map.write().unwrap();
         let Some(inner) = map.get_mut(name) else { return false; };
         let Some(func) = inner.get_mut(&arity) else { return false; };
         if let FunctionKind::UserDefined { ref mut clauses } = func.kind {
@@ -172,36 +158,49 @@ impl FnTable {
         false
     }
 
-    pub fn insert_native<F>(
-        &self,
-        name: &str,
-        arity: u8,
-        func: F,
-    ) where
-        F: Fn(&[Atom], &FnTable) -> Result<NDet, String> + 'static,
+    pub fn insert_native<F>(&self, name: &str, arity: u8, func: F)
+    where
+        F: Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static,
     {
-        self.map.borrow_mut()
+        self.map.write().unwrap()
             .entry(name.to_string()).or_insert_with(HashMap::new)
             .insert(arity, Function {
                 name: name.to_string(),
                 kind: FunctionKind::Native { func: Arc::new(func) },
+                pure: false,
             });
     }
 
-    /// Returns a borrowed reference — zero String allocation, no Function clone.
-    /// Uses Borrow<str> on the outer map so `name` lookup needs no to_string().
-    pub fn get_ref(&self, name: &str, arity: u8) -> Option<Ref<'_, Function>> {
-        Ref::filter_map(self.map.borrow(), |m| {
-            m.get(name).and_then(|inner| inner.get(&arity))
-        }).ok()
+    /// Mark a registered function as pure (no side effects).
+    /// Pure functions can have arguments evaluated in parallel.
+    /// No-op if the function is not found (e.g. not yet loaded).
+    pub fn mark_pure(&self, name: &str, arity: u8) {
+        if let Some(func) = self.map.write().unwrap()
+            .get_mut(name).and_then(|inner| inner.get_mut(&arity))
+        {
+            func.pure = true;
+        }
     }
 
-    /// Check existence — zero allocation via Borrow<str>.
+    /// Check existence — zero allocation.
     pub fn has(&self, name: &str, arity: u8) -> bool {
-        self.map.borrow().get(name).map_or(false, |inner| inner.contains_key(&arity))
+        self.map.read().unwrap()
+            .get(name).map_or(false, |inner| inner.contains_key(&arity))
     }
 
+    /// Clone the Function out — cheap since UserDefined clones Vec<Clause> and
+    /// Native just bumps an Arc refcount.
     pub fn get(&self, name: &str, arity: u8) -> Option<Function> {
-        self.map.borrow().get(name).and_then(|inner| inner.get(&arity)).cloned()
+        self.map.read().unwrap()
+            .get(name).and_then(|inner| inner.get(&arity)).cloned()
+    }
+
+    /// Check if a named function is pure at the given arity.
+    /// Returns `false` if the function is not found (conservative).
+    pub fn is_pure(&self, name: &str, arity: u8) -> bool {
+        self.map.read().unwrap()
+            .get(name).and_then(|inner| inner.get(&arity))
+            .map(|f| f.pure)
+            .unwrap_or(false)
     }
 }

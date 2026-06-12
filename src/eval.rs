@@ -52,7 +52,6 @@
 /// - Truthiness: `Num(0)` and empty `Sym("")` are false; all else is true.
 /// - Function arguments are deterministic: only the first result of each
 ///   argument evaluation is used.
-use std::cell::Ref;
 use crate::atom::Atom;
 use crate::env::Env;
 use crate::func::{Clause, FnTable, Function, FunctionKind, NDet};
@@ -61,6 +60,18 @@ use crate::space::Pattern;
 use std::path::PathBuf;
 use std::sync::Arc;
 use crate::{trace, trace_enter, trace_exit};
+/// Top-level entry point: evaluate an expression.
+///
+/// Parallelism happens automatically inside the evaluator:
+/// - `par_iter` in `call_with_cloned` (func arg eval)
+/// - `par_iter` in `eval_data_list_par` (data list elt eval)
+/// - `par_iter` in `eval_case` (per-value clause bodies)
+/// - `par_iter` in `eval_match` (template bodies)
+/// All use Rayon's global thread pool. No outer scope is needed.
+pub fn eval_scope(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    eval(expr, env, funcs)
+}
+
 /// Evaluate an expression, returning a (possibly empty) stream of results.
 pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     trace_enter!("eval: {}", expr_to_atom(expr).to_sexpr_string());
@@ -148,15 +159,11 @@ fn try_call_or_data(
     env: &Env,
     funcs: &FnTable,
 ) -> Result<NDet, String> {
-    // Case 1: plain (non-$) symbol — single get_ref lookup decides call vs data.
-    // No double-lookup: the Ref from get_ref is passed directly into call_with_ref.
+    // Case 1: plain (non-$) symbol — single lookup decides call vs data.
     if let Expr::Symbol(s) = op {
         if !s.starts_with('$') {
-            // SAFETY: args.len() is the number of parsed function arguments —
-            // never exceeds practical limits (<10 in real usage). The cast to
-            // u8 is safe because no MeTTa function has >255 args.
-            return match funcs.get_ref(s, args.len() as u8) {
-                Some(func_ref) => call_with_ref(func_ref, s, args, env, funcs),
+            return match funcs.get(s, args.len() as u8) {
+                Some(func) => call_with_cloned(func, s, args, env, funcs),
                 None => {
                     trace!("→ unknown symbol '{}', treating as data list", s);
                     eval_data_list(all_items, env, funcs)
@@ -166,7 +173,6 @@ fn try_call_or_data(
     }
 
     // Case 2: $variable or expression (number/nested list).
-    // Evaluate the operator; if it's a known function name, call.
     let mut op_results = eval(op, env, funcs)?;
     let op_val = match op_results.next() {
         Some(a) => a,
@@ -174,9 +180,8 @@ fn try_call_or_data(
         None => return Ok(NDet::stream(std::iter::empty())),
     };
     if let Atom::Sym(fname) = &op_val {
-        // SAFETY: args.len() is small — see note above.
-        if let Some(func_ref) = funcs.get_ref(fname, args.len() as u8) {
-            return call_with_ref(func_ref, fname, args, env, funcs);
+        if let Some(func) = funcs.get(fname, args.len() as u8) {
+            return call_with_cloned(func, fname, args, env, funcs);
         }
     }
     // Case 3: closure application — operator evaluated to a Closure.
@@ -229,51 +234,72 @@ fn apply_closure(
     }
 }
 
-/// Dispatch a function call using a pre-retrieved reference — zero extra HashMap lookup.
+/// Dispatch a function call using an owned (cloned) Function value.
 ///
-/// Holding `func: Ref<'_, Function>` while evaluating args and body is safe:
-/// all concurrent borrows of `funcs.map` via `get_ref` are shared (immutable),
-/// and `borrow_mut` on `funcs.map` only occurs during initialization (add_clause /
-/// insert_native), never during eval.
-fn call_with_ref(
-    func: Ref<'_, Function>,
+/// The Function is cloned out of the map before any recursive eval — this
+/// ensures the RwLock read guard is released before we recurse, preventing
+/// deadlocks when body evaluation calls `add_clause` / `remove_clause`.
+fn call_with_cloned(
+    func: Function,
     op_name: &str,
     args: &[Expr],
     env: &Env,
     funcs: &FnTable,
 ) -> Result<NDet, String> {
-    // Clone necessary data out of the Ref BEFORE evaluating args/body, because
-    // body evaluation may trigger add_clause/remove_clause which borrow_mut() on
-    // funcs.map — would panic if the Ref still holds an immutable borrow.
     let name = func.name.clone();
     let is_native = matches!(&func.kind, FunctionKind::Native { .. });
+    let pure = func.pure;  // Save before drop
     let clauses: Vec<Clause> = match &func.kind {
         FunctionKind::UserDefined { clauses } => clauses.clone(),
         FunctionKind::Native { .. } => vec![],
     };
-    let native_func: Option<Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + 'static>> = match &func.kind {
+    let native_func: Option<Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static>> = match &func.kind {
         FunctionKind::Native { func: f } => Some(Arc::clone(f)),
         FunctionKind::UserDefined { .. } => None,
     };
-    drop(func); // Release the RefCell borrow before any recursive eval calls.
+    drop(func);
     trace_enter!("call: {} ({} args)", name, args.len());
     // Collect ALL results from each arg, don't truncate to first.
     // Nondeterminism threads through function calls: if an arg produces
     // multiple values (e.g. (g $z) → [2,3]), the function is called with
     // every combination (cartesian product).  This matches PeTTa semantics
     // where backtracking through args generates all solutions.
-    let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(args.len());
-    for (i, arg) in args.iter().enumerate() {
-        let mut results = eval(arg, env, funcs)?;
-        let vals: Vec<Atom> = results.collect();
-        if vals.is_empty() {
-            return Err(format!(
-                "{}: argument {} produced no results",
-                name, i + 1
-            ));
+    let arg_options: Vec<Vec<Atom>> = if pure && args.len() > 1 {
+        // Pure function: evaluate args in parallel
+        use rayon::prelude::*;
+        let results: Vec<Result<Vec<Atom>, String>> = args.par_iter()
+            .map(|arg| {
+                let mut results = eval(arg, env, funcs)?;
+                let vals: Vec<Atom> = results.by_ref().collect();
+                if vals.is_empty() {
+                    Err(format!("{}: argument produced no results", name))
+                } else {
+                    Ok(vals)
+                }
+            })
+            .collect();
+        // Unwrap results (first error propagates)
+        let mut arg_options = Vec::with_capacity(args.len());
+        for r in results {
+            arg_options.push(r?);
         }
-        arg_options.push(vals);
-    }
+        arg_options
+    } else {
+        // Impure or single arg: sequential
+        let mut arg_options = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let mut results = eval(arg, env, funcs)?;
+            let vals: Vec<Atom> = results.by_ref().collect();
+            if vals.is_empty() {
+                return Err(format!(
+                    "{}: argument {} produced no results",
+                    name, i + 1
+                ));
+            }
+            arg_options.push(vals);
+        }
+        arg_options
+    };
     // Compute cartesian product of arg values
     #[cfg(feature = "trace")]
     {
@@ -480,14 +506,7 @@ fn match_clauses<'c>(
 /// data — `Out = [HV|AVs]`. In our runtime each element IS evaluated
 /// (including nested function calls), then collected into one list atom.
 fn eval_data_list(items: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
-    let mut atoms = Vec::with_capacity(items.len());
-    for item in items {
-        match eval_data_item(item, env, funcs)? {
-            Some(a) => atoms.push(a),
-            None => return Ok(NDet::stream(std::iter::empty())),
-        }
-    }
-    Ok(NDet::single(Atom::Expr(atoms)))
+    eval_data_list_par(items, env, funcs)
 }
 
 /// Like `eval_data_list`, but the head element was already evaluated by the
@@ -500,15 +519,95 @@ fn eval_data_list_with_head(
     env: &Env,
     funcs: &FnTable,
 ) -> Result<NDet, String> {
-    let mut atoms = Vec::with_capacity(rest.len() + 1);
-    atoms.push(head);
-    for item in rest {
-        match eval_data_item(item, env, funcs)? {
-            Some(a) => atoms.push(a),
-            None => return Ok(NDet::stream(std::iter::empty())),
+    let all_pure = rest.iter().all(|item| is_pure_expr(item, funcs));
+    if all_pure && rest.len() > 1 {
+        use rayon::prelude::*;
+        let mut atoms = Vec::with_capacity(rest.len() + 1);
+        atoms.push(head);
+        let results: Vec<Result<Option<Atom>, String>> = rest.par_iter()
+            .map(|item| eval_data_item(item, env, funcs))
+            .collect();
+        for r in results {
+            match r? {
+                Some(a) => atoms.push(a),
+                None => return Ok(NDet::stream(std::iter::empty())),
+            }
+        }
+        Ok(NDet::single(Atom::Expr(atoms)))
+    } else {
+        let mut atoms = Vec::with_capacity(rest.len() + 1);
+        atoms.push(head);
+        for item in rest {
+            match eval_data_item(item, env, funcs)? {
+                Some(a) => atoms.push(a),
+                None => return Ok(NDet::stream(std::iter::empty())),
+            }
+        }
+        Ok(NDet::single(Atom::Expr(atoms)))
+    }
+}
+
+/// Recursively check if an expression is pure (no side effects).
+/// Pure expressions can be evaluated in parallel.
+fn is_pure_expr(expr: &Expr, funcs: &FnTable) -> bool {
+    match expr {
+        Expr::Number(_) => true,
+        Expr::Symbol(s) => {
+            // $var lookups are pure (read-only env access)
+            // Plain symbols are pure (self-evaluating)
+            true
+        }
+        Expr::List(items) if items.is_empty() => true,
+        Expr::List(items) => {
+            let op = &items[0];
+            if let Expr::Symbol(s) = op {
+                match s.as_str() {
+                    // Pure special forms
+                    "quote" | "collapse" | "superpose" | "empty" => true,
+                    // Impure special forms
+                    "if" | "progn" | "let" | "let*" | "eval" | "call" | "reduce"
+                    | "add-atom" | "remove-atom" | "match" | "import!" | "readln!"
+                    | "println!" | "chain" | "case" | "foldall" | "map-atom"
+                    | "|->" | "forall" | "within" | "py-call" | "import-rs!" => false,
+                    // User-defined or native function — check table
+                    _ => funcs.is_pure(s, (items.len() - 1) as u8),
+                }
+            } else {
+                // Dynamic operator (expression that evaluates to a function name)
+                false
+            }
         }
     }
-    Ok(NDet::single(Atom::Expr(atoms)))
+}
+
+/// Evaluate a data list in parallel when all elements are pure.
+/// Otherwise, evaluates sequentially (preserves side-effect ordering).
+fn eval_data_list_par(items: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    let all_pure = items.iter().all(|item| is_pure_expr(item, funcs));
+    if all_pure && items.len() > 1 {
+        use rayon::prelude::*;
+        let results: Vec<Result<Option<Atom>, String>> = items.par_iter()
+            .map(|item| eval_data_item(item, env, funcs))
+            .collect();
+        let mut atoms = Vec::with_capacity(items.len());
+        for r in results {
+            match r? {
+                Some(a) => atoms.push(a),
+                None => return Ok(NDet::stream(std::iter::empty())),
+            }
+        }
+        Ok(NDet::single(Atom::Expr(atoms)))
+    } else {
+        // Sequential path (preserves order + side-effect visibility)
+        let mut atoms = Vec::with_capacity(items.len());
+        for item in items {
+            match eval_data_item(item, env, funcs)? {
+                Some(a) => atoms.push(a),
+                None => return Ok(NDet::stream(std::iter::empty())),
+            }
+        }
+        Ok(NDet::single(Atom::Expr(atoms)))
+    }
 }
 
 /// Evaluate one element of a data list. Returns `None` if the expression produces
@@ -1077,7 +1176,7 @@ fn eval_add_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
     // (e.g. $N in (= (fib $N) ...)) stay as $-symbols. Matches PeTTa: add-atom
     // receives the Prolog term where unified variables already hold their values.
     let atom = subst_and_atomize(&args[1], env);
-    funcs.space.borrow_mut().add_atom(&atom).map_err(|e| format!("add-atom: {}", e))?;
+    funcs.space.lock().unwrap().add_atom(&atom).map_err(|e| format!("add-atom: {}", e))?;
     // If the atom is a function definition (= head body), register the function
     if let Atom::Expr(items) = &atom {
         if items.len() == 3 && items[0] == Atom::sym("=") {
@@ -1122,11 +1221,11 @@ fn eval_remove_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, S
     // then match the atom as a pattern and remove all exact matches found.
     let expr = subst_expr_vars(&args[1], env);
     let pattern = crate::space::Pattern::from_expr(&expr);
-    let matches = funcs.space.borrow().match_atoms(&pattern);
+    let matches = funcs.space.lock().unwrap().match_atoms(&pattern);
     let mut removed_any = false;
-    
+
     for m in matches {
-        if let Ok(removed) = funcs.space.borrow_mut().remove_atom(&m.atom) {
+        if let Ok(removed) = funcs.space.lock().unwrap().remove_atom(&m.atom) {
             if removed {
                 removed_any = true;
                 // Keep FnTable in sync: if removed atom was a function definition, drop its clause.
@@ -1194,11 +1293,8 @@ fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String>
         let substituted = subst_expr_vars(&args[1], env);
         Pattern::from_expr(&substituted)
     };
-    // Query the space
-    let matches = {
-        let space = funcs.space.borrow();
-        space.match_atoms(&pattern)
-    };
+    // Query the space — brief lock, collect all results, then release.
+    let matches = funcs.space.lock().unwrap().match_atoms(&pattern);
     if matches.is_empty() {
         return Ok(NDet::Single(None)); // empty stream — no match
     }
@@ -1217,18 +1313,24 @@ fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String>
     } else {
         args[2].clone()
     };
-    // Evaluate template for each match with variable bindings
-    let streams: Result<Vec<NDet>, String> = matches
-        .into_iter()
-        .map(|result| {
+    // Evaluate each match result's template in parallel.
+    // Space reads are done (lock released above); template eval may call add-atom
+    // which re-acquires the Mutex for individual writes — these serialize naturally.
+    use rayon::prelude::*;
+    let result_vecs: Vec<Vec<Atom>> = matches
+        .into_par_iter()
+        .map(|mr| {
             let mut match_env = env.clone();
-            for (name, val) in &result.bindings {
+            for (name, val) in &mr.bindings {
                 match_env = match_env.extend(name, val.clone());
             }
-            eval(&template, &match_env, funcs)
+            match eval(&template, &match_env, funcs) {
+                Ok(nd) => nd.collect(),
+                Err(_) => vec![],
+            }
         })
         .collect();
-    Ok(NDet::stream(streams?.into_iter().flatten()))
+    Ok(NDet::stream(result_vecs.into_iter().flatten()))
 }
 
 /// Evaluate `(import! space path)` — load a MeTTa file into the space.
@@ -1260,7 +1362,7 @@ fn eval_import(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String
         Expr::List(_)   => return Err("import!: file path must be a symbol, not a list".into()),
     };
     // Resolve path: CWD first, then relative to the importing file's directory.
-    let import_dir = funcs.import_dir.borrow().clone();
+    let import_dir = funcs.import_dir.lock().unwrap().clone();
     let resolved = resolve_import_path(&path_str, &import_dir)
         .ok_or_else(|| format!(
             "import!: cannot find '{}' (searched CWD and '{}')",
@@ -1270,9 +1372,9 @@ fn eval_import(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String
     let new_dir = resolved.parent()
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
-    let prev_dir = funcs.import_dir.replace(new_dir);
+    let prev_dir = std::mem::replace(&mut *funcs.import_dir.lock().unwrap(), new_dir);
     let result = load_metta_file(&resolved, env, funcs);
-    funcs.import_dir.replace(prev_dir);
+    *funcs.import_dir.lock().unwrap() = prev_dir;
     result?;
     Ok(NDet::single(Atom::sym("true")))
 }
@@ -1297,7 +1399,7 @@ fn eval_import_rs(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Str
     }
 
     // Build search directories: importing file's dir, libs/, then CWD
-    let import_dir = funcs.import_dir.borrow().clone();
+    let import_dir = funcs.import_dir.lock().unwrap().clone();
     let mut search_dirs: Vec<PathBuf> = Vec::new();
     if !import_dir.as_os_str().is_empty() {
         search_dirs.push(import_dir.clone());
@@ -1436,7 +1538,7 @@ fn process_top_form(form: TopForm, env: &Env, funcs: &FnTable) -> Result<Option<
     match form {
         TopForm::Definition(expr) => {
             let atom = expr_to_atom(&expr);
-            funcs.space.borrow_mut().add_atom(&atom)
+            funcs.space.lock().unwrap().add_atom(&atom)
                 .map_err(|e| format!("add_atom: {}", e))?;
             if let Ok((name, clause)) = crate::compile::compile_definition(&expr) {
                 funcs.add_clause(name, clause.patterns, clause.body);
@@ -1662,15 +1764,15 @@ fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<V
         )),
     };
     // SAFETY: arity = items.len() - 1; items is non-empty (guarded above), so arity < 256.
-    let func_ref = funcs.get_ref(&fname, arity as u8).ok_or_else(|| {
+    let func_ref = funcs.get(&fname, arity as u8).ok_or_else(|| {
         format!("generator: unknown function {} with {} args", fname, arity)
     })?;
-    let (clauses, native_func): (Vec<Clause>, Option<Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + 'static>>) = match &func_ref.kind {
+    let is_native = matches!(&func_ref.kind, FunctionKind::Native { .. });
+    let (clauses, native_func): (Vec<Clause>, Option<Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static>>) = match &func_ref.kind {
         FunctionKind::UserDefined { clauses } => (clauses.clone(), None),
         FunctionKind::Native { func: f } => (vec![], Some(Arc::clone(f))),
     };
-    let is_native = matches!(&func_ref.kind, FunctionKind::Native { .. });
-    drop(func_ref); // Release RefCell borrow before recursive eval calls.
+    drop(func_ref);
     if is_native {
         if let Some(f) = native_func {
             // For each arg, collect all possible values:
@@ -1907,6 +2009,33 @@ fn eval_chain(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String>
 ///
 /// # Errors
 /// Returns error if no clause matches the value.
+/// Try one (value, clauses) combination for case: find first matching clause
+/// and evaluate its body. Returns the body results or an error.
+fn try_case_value(val: &Atom, clauses: &[Expr], env: &Env, funcs: &FnTable) -> Result<Vec<Atom>, String> {
+    for clause in clauses {
+        let (pattern, body) = match clause {
+            Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
+            _ => return Err(format!(
+                "case: each clause must be (pattern body), got {}",
+                clause.to_string()
+            )),
+        };
+        if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
+            continue;
+        }
+        if matches!(pattern, Expr::Symbol(s) if s == "$else") {
+            return eval(body, env, funcs).map(|r| r.collect());
+        }
+        if let Some(match_env) = try_match_one(pattern, val, &Env::new(), funcs)? {
+            let new_env = prepend_env(match_env, env);
+            return eval(body, &new_env, funcs).map(|r| r.collect());
+        }
+    }
+    Err(format!(
+        "case: no clause matched value {}", val.to_sexpr_string()
+    ))
+}
+
 fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 2 {
         return Err(format!(
@@ -1938,41 +2067,18 @@ fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> 
         return Ok(NDet::stream(std::iter::empty()));
     }
 
-    // Fan out: for each scrutinee value, match clauses and collect results
+    // Parallel fan-out: for each scrutinee value, match clauses independently.
+    // The inner loop (per-value clause matching) stays sequential to preserve
+    // first-match-wins semantics. Different values are independent.
+    let results: Vec<Result<Vec<Atom>, String>> = if vals.len() > 1 {
+        use rayon::prelude::*;
+        vals.par_iter().map(|val| try_case_value(val, clauses, env, funcs)).collect()
+    } else {
+        vals.iter().map(|val| try_case_value(val, clauses, env, funcs)).collect()
+    };
     let mut out: Vec<Atom> = Vec::new();
-    for val in vals {
-        let mut matched = false;
-        for clause in clauses {
-            let (pattern, body) = match clause {
-                Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
-                _ => return Err(format!(
-                    "case: each clause must be (pattern body), got {}",
-                    clause.to_string()
-                )),
-            };
-
-            if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
-                continue;
-            }
-
-            if matches!(pattern, Expr::Symbol(s) if s == "$else") {
-                out.extend(eval(body, env, funcs)?);
-                matched = true;
-                break;
-            }
-
-            if let Some(match_env) = try_match_one(pattern, &val, &Env::new(), funcs)? {
-                let new_env = prepend_env(match_env, env);
-                out.extend(eval(body, &new_env, funcs)?);
-                matched = true;
-                break;
-            }
-        }
-        if !matched {
-            return Err(format!(
-                "case: no clause matched value {}", val.to_sexpr_string()
-            ));
-        }
+    for r in results {
+        out.extend(r?);
     }
     Ok(NDet::stream(out.into_iter()))
 }

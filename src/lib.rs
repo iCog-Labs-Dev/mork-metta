@@ -27,7 +27,7 @@ pub mod plugin;
 use crate::atom::Atom;
 use crate::compile::compile_definition;
 use crate::env::Env;
-use crate::eval::eval;
+use crate::eval::{eval, eval_scope};
 use crate::func::FnTable;
 use crate::func::Clause;
 use crate::builtins::register_builtins;
@@ -62,27 +62,27 @@ impl Runtime {
             Pattern::Any,
             Pattern::Any,
         ]);
-        // Snapshot matches while holding space borrow
+        // Snapshot matches while holding space lock
         let matches: Vec<_> = {
-            let space = self.funcs.space.borrow();
+            let space = self.funcs.space.lock().unwrap();
             space.match_atoms(&pat)
         };
         // Snapshot state
         let state: std::collections::HashMap<String, Atom> = {
-            let s = self.funcs.state.borrow();
+            let s = self.funcs.state.lock().unwrap();
             s.clone()
         };
         // Move space out of current table
         let old_space = std::mem::replace(
-            &mut *self.funcs.space.borrow_mut(),
+            &mut *self.funcs.space.lock().unwrap(),
             crate::space::LocalSpace::new_box(),
         );
         // Fresh table
         let new_table = FnTable::new();
         register_builtins(&new_table);
         // Move space and state into new table
-        let _ = std::mem::replace(&mut *new_table.space.borrow_mut(), old_space);
-        let _ = std::mem::replace(&mut *new_table.state.borrow_mut(), state);
+        let _ = std::mem::replace(&mut *new_table.space.lock().unwrap(), old_space);
+        let _ = std::mem::replace(&mut *new_table.state.lock().unwrap(), state);
         // Re-register user-defined functions
         for result in matches {
             if let Ok(expr) = parser::atom_to_expr(&result.atom) {
@@ -112,7 +112,7 @@ impl Runtime {
                 // Store the atom in the space unconditionally — plain data atoms
                 // like `(kb 1)` are valid top-level forms that go into &self.
                 let atom = expr_to_atom(&expr);
-                self.funcs.space.borrow_mut().add_atom(&atom)?;
+                self.funcs.space.lock().unwrap().add_atom(&atom)?;
                 // Only compile as a function if it's a (= head body) form.
                 if let Ok((name, clause)) = compile_definition(&expr) {
                     self.funcs.add_clause(name, clause.patterns, clause.body);
@@ -121,7 +121,7 @@ impl Runtime {
             }
             TopForm::Runnable(expr) => {
                 let env = Env::new();
-                let mut results = eval(&expr, &env, &self.funcs)?;
+                let mut results = eval_scope(&expr, &env, &self.funcs)?;
                 Ok(results.next())
             }
         }
@@ -146,7 +146,7 @@ impl Runtime {
     pub fn load_file(&mut self, path: &str) -> Result<Vec<crate::atom::Atom>, String> {
         let path = std::path::Path::new(path);
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
-        *self.funcs.import_dir.borrow_mut() = dir.to_path_buf();
+        *self.funcs.import_dir.lock().unwrap() = dir.to_path_buf();
         let env = crate::env::Env::new();
         crate::eval::load_metta_file(path, &env, &self.funcs)
     }

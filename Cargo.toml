@@ -13,3 +13,4 @@ plugins = ["dep:libloading"]
 mork = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true, features = ["auto-initialize"] }
 libloading = { version = "0.8", optional = true }
+rayon = "1"
