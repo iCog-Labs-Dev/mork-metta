@@ -63,7 +63,7 @@ impl Expr {
 /// - The conversion is lossless: `atom_to_expr(expr_to_atom(e)) == Ok(e)`.
 pub fn expr_to_atom(expr: &Expr) -> Atom {
     match expr {
-        Expr::Symbol(s) => Atom::Sym(s.clone()),
+        Expr::Symbol(s) => Atom::sym(s),
         Expr::Number(n) => Atom::Num(*n),
         Expr::List(items) => Atom::Expr(items.iter().map(expr_to_atom).collect()),
     }
@@ -83,7 +83,7 @@ pub fn expr_to_atom(expr: &Expr) -> Atom {
 /// - The conversion is lossless: `expr_to_atom(&atom_to_expr(a)?) == a`.
 pub fn atom_to_expr(atom: &Atom) -> Result<Expr, String> {
     match atom {
-        Atom::Sym(s) => Ok(Expr::Symbol(s.clone())),
+        Atom::Sym(s) => Ok(Expr::Symbol(s.to_string())),
         Atom::Num(n) => Ok(Expr::Number(*n)),
         Atom::Expr(items) => {
             let mut exprs = Vec::with_capacity(items.len());
