@@ -134,19 +134,39 @@ fn try_call_or_data(
     env: &Env,
     funcs: &FnTable,
 ) -> Result<NDet, String> {
+    // Helper: if a head atom is a lambda closure, apply it.
+    let try_apply_lambda = |head: &Atom, env: &Env, args: &[Expr]| -> Option<Result<NDet, String>> {
+        if let Atom::Closure(data) = head {
+            return Some(apply_closure(
+                &data.params, &data.body, &data.env, args, env, funcs,
+            ));
+        }
+        None
+    };
+
     match op {
         Expr::Symbol(s) if s.starts_with('$') => {
             let op_val = env.get(s).unwrap_or_else(|| Atom::sym(s));
-            if let Atom::Sym(func_name) = &op_val {
-                trace!("→ $var op '{}' = '{}'", s, func_name);
-                return match funcs.get(func_name, args.len() as u8) {
-                    Some(func) => call_with_cloned(func, func_name, args, env, funcs),
-                    None => {
-                        trace!("→ unknown symbol '{}', treating as data list", s);
-                        eval_data_list(all_items, env, funcs)
+            match &op_val {
+                Atom::Sym(func_name) => {
+                    trace!("→ $var op '{}' = '{}'", s, func_name);
+                    return match funcs.get(func_name, args.len() as u8) {
+                        Some(func) => call_with_cloned(func, func_name, args, env, funcs),
+                        None => {
+                            trace!("→ unknown symbol '{}', treating as data list", s);
+                            eval_data_list(all_items, env, funcs)
+                        }
+                    };
+                }
+                _ => {
+                    // Variable resolved to a non-symbol value (e.g. a lambda closure).
+                    // Try to apply as a lambda first.
+                    if let Some(result) = try_apply_lambda(&op_val, env, args) {
+                        return result;
                     }
-                };
+                }
             }
+            // Fall back: re-evaluate the operator and treat the whole thing as data.
             let head = eval(op, env, funcs)?.next();
             match head {
                 Some(h) => eval_data_list_with_head(h, args, env, funcs),
@@ -166,6 +186,8 @@ fn try_call_or_data(
             eval_data_list(all_items, env, funcs)
         }
         _ => {
+            // Operator is a compound expression (e.g. a lambda literal or something
+            // that evaluates to a function). Evaluate it, then dispatch.
             let op_val = eval(op, env, funcs)?.next();
             match op_val {
                 Some(Atom::Sym(func_name)) => {
@@ -177,7 +199,13 @@ fn try_call_or_data(
                         }
                     }
                 }
-                Some(head) => eval_data_list_with_head(head, args, env, funcs),
+                Some(head) => {
+                    // Check if it's a lambda closure — apply it directly.
+                    if let Some(result) = try_apply_lambda(&head, env, args) {
+                        return result;
+                    }
+                    eval_data_list_with_head(head, args, env, funcs)
+                }
                 None => eval_data_list(all_items, env, funcs),
             }
         }
