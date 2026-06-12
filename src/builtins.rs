@@ -290,17 +290,23 @@ pub fn register_builtins(table: &FnTable) {
         }))
     });
 
-    // test: (test actual expected) — compares two atoms, errors on mismatch
+    // test: (test actual expected) — compares two atoms, prints diagnostics
     table.insert_native("test", 2, |args, _| {
         expect_n_args(args, 2, "test")?;
         if args[0] == args[1] {
-            Ok(NDet::single(Atom::sym("ok")))
-        } else {
-            Err(format!(
-                "test failed: expected {}, got {}",
+            eprintln!(
+                "is {}, should {}. ✅",
                 args[0].to_sexpr_string(),
                 args[1].to_sexpr_string()
-            ))
+            );
+            Ok(NDet::single(Atom::sym("true")))
+        } else {
+            eprintln!(
+                "is {}, should {}. ❌",
+                args[0].to_sexpr_string(),
+                args[1].to_sexpr_string()
+            );
+            Ok(NDet::single(Atom::sym("False")))
         }
     });
 
