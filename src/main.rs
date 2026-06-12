@@ -36,10 +36,11 @@ fn main() {
     };
 
     match rt.load_file(&path) {
-        Ok(Some(result)) => {
-            println!("{}", result.to_sexpr_string());
+        Ok(results) => {
+            for result in results {
+                println!("{}", result.to_sexpr_string());
+            }
         }
-        Ok(None) => {}
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
