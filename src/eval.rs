@@ -170,9 +170,8 @@ fn try_call_or_data(
     let mut op_results = eval(op, env, funcs)?;
     let op_val = match op_results.next() {
         Some(a) => a,
-        // Head produced no results — same error the data-list path would hit,
-        // but without re-running the head's side effects.
-        None => return Err("expression produced no results in data list".into()),
+        // Head produced no results — propagate emptiness (MeTTa nondeterminism).
+        None => return Ok(NDet::stream(std::iter::empty())),
     };
     if let Atom::Sym(fname) = &op_val {
         // SAFETY: args.len() is small — see note above.
@@ -483,7 +482,10 @@ fn match_clauses<'c>(
 fn eval_data_list(items: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     let mut atoms = Vec::with_capacity(items.len());
     for item in items {
-        atoms.push(eval_data_item(item, env, funcs)?);
+        match eval_data_item(item, env, funcs)? {
+            Some(a) => atoms.push(a),
+            None => return Ok(NDet::stream(std::iter::empty())),
+        }
     }
     Ok(NDet::single(Atom::Expr(atoms)))
 }
@@ -501,32 +503,31 @@ fn eval_data_list_with_head(
     let mut atoms = Vec::with_capacity(rest.len() + 1);
     atoms.push(head);
     for item in rest {
-        atoms.push(eval_data_item(item, env, funcs)?);
+        match eval_data_item(item, env, funcs)? {
+            Some(a) => atoms.push(a),
+            None => return Ok(NDet::stream(std::iter::empty())),
+        }
     }
     Ok(NDet::single(Atom::Expr(atoms)))
 }
 
-/// Evaluate one element of a data list to an Atom (first result).
-fn eval_data_item(item: &Expr, env: &Env, funcs: &FnTable) -> Result<Atom, String> {
+/// Evaluate one element of a data list. Returns `None` if the expression produces
+/// no results (empty NDet), which callers propagate as empty.
+fn eval_data_item(item: &Expr, env: &Env, funcs: &FnTable) -> Result<Option<Atom>, String> {
     match item {
-        Expr::Number(n) => Ok(Atom::Num(*n)),
+        Expr::Number(n) => Ok(Some(Atom::Num(*n))),
         Expr::Symbol(s) => {
             if s.starts_with('$') {
-                // PeTTa: unbound $vars in a data list stay as Prolog variables
-                // (structural holes). Pattern matching in let/try_match_one
-                // then binds them via computation-in-pattern or direct unification.
-                Ok(env.get(s).unwrap_or_else(|| Atom::sym(s)))
+                Ok(Some(env.get(s).unwrap_or_else(|| Atom::sym(s))))
             } else {
-                Ok(Atom::sym(s))
+                Ok(Some(Atom::sym(s)))
             }
         }
         Expr::List(inner) => {
             if inner.is_empty() {
-                Ok(Atom::Expr(vec![]))
+                Ok(Some(Atom::Expr(vec![])))
             } else {
-                eval(item, env, funcs)?
-                    .next()
-                    .ok_or_else(|| "expression produced no results in data list".into())
+                Ok(eval(item, env, funcs)?.next())
             }
         }
     }
