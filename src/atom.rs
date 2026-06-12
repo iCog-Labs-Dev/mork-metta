@@ -53,6 +53,7 @@ impl PartialEq for Atom {
         }
     }
 }
+impl Eq for Atom {}
 
 impl std::hash::Hash for Atom {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {

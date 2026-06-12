@@ -32,6 +32,21 @@ pub enum Pattern {
 }
 
 impl Pattern {
+    /// If this pattern is fully ground (no Var or Any nodes), recover the
+    /// concrete `Atom` it represents. Used for fast-path exact lookups.
+    pub fn as_ground_atom(&self) -> Option<Atom> {
+        match self {
+            Pattern::Any | Pattern::Var(_) => None,
+            Pattern::Exact(a) => Some(a.clone()),
+            Pattern::Expr(pats) => {
+                pats.iter()
+                    .map(|p| p.as_ground_atom())
+                    .collect::<Option<Vec<_>>>()
+                    .map(Atom::Expr)
+            }
+        }
+    }
+
     /// Construct a pattern from a parsed Expr tree.
     /// `$`-prefixed symbols become `Var(name)`; others become `Exact`.
     pub fn from_expr(expr: &Expr) -> Self {
@@ -125,6 +140,10 @@ fn pattern_index_key(pattern: &Pattern) -> Option<(String, usize)> {
 pub struct LocalSpace {
     indexed: HashMap<(String, usize), Vec<Atom>>,
     scalars: Vec<Atom>,
+    /// O(1) existence check for exact atom membership. Kept in sync with
+    /// the indexed and scalar stores so `match_atoms` on a ground pattern
+    /// can avoid a full bucket scan.
+    has: std::collections::HashSet<Atom>,
 }
 
 impl LocalSpace {
@@ -134,6 +153,7 @@ impl LocalSpace {
 
 impl Space for LocalSpace {
     fn add_atom(&mut self, atom: &Atom) -> Result<(), String> {
+        self.has.insert(atom.clone());
         if let Some(key) = index_key(atom) {
             self.indexed.entry(key).or_default().push(atom.clone());
         } else {
@@ -143,6 +163,7 @@ impl Space for LocalSpace {
     }
 
     fn remove_atom(&mut self, atom: &Atom) -> Result<bool, String> {
+        self.has.remove(atom);
         if let Some(key) = index_key(atom) {
             if let Some(vec) = self.indexed.get_mut(&key) {
                 let before = vec.len();
@@ -159,8 +180,16 @@ impl Space for LocalSpace {
     }
 
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
+        // Fast path: fully ground pattern — O(1) hash lookup.
+        if let Some(atom) = pattern.as_ground_atom() {
+            return if self.has.contains(&atom) {
+                vec![MatchResult { atom, bindings: vec![] }]
+            } else {
+                vec![]
+            };
+        }
+        // Indexed path: resolve functor+arity bucket and scan only that bucket.
         if let Some(key) = pattern_index_key(pattern) {
-            // Hot path: only unify against atoms in the matching bucket.
             return self.indexed.get(&key)
                 .map(|atoms| atoms.iter().filter_map(|a| match_one(pattern, a)).collect())
                 .unwrap_or_default();
@@ -300,6 +329,10 @@ pub struct MorkSpace {
     /// Mirrors `inner` in Rust form — serves all read operations without going
     /// through the serialization round-trip.
     shadow: LocalSpace,
+    /// Reusable scratch for encoding atoms into trie paths. Avoids the kernel
+    /// bulk-load path (`add_all_sexpr`), which allocates a 4GiB scratch Vec
+    /// and runs a multi-expression parse loop for every single atom.
+    encode_buf: Vec<u8>,
 }
 
 #[cfg(feature = "mork")]
@@ -308,23 +341,40 @@ impl MorkSpace {
         MorkSpace {
             inner: mork::space::Space::new(),
             shadow: LocalSpace::new(),
+            encode_buf: vec![0u8; 1 << 16],
         }
+    }
+
+    /// Encode one atom into the trie's byte format using the reusable buffer.
+    /// Returns the encoded length.
+    fn encode_atom(&mut self, atom: &Atom) -> Result<usize, String> {
+        let sexpr = atom.to_sexpr_string();
+        // Worst case: every byte of text becomes an 8-byte interned symbol + tag.
+        let cap = sexpr.len() * 8 + 64;
+        if cap > self.encode_buf.len() {
+            self.encode_buf.resize(cap, 0);
+        }
+        let (_expr, len) = self
+            .inner
+            .parse_sexpr(sexpr.as_bytes(), self.encode_buf.as_mut_ptr())
+            .map_err(|e| format!("mork parse: {:?}", e))?;
+        Ok(len)
     }
 }
 
 #[cfg(feature = "mork")]
 impl Space for MorkSpace {
     fn add_atom(&mut self, atom: &Atom) -> Result<(), String> {
-        let sexpr = atom.to_sexpr_string();
-        self.inner.add_all_sexpr(sexpr.as_bytes())?;
+        let len = self.encode_atom(atom)?;
+        self.inner.btm.insert(&self.encode_buf[..len], Default::default());
         self.shadow.add_atom(atom)
     }
 
     fn remove_atom(&mut self, atom: &Atom) -> Result<bool, String> {
-        let sexpr = atom.to_sexpr_string();
-        let count = self.inner.remove_all_sexpr(sexpr.as_bytes())?;
+        let len = self.encode_atom(atom)?;
+        let removed = self.inner.btm.remove(&self.encode_buf[..len]).is_some();
         self.shadow.remove_atom(atom)?;
-        Ok(count > 0)
+        Ok(removed)
     }
 
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
