@@ -35,8 +35,8 @@ pub(crate) fn eval_data_list_with_head(
     env: &Env,
     funcs: &FnTable,
 ) -> Result<NDet, String> {
-    let all_pure = rest.iter().all(|item| is_pure_expr(item, funcs));
-    if all_pure && rest.len() > 1 {
+    let all_pure = worth_parallel(rest) && rest.iter().all(|item| is_pure_expr(item, funcs));
+    if all_pure {
         use rayon::prelude::*;
         let mut atoms = Vec::with_capacity(rest.len() + 1);
         atoms.push(head);
@@ -63,30 +63,87 @@ pub(crate) fn eval_data_list_with_head(
     }
 }
 
+/// Count of currently-active parallel fork regions. Used as a saturation
+/// gate: once enough concurrent forks exist to feed every worker, deeper
+/// recursion levels evaluate sequentially. Without this, recursive functions
+/// fork at EVERY level — exponentially many micro-tasks whose scheduling
+/// overhead dwarfs the work (observed: 10x CPU burn for 4x wall-clock).
+static ACTIVE_FORKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII guard for a parallel fork region.
+pub(crate) struct ForkGuard;
+impl Drop for ForkGuard {
+    fn drop(&mut self) {
+        ACTIVE_FORKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Try to claim a fork slot. Returns a guard while the pool is unsaturated,
+/// `None` once active forks ≥ worker count (callers then go sequential).
+pub(crate) fn try_fork() -> Option<ForkGuard> {
+    let limit = rayon::current_num_threads();
+    let prev = ACTIVE_FORKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if prev < limit {
+        Some(ForkGuard)
+    } else {
+        ACTIVE_FORKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        None
+    }
+}
+
+/// Heuristic: is parallel evaluation of these expressions worth the rayon
+/// task overhead? Only when at least two of them are compound (non-empty
+/// lists). Symbols and numbers evaluate in nanoseconds — forking for them
+/// creates a micro-task storm that costs far more than it saves.
+pub(crate) fn worth_parallel(items: &[Expr]) -> bool {
+    items.iter()
+        .filter(|e| matches!(e, Expr::List(l) if !l.is_empty()))
+        .count() >= 2
+}
+
 /// Recursively check if an expression is pure (no side effects).
 /// Pure expressions can be evaluated in parallel.
 pub(crate) fn is_pure_expr(expr: &Expr, funcs: &FnTable) -> bool {
+    is_pure_expr_inner(expr, funcs, None)
+}
+
+/// Purity check used at definition time: occurrences of `self_name` in call
+/// position are optimistically assumed pure, so directly-recursive functions
+/// (e.g. fib) can be inferred pure from an otherwise-pure body.
+pub(crate) fn is_pure_expr_assuming(expr: &Expr, funcs: &FnTable, self_name: &str) -> bool {
+    is_pure_expr_inner(expr, funcs, Some(self_name))
+}
+
+fn is_pure_expr_inner(expr: &Expr, funcs: &FnTable, assume_pure: Option<&str>) -> bool {
     match expr {
         Expr::Number(_) => true,
-        Expr::Symbol(s) => {
-            // $var lookups are pure (read-only env access)
-            // Plain symbols are pure (self-evaluating)
-            true
-        }
+        // $var lookups are pure (read-only env access);
+        // plain symbols are pure (self-evaluating)
+        Expr::Symbol(_) => true,
         Expr::List(items) if items.is_empty() => true,
         Expr::List(items) => {
             let op = &items[0];
+            let args_pure =
+                || items[1..].iter().all(|e| is_pure_expr_inner(e, funcs, assume_pure));
             if let Expr::Symbol(s) = op {
                 match s.as_str() {
-                    // Pure special forms
-                    "quote" | "collapse" | "superpose" | "empty" | "repr" => true,
-                    // Impure special forms
-                    "if" | "progn" | "let" | "let*" | "eval" | "call" | "reduce"
+                    // Pure regardless of args (args not evaluated / no effects)
+                    "quote" | "superpose" | "empty" | "repr" | "|->" => true,
+                    // Control forms: pure iff every subexpression is pure
+                    "if" | "progn" | "let" | "let*" | "chain" | "collapse" => args_pure(),
+                    // Effectful or opaque special forms
+                    "eval" | "call" | "reduce"
                     | "add-atom" | "remove-atom" | "match" | "import!" | "readln!"
-                    | "println!" | "chain" | "case" | "foldall" | "map-atom"
-                    | "|->" | "forall" | "within" | "py-call" | "import-rs!" => false,
-                    // User-defined or native function — check table
-                    _ => funcs.is_pure(s, (items.len() - 1) as u8),
+                    | "println!" | "case" | "foldall" | "map-atom"
+                    | "forall" | "within" | "py-call" | "import-rs!" => false,
+                    // Function call: callee must be pure (or the function being
+                    // defined, assumed pure) AND every argument must be pure —
+                    // a pure callee does not launder impure args.
+                    _ => {
+                        let callee_pure = assume_pure == Some(s.as_str())
+                            || funcs.is_pure(s, (items.len() - 1) as u8);
+                        callee_pure && args_pure()
+                    }
                 }
             } else {
                 // Dynamic operator (expression that evaluates to a function name)
@@ -99,8 +156,8 @@ pub(crate) fn is_pure_expr(expr: &Expr, funcs: &FnTable) -> bool {
 /// Evaluate a data list in parallel when all elements are pure.
 /// Otherwise, evaluates sequentially (preserves side-effect ordering).
 pub(crate) fn eval_data_list_par(items: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
-    let all_pure = items.iter().all(|item| is_pure_expr(item, funcs));
-    if all_pure && items.len() > 1 {
+    let all_pure = worth_parallel(items) && items.iter().all(|item| is_pure_expr(item, funcs));
+    if all_pure {
         use rayon::prelude::*;
         let results: Vec<Result<Option<Atom>, String>> = items.par_iter()
             .map(|item| eval_data_item(item, env, funcs))

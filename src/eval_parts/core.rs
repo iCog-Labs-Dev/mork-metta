@@ -36,8 +36,8 @@ use crate::eval_parts::python::eval_py_call;
 use crate::eval_parts::space_ops::{eval_add_atom, eval_match, eval_remove_atom};
 use crate::eval_parts::special::{
     eval_call, eval_case, eval_chain, eval_collapse, eval_foldall, eval_forall,
-    eval_if, eval_lambda, eval_let, eval_let_star, eval_map_atom, eval_progn,
-    eval_quote, eval_repr, eval_superpose, eval_within, eval_eval,
+    eval_if, eval_implication, eval_lambda, eval_let, eval_let_star, eval_map_atom,
+    eval_progn, eval_query, eval_quote, eval_repr, eval_superpose, eval_within, eval_eval,
 };
 use crate::func::{FnTable, Function, FunctionKind, NDet};
 use crate::parser::Expr;
@@ -109,6 +109,8 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     "empty" => { trace!("→ special: empty"); return Ok(NDet::stream(std::iter::empty())); }
                     "py-call" => { trace!("→ special: py-call"); return eval_py_call(args, env, funcs); }
                     "import-rs!" => { trace!("→ special: import-rs!"); return eval_import_rs(args, env, funcs); }
+                    "=>" => { trace!("→ special: =>"); return eval_implication(args, env, funcs); }
+                    "?" => { trace!("→ special: ?"); return eval_query(args, env, funcs); }
                     _ => {}
                 }
             }

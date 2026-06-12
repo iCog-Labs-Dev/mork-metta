@@ -35,7 +35,7 @@ use crate::eval_parts::{eval, eval_scope};
 use crate::func::FnTable;
 use crate::func::Clause;
 use crate::builtins::register_builtins;
-use crate::parser::{expr_to_atom, parse_forms, TopForm};
+use crate::parser::{expr_to_atom, parse_forms, Expr, TopForm};
 use crate::space::{Pattern, Space};
 
 /// The MeTTa runtime: owns the function table (which owns the atom space).
@@ -119,6 +119,13 @@ impl Runtime {
                 self.funcs.space.lock().unwrap().add_atom(&atom)?;
                 // Only compile as a function if it's a (= head body) form.
                 if let Ok((name, clause)) = compile_definition(&expr) {
+                    // Also store the BARE HEAD atom so `match` can find premise atoms
+                    if let Expr::List(items) = &expr {
+                        if items.len() == 3 {
+                            let head_atom = crate::parser::expr_to_atom(&items[1]);
+                            self.funcs.space.lock().unwrap().add_atom(&head_atom)?;
+                        }
+                    }
                     self.funcs.add_clause(name, clause.patterns, clause.body);
                 }
                 Ok(None)

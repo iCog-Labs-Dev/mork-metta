@@ -43,6 +43,8 @@ pub(crate) fn eval_add_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
     // If the atom is a function definition (= head body), register the function
     if let Atom::Expr(items) = &atom {
         if items.len() == 3 && items[0] == Atom::sym("=") {
+            // Also store the BARE HEAD atom so `match` can find premise atoms
+            funcs.space.lock().unwrap().add_atom(&items[1])?;
             if let (Ok(head_expr), Ok(body_expr)) = (
                 crate::parser::atom_to_expr(&items[1]),
                 crate::parser::atom_to_expr(&items[2]),
@@ -79,29 +81,37 @@ pub(crate) fn eval_remove_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Res
     // then match the atom as a pattern and remove all exact matches found.
     let expr = crate::eval_parts::special::subst_expr_vars(&args[1], env);
     let pattern = crate::space::Pattern::from_expr(&expr);
-    let matches = funcs.space.lock().unwrap().match_atoms(&pattern);
     let mut removed_any = false;
-
-    for m in matches {
-        if let Ok(removed) = funcs.space.lock().unwrap().remove_atom(&m.atom) {
-            if removed {
+    // Hold the lock across snapshot + removal so a concurrent template can't
+    // mutate the space between matching an atom and removing it (TOCTOU).
+    let removed_atoms: Vec<Atom> = {
+        let mut space = funcs.space.lock().unwrap();
+        let matches = space.match_atoms(&pattern);
+        let mut removed = Vec::new();
+        for m in matches {
+            if let Ok(true) = space.remove_atom(&m.atom) {
                 removed_any = true;
-                // Keep FnTable in sync: if removed atom was a function definition, drop its clause.
-                if let Atom::Expr(items) = &m.atom {
-                    if items.len() == 3 && items[0] == Atom::sym("=") {
-                        if let (Ok(head_expr), Ok(body_expr)) = (
-                            crate::parser::atom_to_expr(&items[1]),
-                            crate::parser::atom_to_expr(&items[2]),
-                        ) {
-                            let def_expr = Expr::List(vec![
-                                Expr::Symbol("=".to_string()),
-                                head_expr,
-                                body_expr,
-                            ]);
-                            if let Ok((name, clause)) = crate::compile::compile_definition(&def_expr) {
-                                funcs.remove_clause(&name, &clause.patterns, &clause.body);
-                            }
-                        }
+                removed.push(m.atom);
+            }
+        }
+        removed
+    };
+    // Keep FnTable in sync outside the space lock: if a removed atom was a
+    // function definition, drop its clause.
+    for atom in &removed_atoms {
+        if let Atom::Expr(items) = atom {
+            if items.len() == 3 && items[0] == Atom::sym("=") {
+                if let (Ok(head_expr), Ok(body_expr)) = (
+                    crate::parser::atom_to_expr(&items[1]),
+                    crate::parser::atom_to_expr(&items[2]),
+                ) {
+                    let def_expr = Expr::List(vec![
+                        Expr::Symbol("=".to_string()),
+                        head_expr,
+                        body_expr,
+                    ]);
+                    if let Ok((name, clause)) = crate::compile::compile_definition(&def_expr) {
+                        funcs.remove_clause(&name, &clause.patterns, &clause.body);
                     }
                 }
             }
@@ -171,22 +181,28 @@ pub(crate) fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
     } else {
         args[2].clone()
     };
-    // Evaluate each match result's template in parallel.
-    // Space reads are done (lock released above); template eval may call add-atom
-    // which re-acquires the Mutex for individual writes — these serialize naturally.
-    use rayon::prelude::*;
-    let result_vecs: Vec<Vec<Atom>> = matches
-        .into_par_iter()
-        .map(|mr| {
-            let mut match_env = env.clone();
-            for (name, val) in &mr.bindings {
-                match_env = match_env.extend(name, val.clone());
-            }
-            match eval(&template, &match_env, funcs) {
-                Ok(nd) => nd.collect(),
-                Err(_) => vec![],
-            }
-        })
-        .collect();
+    // Evaluate the template once per match. Parallel only when the template is
+    // pure — impure templates (add-atom/remove-atom/nested match/IO) must run
+    // sequentially in match order, otherwise side effects interleave between
+    // workers and per-op Mutex atomicity does not protect the sequences.
+    let eval_one = |mr: &crate::space::MatchResult| -> Result<Vec<Atom>, String> {
+        let mut match_env = env.clone();
+        for (name, val) in &mr.bindings {
+            match_env = match_env.extend(name, val.clone());
+        }
+        eval(&template, &match_env, funcs).map(|nd| nd.collect())
+    };
+    let results: Vec<Result<Vec<Atom>, String>> =
+        if matches.len() > 1 && crate::eval_parts::data_list::is_pure_expr(&template, funcs) {
+            use rayon::prelude::*;
+            matches.par_iter().map(eval_one).collect()
+        } else {
+            matches.iter().map(eval_one).collect()
+        };
+    // Propagate the first error instead of silently dropping failed branches.
+    let mut result_vecs = Vec::with_capacity(results.len());
+    for r in results {
+        result_vecs.push(r?);
+    }
     Ok(NDet::stream(result_vecs.into_iter().flatten()))
 }

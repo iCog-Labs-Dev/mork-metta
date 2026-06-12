@@ -235,6 +235,13 @@ pub(crate) fn process_top_form(form: TopForm, env: &Env, funcs: &FnTable) -> Res
             funcs.space.lock().unwrap().add_atom(&atom)
                 .map_err(|e| format!("add_atom: {}", e))?;
             if let Ok((name, clause)) = crate::compile::compile_definition(&expr) {
+                // Also store the BARE HEAD atom so `match` can find premise atoms
+                if let crate::parser::Expr::List(items) = &expr {
+                    if items.len() == 3 {
+                        let head_atom = crate::parser::expr_to_atom(&items[1]);
+                        funcs.space.lock().unwrap().add_atom(&head_atom)?;
+                    }
+                }
                 funcs.add_clause(name, clause.patterns, clause.body);
             }
             Ok(None)

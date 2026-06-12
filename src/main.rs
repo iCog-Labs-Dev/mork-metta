@@ -20,8 +20,15 @@ fn main() {
         .cloned()
         .expect("usage: mork-metta [--local] <file.metta>");
 
-    // Spawn with larger stack (32MB) to handle deep recursion (e.g. Peano arithmetic
-    // needs ~300 levels of recursive function calls in the evaluator).
+    // Deep recursion (e.g. Peano at 300 levels) needs big stacks on EVERY thread
+    // that may run eval — including rayon workers, which default to 2MB and
+    // continue the recursion whenever evaluation passes through a parallel
+    // region. Configure the global pool before any rayon use.
+    rayon::ThreadPoolBuilder::new()
+        .stack_size(32 * 1024 * 1024)
+        .build_global()
+        .expect("failed to configure rayon thread pool");
+
     let builder = std::thread::Builder::new()
         .name("eval-worker".into())
         .stack_size(32 * 1024 * 1024);
