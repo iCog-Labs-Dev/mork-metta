@@ -236,6 +236,14 @@ pub fn register_builtins(table: &FnTable) {
         });
         Ok(NDet::single(Atom::Expr(sorted)))
     });
+    // get-atoms: (get-atoms space) → stream of all atoms in the space
+    // Returns each atom as a separate result so that (collapse (get-atoms &self))
+    // collects them into a flat list, matching the match+collapse pattern.
+    table.insert_native("get-atoms", 1, |args, table| {
+        expect_n_args(args, 1, "get-atoms")?;
+        let atoms = table.space.lock().unwrap().get_atoms();
+        Ok(NDet::stream(atoms.into_iter()))
+    });
 
     // sort: (sort list) → sorted deduplicated list
     table.insert_native("sort", 1, |args, _| {
