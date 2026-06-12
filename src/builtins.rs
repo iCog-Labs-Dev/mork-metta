@@ -127,6 +127,12 @@ pub fn register_builtins(table: &FnTable) {
     bool_clause!(table, "xor", ["True",  "True"],  "False");
     bool_clause!(table, "xor", ["False", "False"], "False");
 
+    // implies truth table (boolean implication)
+    bool_clause!(table, "implies", ["True",  "True"],  "True");
+    bool_clause!(table, "implies", ["True",  "False"], "False");
+    bool_clause!(table, "implies", ["False", "True"],  "True");
+    bool_clause!(table, "implies", ["False", "False"], "True");
+
     // Float unary math — (fn-math x)
     math_unary!(table, "sqrt-math",  |x: f64| x.sqrt());
     math_unary!(table, "abs-math",   |x: f64| x.abs());
