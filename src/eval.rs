@@ -58,6 +58,8 @@ use crate::env::Env;
 use crate::func::{Clause, FnTable, Function, FunctionKind, NDet};
 use crate::parser::{atom_to_expr, expr_to_atom, parse_forms, Expr, TopForm};
 use crate::space::Pattern;
+use std::path::PathBuf;
+use std::sync::Arc;
 use crate::{trace, trace_enter, trace_exit};
 /// Evaluate an expression, returning a (possibly empty) stream of results.
 pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
@@ -119,6 +121,7 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     // empty produces no results (Prolog fail / empty nondeterminism)
                     "empty" => { trace!("→ special: empty"); return Ok(NDet::stream(std::iter::empty())); }
                     "py-call" => { trace!("→ special: py-call"); return eval_py_call(args, env, funcs); }
+                    "import-rs!" => { trace!("→ special: import-rs!"); return eval_import_rs(args, env, funcs); }
                     _ => {}
                 }
             }
@@ -248,8 +251,8 @@ fn call_with_ref(
         FunctionKind::UserDefined { clauses } => clauses.clone(),
         FunctionKind::Native { .. } => vec![],
     };
-    let native_func: Option<fn(&[Atom], &FnTable) -> Result<NDet, String>> = match &func.kind {
-        FunctionKind::Native { func: f } => Some(*f),
+    let native_func: Option<Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + 'static>> = match &func.kind {
+        FunctionKind::Native { func: f } => Some(Arc::clone(f)),
         FunctionKind::UserDefined { .. } => None,
     };
     drop(func); // Release the RefCell borrow before any recursive eval calls.
@@ -1244,6 +1247,59 @@ fn eval_import(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String
     Ok(NDet::single(Atom::sym("true")))
 }
 
+/// Evaluate `(import-rs! name)` — compile and load a Rust plugin.
+///
+/// `name` can be a bare library name (e.g. `my_math`) or a path to a `.rs` file.
+/// Search order: same dir as the importing file, then CWD, then bare path.
+///
+/// Requires building with `--features plugins`.
+#[cfg(feature = "plugins")]
+fn eval_import_rs(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 1 {
+        return Err(format!("import-rs!: expected 1 arg (library name), got {}", args.len()));
+    }
+    let name = match &args[0] {
+        Expr::Symbol(s) => s.as_str(),
+        _ => return Err("import-rs!: argument must be a symbol (library name)".into()),
+    };
+    if name.is_empty() {
+        return Err("import-rs!: library name cannot be empty".into());
+    }
+
+    // Build search directories: importing file's dir, libs/, then CWD
+    let import_dir = funcs.import_dir.borrow().clone();
+    let mut search_dirs: Vec<PathBuf> = Vec::new();
+    if !import_dir.as_os_str().is_empty() {
+        search_dirs.push(import_dir.clone());
+        search_dirs.push(import_dir.join("libs"));
+    }
+    search_dirs.push(PathBuf::from("."));
+    search_dirs.push(PathBuf::from("./libs"));
+
+    let lib_name = crate::plugin::import_rs(name, funcs, &search_dirs)
+        .map_err(|e| format!("import-rs!: {}", e))?;
+
+    // Also load a companion .metta file if it exists
+    let metta_name = format!("{}.metta", lib_name);
+    for dir in &search_dirs {
+        let metta_path = dir.join(&metta_name);
+        if metta_path.exists() {
+            let _ = load_metta_file(&metta_path, env, funcs)?;
+            break;
+        }
+    }
+
+    trace!("import-rs!: loaded plugin '{}'", lib_name);
+    Ok(NDet::single(Atom::sym(&lib_name)))
+}
+
+/// Stub when `plugins` feature is disabled.
+#[cfg(not(feature = "plugins"))]
+fn eval_import_rs(args: &[Expr], _env: &Env, _funcs: &FnTable) -> Result<NDet, String> {
+    let _ = args; // suppress unused
+    Err("import-rs!: this interpreter was built without the 'plugins' feature (rebuild with --features plugins)".into())
+}
+
 /// Resolve an import path against a priority-ordered list of base directories.
 ///
 /// Search order (first hit wins, each tried with and without `.metta`):
@@ -1579,9 +1635,9 @@ fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<V
     let func_ref = funcs.get_ref(&fname, arity as u8).ok_or_else(|| {
         format!("generator: unknown function {} with {} args", fname, arity)
     })?;
-    let (clauses, native_func): (Vec<Clause>, Option<fn(&[Atom], &FnTable) -> Result<NDet, String>>) = match &func_ref.kind {
+    let (clauses, native_func): (Vec<Clause>, Option<Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + 'static>>) = match &func_ref.kind {
         FunctionKind::UserDefined { clauses } => (clauses.clone(), None),
-        FunctionKind::Native { func: f } => (vec![], Some(*f)),
+        FunctionKind::Native { func: f } => (vec![], Some(Arc::clone(f))),
     };
     let is_native = matches!(&func_ref.kind, FunctionKind::Native { .. });
     drop(func_ref); // Release RefCell borrow before recursive eval calls.

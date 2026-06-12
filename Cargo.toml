@@ -8,6 +8,8 @@ default = ["mork"]
 trace = []
 mork = ["dep:mork"]
 python-bridge = ["dep:pyo3"]
+plugins = ["dep:libloading"]
 [dependencies]
 mork = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true, features = ["auto-initialize"] }
+libloading = { version = "0.8", optional = true }

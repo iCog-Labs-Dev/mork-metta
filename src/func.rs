@@ -14,6 +14,7 @@
 ///   builtins and special forms can access them through `&FnTable`.
 
 use std::cell::{Ref, RefCell};
+use std::sync::Arc;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use crate::parser::Expr;
@@ -74,8 +75,8 @@ pub enum FunctionKind {
         clauses: Vec<Clause>,
     },
     Native {
-        #[allow(clippy::type_complexity)] // REASON: fn pointer in enum variant — a type alias would obscure the actual signature without adding clarity
-        func: fn(&[Atom], &FnTable) -> Result<NDet, String>,
+        // REASON: Arc<dyn Fn> allows closures that capture context (e.g. loaded plugin fns).
+        func: Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + 'static>,
     },
 }
 /// A named function in the table.
@@ -171,17 +172,19 @@ impl FnTable {
         false
     }
 
-    pub fn insert_native(
+    pub fn insert_native<F>(
         &self,
         name: &str,
         arity: u8,
-        func: fn(&[Atom], &FnTable) -> Result<NDet, String>,
-    ) {
+        func: F,
+    ) where
+        F: Fn(&[Atom], &FnTable) -> Result<NDet, String> + 'static,
+    {
         self.map.borrow_mut()
             .entry(name.to_string()).or_insert_with(HashMap::new)
             .insert(arity, Function {
                 name: name.to_string(),
-                kind: FunctionKind::Native { func },
+                kind: FunctionKind::Native { func: Arc::new(func) },
             });
     }
 

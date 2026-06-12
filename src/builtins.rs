@@ -678,7 +678,7 @@ pub fn register_builtins(table: &FnTable) {
             let func_ref = table.get_ref(&fname, 2)
                 .ok_or_else(|| format!("foldl: function {} with arity 2 not found", fname))?;
             let func_ptr = match &func_ref.kind {
-                FunctionKind::Native { func } => *func,
+                FunctionKind::Native { func } => func.clone(),
                 FunctionKind::UserDefined { .. } => {
                     return Err("foldl: only native functions supported as first argument".into());
                 }
@@ -706,7 +706,7 @@ pub fn register_builtins(table: &FnTable) {
             let func_ref = table.get_ref(&fname, 2)
                 .ok_or_else(|| format!("foldl-atom: function {} with arity 2 not found", fname))?;
             let func_ptr = match &func_ref.kind {
-                FunctionKind::Native { func } => *func,
+                FunctionKind::Native { func } => func.clone(),
                 FunctionKind::UserDefined { .. } => {
                     return Err("foldl-atom: only native functions supported as first argument".into());
                 }
@@ -789,7 +789,7 @@ pub fn register_builtins(table: &FnTable) {
             let func_ref = table.get_ref(&fname, 1)
                 .ok_or_else(|| format!("maplist: function {} with arity 1 not found", fname))?;
             let func_ptr = match &func_ref.kind {
-                FunctionKind::Native { func } => *func,
+                FunctionKind::Native { func } => func.clone(),
                 FunctionKind::UserDefined { .. } => {
                     return Err("maplist: only native functions supported as first argument".into());
                 }
@@ -818,7 +818,7 @@ pub fn register_builtins(table: &FnTable) {
             let func_ref = table.get_ref(&fname, 1)
                 .ok_or_else(|| format!("filter-atom: function {} with arity 1 not found", fname))?;
             let func_ptr = match &func_ref.kind {
-                FunctionKind::Native { func } => *func,
+                FunctionKind::Native { func } => func.clone(),
                 FunctionKind::UserDefined { .. } => {
                     return Err("filter-atom: only native functions supported as first argument".into());
                 }

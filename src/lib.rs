@@ -21,6 +21,8 @@ pub mod func;
 pub mod builtins;
 pub mod parser;
 pub mod space;
+#[cfg(feature = "plugins")]
+pub mod plugin;
 
 use crate::atom::Atom;
 use crate::compile::compile_definition;
