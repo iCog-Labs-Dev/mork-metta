@@ -341,6 +341,16 @@ pub fn register_builtins(table: &FnTable) {
         }
     });
 
+    // car: (car list) → first element — alias for car-atom
+    table.insert_native("car", 1, |args, _| {
+        expect_n_args(args, 1, "car")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
+            Atom::Expr(_) => Err("car: empty list".into()),
+            other => Err(format!("car: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+
     // cdr-atom: (cdr-atom list) → tail (all but first)
     table.insert_native("cdr-atom", 1, |args, _| {
         expect_n_args(args, 1, "cdr-atom")?;
@@ -392,6 +402,16 @@ pub fn register_builtins(table: &FnTable) {
             Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
             Atom::Expr(_) => Err("first-from-pair: empty list".into()),
             other => Err(format!("first-from-pair: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+
+    // first: (first list) → first element — alias for first-from-pair
+    table.insert_native("first", 1, |args, _| {
+        expect_n_args(args, 1, "first")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
+            Atom::Expr(_) => Err("first: empty list".into()),
+            other => Err(format!("first: expected list, got {}", other.to_sexpr_string())),
         }
     });
 
