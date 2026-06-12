@@ -255,6 +255,26 @@ pub fn register_builtins(table: &FnTable) {
         }))
     });
 
+    // =: (= a b) → True/False — unification-as-boolean (same as == for ground atoms)
+    table.insert_native("=", 2, |args, _| {
+        expect_n_args(args, 2, "=")?;
+        Ok(NDet::single(if args[0] == args[1] {
+            Atom::sym("True")
+        } else {
+            Atom::sym("False")
+        }))
+    });
+
+    // =?: (=? a b) → True/False — double-negation unification check (same as == for ground atoms)
+    table.insert_native("=?", 2, |args, _| {
+        expect_n_args(args, 2, "=?")?;
+        Ok(NDet::single(if args[0] == args[1] {
+            Atom::sym("True")
+        } else {
+            Atom::sym("False")
+        }))
+    });
+
     // test: (test actual expected) — compares two atoms, errors on mismatch
     table.insert_native("test", 2, |args, _| {
         expect_n_args(args, 2, "test")?;
