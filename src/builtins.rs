@@ -541,6 +541,61 @@ pub fn register_builtins(table: &FnTable) {
             other => Ok(NDet::single(other.clone())),
         }
     });
+
+    // union-atom: (union-atom list1 list2) → union of two lists (no duplicates)
+    table.insert_native("union-atom", 2, |args, _| {
+        expect_n_args(args, 2, "union-atom")?;
+        let items1 = match &args[0] {
+            Atom::Expr(v) => v.clone(),
+            other => vec![other.clone()],
+        };
+        let items2 = match &args[1] {
+            Atom::Expr(v) => v.clone(),
+            other => vec![other.clone()],
+        };
+        let mut result = items1;
+        for item in items2 {
+            if !result.contains(&item) {
+                result.push(item);
+            }
+        }
+        Ok(NDet::single(Atom::Expr(result)))
+    });
+
+    // intersection-atom: (intersection-atom list1 list2) → elements in both lists (no duplicates)
+    table.insert_native("intersection-atom", 2, |args, _| {
+        expect_n_args(args, 2, "intersection-atom")?;
+        let items1 = match &args[0] {
+            Atom::Expr(v) => v.clone(),
+            other => vec![other.clone()],
+        };
+        let items2 = match &args[1] {
+            Atom::Expr(v) => v.clone(),
+            other => vec![other.clone()],
+        };
+        let mut result = Vec::new();
+        for item in &items1 {
+            if items2.contains(item) && !result.contains(item) {
+                result.push(item.clone());
+            }
+        }
+        Ok(NDet::single(Atom::Expr(result)))
+    });
+
+    // subtraction-atom: (subtraction-atom list1 list2) → elements in list1 not in list2 (set difference)
+    table.insert_native("subtraction-atom", 2, |args, _| {
+        expect_n_args(args, 2, "subtraction-atom")?;
+        let items1 = match &args[0] {
+            Atom::Expr(v) => v.clone(),
+            other => vec![other.clone()],
+        };
+        let items2 = match &args[1] {
+            Atom::Expr(v) => v.clone(),
+            other => vec![other.clone()],
+        };
+        let result: Vec<Atom> = items1.into_iter().filter(|x| !items2.contains(x)).collect();
+        Ok(NDet::single(Atom::Expr(result)))
+    });
 }
 
 // ---- Helpers ----
