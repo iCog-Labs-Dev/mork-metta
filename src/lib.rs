@@ -141,7 +141,7 @@ impl Runtime {
     /// files with millions of atom assertions. Sets `import_dir` to the file's
     /// parent directory so that `import!` inside the file resolves paths relative
     /// to the file, not the caller's CWD.
-    pub fn load_file(&mut self, path: &str) -> Result<Option<Atom>, String> {
+    pub fn load_file(&mut self, path: &str) -> Result<Vec<crate::atom::Atom>, String> {
         let path = std::path::Path::new(path);
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
         *self.funcs.import_dir.borrow_mut() = dir.to_path_buf();
