@@ -192,8 +192,24 @@ fn parse_sexpr_body(
 }
 
 /// Read a token (whitespace-delimited, also stops at '(' and ')').
+/// If the token starts with `"`, read until the closing `"` and return
+/// the content between quotes as a single token (parens inside are literal).
 fn read_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
     let mut s = String::new();
+    // Quoted string: read until closing "
+    if let Some(&'"') = chars.peek() {
+        chars.next(); // consume opening "
+        while let Some(&c) = chars.peek() {
+            if c == '"' {
+                chars.next(); // consume closing "
+                break;
+            }
+            s.push(c);
+            chars.next();
+        }
+        return s;
+    }
+    // Normal token: whitespace/paren delimited
     while let Some(&c) = chars.peek() {
         if c.is_whitespace() || c == '(' || c == ')' {
             break;

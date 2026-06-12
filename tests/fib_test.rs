@@ -662,9 +662,9 @@ fn test_multi_clause_fallback_catches_all() {
 (= (pos $X) "many")
 !(collapse (pos 1))
 "#;
-    // pos(1) matches clause 1 ("one") AND clause 4 ($X), so result is ("one" "many")
+    // pos(1) matches clause 1 ("one") AND clause 4 ($X), so result is (one many)
     let result = rt.eval_str(code).unwrap();
-    assert_eq!(result.unwrap().to_sexpr_string(), "(\"one\" \"many\")");
+    assert_eq!(result.unwrap().to_sexpr_string(), "(one many)");
 }
 #[test]
 fn test_multi_clause_structured_patterns() {
