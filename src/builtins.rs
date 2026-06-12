@@ -833,6 +833,26 @@ pub fn register_builtins(table: &FnTable) {
         }
         Ok(NDet::single(Atom::Expr(results)))
     });
+
+    // is-var: (is-var x) → True/False — whether x is a variable (starts with $)
+    table.insert_native("is-var", 1, |args, _| {
+        expect_n_args(args, 1, "is-var")?;
+        let is_var = matches!(&args[0], Atom::Sym(s) if s.starts_with('$'));
+        Ok(NDet::single(if is_var { Atom::sym("True") } else { Atom::sym("False") }))
+    });
+
+    // is-expr: (is-expr x) → True/False — whether x is a list/expression
+    table.insert_native("is-expr", 1, |args, _| {
+        expect_n_args(args, 1, "is-expr")?;
+        Ok(NDet::single(if matches!(&args[0], Atom::Expr(_)) { Atom::sym("True") } else { Atom::sym("False") }))
+    });
+
+    // is-space: (is-space x) → True/False — whether x is a space reference (&...)
+    table.insert_native("is-space", 1, |args, _| {
+        expect_n_args(args, 1, "is-space")?;
+        let is_space = matches!(&args[0], Atom::Sym(s) if s.starts_with('&'));
+        Ok(NDet::single(if is_space { Atom::sym("True") } else { Atom::sym("False") }))
+    });
 }
 
 // ---- Helpers ----
