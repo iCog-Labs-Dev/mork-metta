@@ -866,3 +866,37 @@ fn test_lambda_multi_arg_closure() {
     let result = rt.eval_str(code).unwrap();
     assert_eq!(result, Some(Atom::sym("true")));
 }
+
+#[test]
+fn test_cons_pattern_in_let() {
+    // (cons $h $t) destructures any non-empty list
+    let mut rt = Runtime::new();
+    let code = r#"
+!(test (let (cons $h $t) (1 2 3 4 5 6) ($h $t)) (1 (2 3 4 5 6)))
+"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::sym("true")));
+}
+
+#[test]
+fn test_cons_pattern_in_case() {
+    // (cons $h $t) in case patterns
+    let mut rt = Runtime::new();
+    let code = r#"
+!(test (case (1 2 3) (((cons $h $t) $h))) 1)
+"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::sym("true")));
+}
+
+#[test]
+fn test_foldl_atom_list_init_func() {
+    // foldl-atom uses (list init func) convention
+    let mut rt = Runtime::new();
+    let code = r#"
+(= (add $a $b) (+ $a $b))
+!(test (foldl-atom (1 2 3 4) 0 add) 10)
+"#;
+    let result = rt.eval_str(code).unwrap();
+    assert_eq!(result, Some(Atom::sym("true")));
+}
