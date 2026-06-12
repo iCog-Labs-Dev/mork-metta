@@ -717,6 +717,122 @@ pub fn register_builtins(table: &FnTable) {
         }
         Ok(NDet::single(acc))
     });
+
+    // decons-atom: (decons-atom list) → (first rest) — split list into head and tail, alias for decons
+    table.insert_native("decons-atom", 1, |args, _| {
+        expect_n_args(args, 1, "decons-atom")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => {
+                let head = items[0].clone();
+                let rest = Atom::Expr(items[1..].to_vec());
+                Ok(NDet::single(Atom::Expr(vec![head, rest])))
+            }
+            Atom::Expr(_) => Err("decons-atom: empty list".into()),
+            other => Err(format!("decons-atom: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+
+    // list_to_set: (list_to_set list) → deduplicated list — alias for unique-atom
+    table.insert_native("list_to_set", 1, |args, _| {
+        expect_n_args(args, 1, "list_to_set")?;
+        match &args[0] {
+            Atom::Expr(items) => {
+                let mut seen = Vec::with_capacity(items.len());
+                let mut deduped = Vec::with_capacity(items.len());
+                for item in items {
+                    if !seen.contains(item) {
+                        seen.push(item.clone());
+                        deduped.push(item.clone());
+                    }
+                }
+                Ok(NDet::single(Atom::Expr(deduped)))
+            }
+            other => Ok(NDet::single(other.clone())),
+        }
+    });
+
+    // alpha-unique-atom: (alpha-unique-atom list) → deduplicated list (alpha-equivalence aware)
+    table.insert_native("alpha-unique-atom", 1, |args, _| {
+        expect_n_args(args, 1, "alpha-unique-atom")?;
+        match &args[0] {
+            Atom::Expr(items) => {
+                let mut deduped: Vec<Atom> = Vec::with_capacity(items.len());
+                'outer: for item in items {
+                    for existing in &deduped {
+                        let mut map_ab = std::collections::HashMap::new();
+                        let mut map_ba = std::collections::HashMap::new();
+                        if alpha_equiv(item, existing, &mut map_ab, &mut map_ba) {
+                            continue 'outer;
+                        }
+                    }
+                    deduped.push(item.clone());
+                }
+                Ok(NDet::single(Atom::Expr(deduped)))
+            }
+            other => Ok(NDet::single(other.clone())),
+        }
+    });
+
+    // maplist: (maplist func list) → list of results — apply func (arity 1) to each element
+    table.insert_native("maplist", 2, |args, table| {
+        expect_n_args(args, 2, "maplist")?;
+        let items = match &args[1] {
+            Atom::Expr(v) => v.clone(),
+            other => vec![other.clone()],
+        };
+        let fname = match &args[0] {
+            Atom::Sym(s) => s.clone(),
+            _ => return Err("maplist: first arg must be a symbol (function name)".into()),
+        };
+        let mut results = Vec::with_capacity(items.len());
+        for item in &items {
+            let func_ref = table.get_ref(&fname, 1)
+                .ok_or_else(|| format!("maplist: function {} with arity 1 not found", fname))?;
+            let func_ptr = match &func_ref.kind {
+                FunctionKind::Native { func } => *func,
+                FunctionKind::UserDefined { .. } => {
+                    return Err("maplist: only native functions supported as first argument".into());
+                }
+            };
+            drop(func_ref);
+            let mut result = func_ptr(&[item.clone()], table)?;
+            let val = result.next().ok_or_else(|| format!("maplist: function produced no results for item {}", item.to_sexpr_string()))?;
+            results.push(val);
+        }
+        Ok(NDet::single(Atom::Expr(results)))
+    });
+
+    // filter-atom: (filter-atom pred list) → filtered list — keep elements where pred returns True
+    table.insert_native("filter-atom", 2, |args, table| {
+        expect_n_args(args, 2, "filter-atom")?;
+        let items = match &args[1] {
+            Atom::Expr(v) => v.clone(),
+            other => vec![other.clone()],
+        };
+        let fname = match &args[0] {
+            Atom::Sym(s) => s.clone(),
+            _ => return Err("filter-atom: first arg must be a symbol (function name)".into()),
+        };
+        let mut results = Vec::with_capacity(items.len());
+        for item in &items {
+            let func_ref = table.get_ref(&fname, 1)
+                .ok_or_else(|| format!("filter-atom: function {} with arity 1 not found", fname))?;
+            let func_ptr = match &func_ref.kind {
+                FunctionKind::Native { func } => *func,
+                FunctionKind::UserDefined { .. } => {
+                    return Err("filter-atom: only native functions supported as first argument".into());
+                }
+            };
+            drop(func_ref);
+            let mut result = func_ptr(&[item.clone()], table)?;
+            if let Some(val) = result.next() {
+                if val == Atom::sym("True") {
+                    results.push(item.clone());
+                }
+            }
+        }
+        Ok(NDet::single(Atom::Expr(results)))
+    });
 }
 
 // ---- Helpers ----
