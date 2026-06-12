@@ -54,6 +54,12 @@ impl PartialEq for Atom {
     }
 }
 
+impl std::hash::Hash for Atom {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.to_sexpr_string().hash(state);
+    }
+}
+
 impl Atom {
     /// Format an Atom as an S-expression string (for display).
     ///

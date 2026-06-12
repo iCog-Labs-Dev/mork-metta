@@ -853,6 +853,64 @@ pub fn register_builtins(table: &FnTable) {
         let is_space = matches!(&args[0], Atom::Sym(s) if s.starts_with('&'));
         Ok(NDet::single(if is_space { Atom::sym("True") } else { Atom::sym("False") }))
     });
+
+    // concat: (concat a b) → concatenation of string syms or lists
+    table.insert_native("concat", 2, |args, _| {
+        expect_n_args(args, 2, "concat")?;
+        match (&args[0], &args[1]) {
+            (Atom::Expr(a), Atom::Expr(b)) => {
+                let mut out = a.clone();
+                out.extend(b.iter().cloned());
+                Ok(NDet::single(Atom::Expr(out)))
+            }
+            (Atom::Sym(a), Atom::Sym(b)) => {
+                let s = format!("{}{}", a, b);
+                Ok(NDet::single(Atom::sym(&s)))
+            }
+            _ => {
+                // Fallback: concat as strings via sexpr representation
+                let s = format!("{}{}", args[0].to_sexpr_string(), args[1].to_sexpr_string());
+                Ok(NDet::single(Atom::sym(&s)))
+            }
+        }
+    });
+
+    // atom_concat: (atom_concat a b) → concatenates two atoms into one symbol
+    table.insert_native("atom_concat", 2, |args, _| {
+        expect_n_args(args, 2, "atom_concat")?;
+        let a_str = args[0].to_sexpr_string();
+        let b_str = args[1].to_sexpr_string();
+        let s = format!("{}{}", a_str, b_str);
+        Ok(NDet::single(Atom::sym(&s)))
+    });
+
+    // atom_chars: (atom_chars atom) → list of single-char symbols
+    table.insert_native("atom_chars", 1, |args, _| {
+        expect_n_args(args, 1, "atom_chars")?;
+        let s = args[0].to_sexpr_string();
+        let chars: Vec<Atom> = s.chars().map(|c| Atom::sym(&c.to_string())).collect();
+        Ok(NDet::single(Atom::Expr(chars)))
+    });
+
+    // term_hash: (term_hash x) → hash number for the atom
+    table.insert_native("term_hash", 1, |args, _| {
+        expect_n_args(args, 1, "term_hash")?;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        args[0].hash(&mut hasher);
+        Ok(NDet::single(Atom::Num(hasher.finish() as i128)))
+    });
+
+    // sread: (sread str) → parse string into a MeTTa expression atom
+    table.insert_native("sread", 1, |args, _| {
+        expect_n_args(args, 1, "sread")?;
+        let input = match &args[0] {
+            Atom::Sym(s) => s.to_string(),
+            other => other.to_sexpr_string(),
+        };
+        // Parse a single atom from string using a simple parser
+        Ok(NDet::single(sread_parse(&input)?))
+    });
 }
 
 // ---- Helpers ----
@@ -894,3 +952,54 @@ fn expect_n_args(args: &[Atom], n: usize, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+
+/// Parse a single MeTTa atom from a string.
+/// Handles symbols, numbers, and s-expressions.
+fn sread_parse(input: &str) -> Result<Atom, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("sread: empty input".into());
+    }
+    // Try as sexpr: must start with '(' and end with ')'
+    if input.starts_with('(') && input.ends_with(')') {
+        let inner = &input[1..input.len() - 1].trim();
+        if inner.is_empty() {
+            return Ok(Atom::Expr(vec![]));
+        }
+        // Split on whitespace respecting nested parens
+        let mut items = Vec::new();
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        let bytes = inner.as_bytes();
+        for i in 0..bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b' ' | b'\t' | b'\n' => {
+                    if depth == 0 && i > start {
+                        let token = &inner[start..i];
+                        items.push(sread_parse(token)?);
+                        start = i + 1;
+                    } else if depth == 0 {
+                        start = i + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Last token
+        if start < inner.len() {
+            let token = inner[start..].trim();
+            if !token.is_empty() {
+                items.push(sread_parse(token)?);
+            }
+        }
+        return Ok(Atom::Expr(items));
+    }
+    // Try as number
+    if let Ok(n) = input.parse::<i128>() {
+        return Ok(Atom::Num(n));
+    }
+    // Otherwise it's a symbol
+    Ok(Atom::sym(input))
+}
