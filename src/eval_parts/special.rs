@@ -911,37 +911,11 @@ pub(crate) fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDe
         Some(v) => v,
     };
 
-    // Check if clause bodies are pure enough for parallel fan-out.
-    // The inner loop (per-value clause matching) stays sequential to preserve
-    // first-match-wins semantics.
-    let bodies_pure = clauses.iter().all(|clause| match clause {
-        Expr::List(items) if items.len() == 2 => {
-            crate::eval_parts::data_list::is_pure_expr(&items[1], funcs)
-        }
-        _ => false,
-    });
-
-    // Parallel path: collect all vals first, then fan-out across workers.
-    if bodies_pure {
-        let mut vals = Vec::new();
-        vals.push(first_val);
-        vals.extend(&mut stream);
-
-        let results: Vec<Result<Vec<Atom>, String>> = if vals.len() > 1 {
-            use rayon::prelude::*;
-            vals.par_iter().map(|val| try_case_value(val, clauses, env, funcs)).collect()
-        } else {
-            vals.iter().map(|val| try_case_value(val, clauses, env, funcs)).collect()
-        };
-        let mut out: Vec<Atom> = Vec::new();
-        for r in results {
-            out.extend(r?);
-        }
-        return Ok(NDet::stream(out.into_iter()));
-    }
-
     // Sequential path: process values lazily from the stream, collecting
     // results directly into the output without an intermediate Vec.
+    // Parallel fan-out was tried but adds overhead: each handler is a
+    // microsecond-scale operation (O(1) HashSet check + conditional insert),
+    // so rayon's work-stealing overhead exceeds any gain.
     let mut out: Vec<Atom> = try_case_value(&first_val, clauses, env, funcs)?;
     for val in &mut stream {
         out.extend(try_case_value(&val, clauses, env, funcs)?);
