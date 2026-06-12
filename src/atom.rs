@@ -143,7 +143,12 @@ impl Atom {
     pub fn is_truthy(&self) -> bool {
         match self {
             Atom::Num(0) => false,
-            Atom::Sym(s) if s.is_empty() || s.as_ref() == "false" => false,
+            Atom::Sym(s)
+                if s.is_empty()
+                    || s.as_ref().eq_ignore_ascii_case("false") =>
+            {
+                false
+            }
             _ => true,
         }
     }
