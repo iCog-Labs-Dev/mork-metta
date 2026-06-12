@@ -64,7 +64,7 @@ macro_rules! cmp_binary {
             Ok(NDet::single(if $op(a, b) {
                 Atom::sym("True")
             } else {
-                Atom::sym("")
+                Atom::sym("False")
             }))
         });
     };
@@ -182,6 +182,16 @@ pub fn register_builtins(table: &FnTable) {
         Ok(NDet::single(f64_to_atom(best)))
     });
 
+    // size-atom: (size-atom list) → Number
+    table.insert_native("size-atom", 1, |args, _| {
+        expect_n_args(args, 1, "size-atom")?;
+        let len = match &args[0] {
+            Atom::Expr(items) => items.len(),
+            _ => 1,
+        };
+        Ok(NDet::single(Atom::Num(len as i128)))
+    });
+
     // append: (append list1 list2) → concatenated list
     table.insert_native("append", 2, |args, _| {
         expect_n_args(args, 2, "append")?;
@@ -196,13 +206,42 @@ pub fn register_builtins(table: &FnTable) {
         Ok(NDet::single(Atom::Expr(out)))
     });
 
+    // msort: (msort list) → sorted list (keeps duplicates)
+    table.insert_native("msort", 1, |args, _| {
+        expect_n_args(args, 1, "msort")?;
+        let items = match &args[0] {
+            Atom::Expr(v) => v.clone(),
+            a => vec![a.clone()],
+        };
+        let mut sorted = items;
+        sorted.sort_by(|a, b| {
+            a.to_sexpr_string().cmp(&b.to_sexpr_string())
+        });
+        Ok(NDet::single(Atom::Expr(sorted)))
+    });
+
+    // sort: (sort list) → sorted deduplicated list
+    table.insert_native("sort", 1, |args, _| {
+        expect_n_args(args, 1, "sort")?;
+        let items = match &args[0] {
+            Atom::Expr(v) => v.clone(),
+            a => vec![a.clone()],
+        };
+        let mut sorted = items;
+        sorted.sort_by(|a, b| {
+            a.to_sexpr_string().cmp(&b.to_sexpr_string())
+        });
+        sorted.dedup();
+        Ok(NDet::single(Atom::Expr(sorted)))
+    });
+
     // == compares any two atoms structurally
     table.insert_native("==", 2, |args, _| {
         expect_n_args(args, 2, "==")?;
         Ok(NDet::single(if args[0] == args[1] {
             Atom::sym("True")
         } else {
-            Atom::sym("")
+            Atom::sym("False")
         }))
     });
 
