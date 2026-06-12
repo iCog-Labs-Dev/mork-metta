@@ -192,6 +192,16 @@ pub fn register_builtins(table: &FnTable) {
         Ok(NDet::single(Atom::Num(len as i128)))
     });
 
+    // length: (length list) → Number — alias for size-atom
+    table.insert_native("length", 1, |args, _| {
+        expect_n_args(args, 1, "length")?;
+        let len = match &args[0] {
+            Atom::Expr(items) => items.len(),
+            _ => 1,
+        };
+        Ok(NDet::single(Atom::Num(len as i128)))
+    });
+
     // append: (append list1 list2) → concatenated list
     table.insert_native("append", 2, |args, _| {
         expect_n_args(args, 2, "append")?;
