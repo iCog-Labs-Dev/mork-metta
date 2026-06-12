@@ -119,6 +119,7 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     "|->" => { trace!("→ special: lambda"); return eval_lambda(args, env); }
                     "forall" => { trace!("→ special: forall"); return eval_forall(args, env, funcs); }
                     // empty produces no results (Prolog fail / empty nondeterminism)
+                    "within" => { trace!("→ special: within"); return eval_within(args, env, funcs); }
                     "empty" => { trace!("→ special: empty"); return Ok(NDet::stream(std::iter::empty())); }
                     "py-call" => { trace!("→ special: py-call"); return eval_py_call(args, env, funcs); }
                     "import-rs!" => { trace!("→ special: import-rs!"); return eval_import_rs(args, env, funcs); }
@@ -903,6 +904,34 @@ fn eval_let_star(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, Stri
     }
     eval(&args[1], &current_env, funcs)
 }
+/// Evaluate `(within expr)` — evaluate `expr` then wrap result in `(within ...)`.
+///
+/// PeTTa semantics: `within` is NOT a registered function; it's a data constructor
+/// marker. Its argument is a regular MeTTa expression that IS evaluated (via `call`
+/// semantics — i.e., normal evaluation), and the result is wrapped in `(within ...)`.
+/// This is equivalent to `(= (within $x) (within $x))` evaluated in data-list context.
+fn eval_within(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 1 {
+        return Err(format!("within: expected 1 arg, got {}", args.len()));
+    }
+    let result_atom = match eval(&args[0], env, funcs) {
+        Ok(nd) => {
+            let vals: Vec<Atom> = nd.collect();
+            if vals.is_empty() {
+                return Err("within: expression produced no results".into());
+            }
+            if vals.len() > 1 {
+                Atom::Expr(std::iter::once(Atom::sym("within")).chain(vals.into_iter()).collect())
+            } else {
+                Atom::Expr(vec![Atom::sym("within"), vals.into_iter().next().unwrap()])
+            }
+        }
+        Err(e) => return Err(format!("within: {}", e)),
+    };
+    trace!("within: {}", result_atom.to_sexpr_string());
+    Ok(NDet::single(result_atom))
+}
+
 /// Evaluate `(quote expr)` — return expression as data, substituting bound `$vars`.
 ///
 /// PeTTa: `Out = Expr` where Expr is the raw Prolog term. Bound Prolog variables
