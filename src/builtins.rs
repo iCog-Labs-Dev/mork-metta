@@ -4,7 +4,7 @@
 /// macro-registered — one line per function.
 
 use crate::atom::Atom;
-use crate::func::{FnTable, NDet};
+use crate::func::{FnTable, FunctionKind, NDet};
 use crate::parser::Expr;
 
 macro_rules! bool_clause {
@@ -595,6 +595,101 @@ pub fn register_builtins(table: &FnTable) {
         };
         let result: Vec<Atom> = items1.into_iter().filter(|x| !items2.contains(x)).collect();
         Ok(NDet::single(Atom::Expr(result)))
+    });
+
+    // sort-atom: (sort-atom list) → lexicographically sorted list (keeps duplicates) — alias for msort
+    table.insert_native("sort-atom", 1, |args, _| {
+        expect_n_args(args, 1, "sort-atom")?;
+        let items = match &args[0] {
+            Atom::Expr(v) => v.clone(),
+            a => vec![a.clone()],
+        };
+        let mut sorted = items;
+        sorted.sort_by(|a, b| a.to_sexpr_string().cmp(&b.to_sexpr_string()));
+        Ok(NDet::single(Atom::Expr(sorted)))
+    });
+
+    // sort-math: (sort-math list) → numerically sorted list
+    table.insert_native("sort-math", 1, |args, _| {
+        expect_n_args(args, 1, "sort-math")?;
+        let items = match &args[0] {
+            Atom::Expr(v) => v.clone(),
+            a => vec![a.clone()],
+        };
+        let mut pairs: Vec<(f64, Atom)> = Vec::with_capacity(items.len());
+        for item in &items {
+            let num = atom_as_f64(item, "sort-math")?;
+            pairs.push((num, item.clone()));
+        }
+        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let sorted: Vec<Atom> = pairs.into_iter().map(|(_, a)| a).collect();
+        Ok(NDet::single(Atom::Expr(sorted)))
+    });
+
+    // same: (same a b) → True/False — structural equality, alias for ==
+    table.insert_native("same", 2, |args, _| {
+        expect_n_args(args, 2, "same")?;
+        Ok(NDet::single(if args[0] == args[1] {
+            Atom::sym("True")
+        } else {
+            Atom::sym("False")
+        }))
+    });
+
+    // foldl: (foldl func init list) → left fold over a list
+    table.insert_native("foldl", 3, |args, table| {
+        expect_n_args(args, 3, "foldl")?;
+        let items = match &args[2] {
+            Atom::Expr(v) => v.clone(),
+            other => vec![other.clone()],
+        };
+        let mut acc = args[1].clone();
+        for item in &items {
+            let fname = match &args[0] {
+                Atom::Sym(s) => s.clone(),
+                _ => return Err("foldl: first arg must be a symbol (function name)".into()),
+            };
+            let func_ref = table.get_ref(&fname, 2)
+                .ok_or_else(|| format!("foldl: function {} with arity 2 not found", fname))?;
+            let func_ptr = match &func_ref.kind {
+                FunctionKind::Native { func } => *func,
+                FunctionKind::UserDefined { .. } => {
+                    return Err("foldl: only native functions supported as first argument".into());
+                }
+            };
+            drop(func_ref);
+            let mut result = func_ptr(&[acc, item.clone()], table)?;
+            acc = result.next().ok_or_else(|| "foldl: function produced no results".to_string())?;
+        }
+        Ok(NDet::single(acc))
+    });
+
+    // foldl-atom: (foldl-atom func init list) → left fold over a list — alias for foldl
+    table.insert_native("foldl-atom", 3, |args, table| {
+        expect_n_args(args, 3, "foldl-atom")?;
+        let items = match &args[2] {
+            Atom::Expr(v) => v.clone(),
+            other => vec![other.clone()],
+        };
+        let mut acc = args[1].clone();
+        for item in &items {
+            let fname = match &args[0] {
+                Atom::Sym(s) => s.clone(),
+                _ => return Err("foldl-atom: first arg must be a symbol (function name)".into()),
+            };
+            let func_ref = table.get_ref(&fname, 2)
+                .ok_or_else(|| format!("foldl-atom: function {} with arity 2 not found", fname))?;
+            let func_ptr = match &func_ref.kind {
+                FunctionKind::Native { func } => *func,
+                FunctionKind::UserDefined { .. } => {
+                    return Err("foldl-atom: only native functions supported as first argument".into());
+                }
+            };
+            drop(func_ref);
+            let mut result = func_ptr(&[acc, item.clone()], table)?;
+            acc = result.next().ok_or_else(|| "foldl-atom: function produced no results".to_string())?;
+        }
+        Ok(NDet::single(acc))
     });
 }
 
