@@ -363,6 +363,18 @@ pub fn register_builtins(table: &FnTable) {
         }
     });
 
+    // cdr: (cdr list) → tail (all but first) — alias for cdr-atom
+    table.insert_native("cdr", 1, |args, _| {
+        expect_n_args(args, 1, "cdr")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => {
+                Ok(NDet::single(Atom::Expr(items[1..].to_vec())))
+            }
+            Atom::Expr(_) => Err("cdr: empty list".into()),
+            other => Err(format!("cdr: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+
     // index-atom: (index-atom list n) → 0-based nth element
     table.insert_native("index-atom", 2, |args, _| {
         expect_n_args(args, 2, "index-atom")?;
