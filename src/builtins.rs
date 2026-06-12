@@ -481,6 +481,66 @@ pub fn register_builtins(table: &FnTable) {
             other => Err(format!("decons: expected list, got {}", other.to_sexpr_string())),
         }
     });
+
+    // reverse: (reverse list) → reversed list
+    table.insert_native("reverse", 1, |args, _| {
+        expect_n_args(args, 1, "reverse")?;
+        match &args[0] {
+            Atom::Expr(items) => {
+                let mut rev = items.clone();
+                rev.reverse();
+                Ok(NDet::single(Atom::Expr(rev)))
+            }
+            other => Err(format!("reverse: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+
+    // is-member: (is-member elem list) → True/False
+    table.insert_native("is-member", 2, |args, _| {
+        expect_n_args(args, 2, "is-member")?;
+        let found = match &args[1] {
+            Atom::Expr(items) => items.iter().any(|x| *x == args[0]),
+            other => *other == args[0],
+        };
+        Ok(NDet::single(if found { Atom::sym("True") } else { Atom::sym("False") }))
+    });
+
+    // exclude-item: (exclude-item elem list) → list without elem
+    table.insert_native("exclude-item", 2, |args, _| {
+        expect_n_args(args, 2, "exclude-item")?;
+        match &args[1] {
+            Atom::Expr(items) => {
+                let filtered: Vec<Atom> = items.iter().filter(|x| **x != args[0]).cloned().collect();
+                Ok(NDet::single(Atom::Expr(filtered)))
+            }
+            other => {
+                if *other == args[0] {
+                    Ok(NDet::single(Atom::Expr(vec![])))
+                } else {
+                    Ok(NDet::single(other.clone()))
+                }
+            }
+        }
+    });
+
+    // unique-atom: (unique-atom list) → deduplicated list
+    table.insert_native("unique-atom", 1, |args, _| {
+        expect_n_args(args, 1, "unique-atom")?;
+        match &args[0] {
+            Atom::Expr(items) => {
+                let mut seen = Vec::with_capacity(items.len());
+                let mut deduped = Vec::with_capacity(items.len());
+                for item in items {
+                    if !seen.contains(item) {
+                        seen.push(item.clone());
+                        deduped.push(item.clone());
+                    }
+                }
+                Ok(NDet::single(Atom::Expr(deduped)))
+            }
+            other => Ok(NDet::single(other.clone())),
+        }
+    });
 }
 
 // ---- Helpers ----
