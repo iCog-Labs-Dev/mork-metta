@@ -129,6 +129,8 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     "map-atom" => { trace!("→ special: map-atom"); return eval_map_atom(args, env, funcs); }
                     "|->" => { trace!("→ special: lambda"); return eval_lambda(args, env); }
                     "forall" => { trace!("→ special: forall"); return eval_forall(args, env, funcs); }
+                    "repr" => { trace!("→ special: repr"); return eval_repr(args, env); }
+
                     // empty produces no results (Prolog fail / empty nondeterminism)
                     "within" => { trace!("→ special: within"); return eval_within(args, env, funcs); }
                     "empty" => { trace!("→ special: empty"); return Ok(NDet::stream(std::iter::empty())); }
@@ -563,7 +565,7 @@ fn is_pure_expr(expr: &Expr, funcs: &FnTable) -> bool {
             if let Expr::Symbol(s) = op {
                 match s.as_str() {
                     // Pure special forms
-                    "quote" | "collapse" | "superpose" | "empty" => true,
+                    "quote" | "collapse" | "superpose" | "empty" | "repr" => true,
                     // Impure special forms
                     "if" | "progn" | "let" | "let*" | "eval" | "call" | "reduce"
                     | "add-atom" | "remove-atom" | "match" | "import!" | "readln!"
@@ -1044,6 +1046,18 @@ fn eval_quote(args: &[Expr], env: &Env) -> Result<NDet, String> {
     let atom = subst_and_atomize(&args[0], env);
     Ok(NDet::single(atom))
 }
+
+/// Evaluate `(repr expr)` — return the S-expression text of `expr` as a symbol.
+/// Unlike `quote`, this does NOT substitute bound `$vars` — it returns the
+/// literal source text so that `(repr (remove-all-atoms &self))` produces
+/// the string `(remove-all-atoms &self)`.
+fn eval_repr(args: &[Expr], _env: &Env) -> Result<NDet, String> {
+    if args.len() != 1 {
+        return Err(format!("repr: expected 1 arg, got {}", args.len()));
+    }
+    Ok(NDet::single(Atom::sym(&args[0].to_string())))
+}
+
 
 /// Convert an `Expr` to an `Atom`, substituting bound `$vars` from `env`.
 /// Unbound `$vars` are left as `Atom::Sym("$name")`.

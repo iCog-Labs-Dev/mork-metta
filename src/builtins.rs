@@ -305,12 +305,6 @@ pub fn register_builtins(table: &FnTable) {
     });
 
 
-    // repr: (repr atom) — return the S-expression string of an atom as a symbol
-    table.insert_native("repr", 1, |args, _| {
-        expect_n_args(args, 1, "repr")?;
-        Ok(NDet::single(Atom::sym(&args[0].to_sexpr_string())))
-    });
-
     // get-state: (get-state key) — retrieves state value
     table.insert_native("get-state", 1, |args, table| {
         expect_n_args(args, 1, "get-state")?;
