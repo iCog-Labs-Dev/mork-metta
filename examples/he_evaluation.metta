@@ -9,4 +9,4 @@
 !(test (chain (+ 2 3) $x (* $x 2)) 10)
 
 !(test (for-each-in-atom (1 3 5 62 2 5) println!)
-       (true true true true true true))
+      (true true true true true true))
