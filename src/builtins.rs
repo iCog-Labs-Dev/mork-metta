@@ -331,6 +331,17 @@ pub fn register_builtins(table: &FnTable) {
         Ok(NDet::single(Atom::Expr(out)))
     });
 
+    // cons: (cons elem list) → prepend elem to list — alias for cons-atom
+    table.insert_native("cons", 2, |args, _| {
+        expect_n_args(args, 2, "cons")?;
+        let mut out = vec![args[0].clone()];
+        match &args[1] {
+            Atom::Expr(items) => out.extend(items.iter().cloned()),
+            other => out.push(other.clone()),
+        }
+        Ok(NDet::single(Atom::Expr(out)))
+    });
+
     // car-atom: (car-atom list) → first element
     table.insert_native("car-atom", 1, |args, _| {
         expect_n_args(args, 1, "car-atom")?;
@@ -434,6 +445,40 @@ pub fn register_builtins(table: &FnTable) {
             Atom::Expr(items) if items.len() >= 2 => Ok(NDet::single(items[1].clone())),
             Atom::Expr(_) => Err("second-from-pair: list too short".into()),
             other => Err(format!("second-from-pair: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+
+    // second: (second list) → second element — alias for second-from-pair
+    table.insert_native("second", 1, |args, _| {
+        expect_n_args(args, 1, "second")?;
+        match &args[0] {
+            Atom::Expr(items) if items.len() >= 2 => Ok(NDet::single(items[1].clone())),
+            Atom::Expr(_) => Err("second: list too short".into()),
+            other => Err(format!("second: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+
+    // last: (last list) → last element
+    table.insert_native("last", 1, |args, _| {
+        expect_n_args(args, 1, "last")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[items.len() - 1].clone())),
+            Atom::Expr(_) => Err("last: empty list".into()),
+            other => Err(format!("last: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+
+    // decons: (decons list) → (first rest) — destructure list into head and tail
+    table.insert_native("decons", 1, |args, _| {
+        expect_n_args(args, 1, "decons")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => {
+                let head = items[0].clone();
+                let rest = Atom::Expr(items[1..].to_vec());
+                Ok(NDet::single(Atom::Expr(vec![head, rest])))
+            }
+            Atom::Expr(_) => Err("decons: empty list".into()),
+            other => Err(format!("decons: expected list, got {}", other.to_sexpr_string())),
         }
     });
 }
