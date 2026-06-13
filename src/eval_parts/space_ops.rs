@@ -40,22 +40,15 @@ pub(crate) fn eval_add_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
     // receives the Prolog term where unified variables already hold their values.
     let atom = crate::eval_parts::special::subst_and_atomize(&args[1], env);
     funcs.space.lock().unwrap().add_atom(&atom).map_err(|e| format!("add-atom: {}", e))?;
-    // If the atom is a function definition (= head body), register the function
+    // If the atom is a function definition (= head body), also store the bare
+    // head atom so `match` can find premise atoms (e.g. (= (f $x) $x) → (f $x)).
     if let Atom::Expr(items) = &atom {
         if items.len() == 3 && items[0] == Atom::sym("=") {
-            // Also store the BARE HEAD atom so `match` can find premise atoms
             funcs.space.lock().unwrap().add_atom(&items[1])?;
-            if let (Ok(head_expr), Ok(body_expr)) = (
-                crate::parser::atom_to_expr(&items[1]),
-                crate::parser::atom_to_expr(&items[2]),
-            ) {
-                let def_expr = Expr::List(vec![
-                    Expr::Symbol("=".to_string()),
-                    head_expr,
-                    body_expr,
-                ]);
-                if let Ok((name, clause)) = crate::compile::compile_definition(&def_expr) {
-                    funcs.add_clause(name, clause.patterns, clause.body);
+            // Also populate fn_cache
+            if let Ok(expr) = crate::parser::atom_to_expr(&atom) {
+                if let Ok((name, clause)) = crate::compile::compile_definition(&expr) {
+                    funcs.cache_fn(&name, clause.patterns.len() as u8, clause);
                 }
             }
         }
@@ -96,22 +89,13 @@ pub(crate) fn eval_remove_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Res
         }
         removed
     };
-    // Keep FnTable in sync outside the space lock: if a removed atom was a
-    // function definition, drop its clause.
+    // Invalidate fn_cache for any removed function definitions.
     for atom in &removed_atoms {
         if let Atom::Expr(items) = atom {
             if items.len() == 3 && items[0] == Atom::sym("=") {
-                if let (Ok(head_expr), Ok(body_expr)) = (
-                    crate::parser::atom_to_expr(&items[1]),
-                    crate::parser::atom_to_expr(&items[2]),
-                ) {
-                    let def_expr = Expr::List(vec![
-                        Expr::Symbol("=".to_string()),
-                        head_expr,
-                        body_expr,
-                    ]);
-                    if let Ok((name, clause)) = crate::compile::compile_definition(&def_expr) {
-                        funcs.remove_clause(&name, &clause.patterns, &clause.body);
+                if let Ok(expr) = crate::parser::atom_to_expr(atom) {
+                    if let Ok((name, clause)) = crate::compile::compile_definition(&expr) {
+                        funcs.uncache_fn(&name, clause.patterns.len() as u8);
                     }
                 }
             }
