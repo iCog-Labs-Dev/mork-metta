@@ -14,7 +14,7 @@
 
 use crate::atom::{Atom, ClosureData};
 use crate::env::Env;
-use crate::func::{Clause, FnTable, FunctionKind, NDet};
+use crate::func::{FnTable, FunctionKind, NDet};
 use crate::parser::{atom_to_expr, Expr};
 use super::constrained::eval_constrained;
 use super::core::{apply_closure, eval};
@@ -316,6 +316,14 @@ pub(crate) fn subst_expr_vars(expr: &Expr, env: &Env) -> Expr {
     match expr {
         Expr::Symbol(s) if s.starts_with('$') => {
             if let Some(atom) = env.get(s) {
+                // If the bound value is itself a $-prefixed symbol (e.g. $who from
+                // a query), keep the original pattern variable — the $-prefixed
+                // value acts as a wildcard that match should resolve, not a literal.
+                if let Atom::Sym(ref v) = atom {
+                    if v.starts_with('$') {
+                        return expr.clone();
+                    }
+                }
                 crate::parser::atom_to_expr(&atom).unwrap_or_else(|_| expr.clone())
             } else {
                 expr.clone()
@@ -588,20 +596,11 @@ pub(crate) fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) 
         )),
     };
     // SAFETY: arity = items.len() - 1; items is non-empty (guarded above), so arity < 256.
-    let func_ref = funcs.get(&fname, arity as u8).ok_or_else(|| {
-        format!("generator: unknown function {} with {} args", fname, arity)
-    })?;
-    let is_native = matches!(&func_ref.kind, FunctionKind::Native { .. });
-    let (clauses, native_func): (Vec<Clause>, Option<Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static>>) = match &func_ref.kind {
-        FunctionKind::UserDefined { clauses } => (clauses.clone(), None),
-        FunctionKind::Native { func: f } => (vec![], Some(Arc::clone(f))),
-    };
-    drop(func_ref);
-    if is_native {
-        if let Some(f) = native_func {
+    if let Some(func_ref) = funcs.get(&fname, arity as u8) {
+        // Native function
+        if let FunctionKind::Native { func: f } = &func_ref.kind {
             // For each arg, collect all possible values:
             // concrete args → one value; free-var args → recurse to get many values.
-            // Then call the native with every combination (cartesian product).
             let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(arity);
             for arg_expr in &items[1..] {
                 match super::core::eval(arg_expr, env, funcs) {
@@ -644,64 +643,26 @@ pub(crate) fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) 
         }
         return Err("generator: unexpected native dispatch failure".into());
     }
-    // UserDefined
+    // Cached dispatch for user-defined functions
+    let clauses: Vec<crate::func::Clause> = match funcs.fn_cache.read().unwrap()
+        .get(fname.as_ref()).and_then(|inner| inner.get(&(arity as u8)))
+    {
+        Some(c) => c.clone(),
+        None => return Err(format!(
+            "generator: {}: no matching definitions in fn_cache",
+            fname
+        )),
+    };
     let mut results = Vec::new();
     for clause in &clauses {
-        if clause.patterns.len() != arity {
-            continue;
-        }
-        let mut concrete_args = Vec::with_capacity(arity);
-        let mut has_free = false;
-        for (i, arg_expr) in items[1..].iter().enumerate() {
-            if let Expr::Symbol(s) = arg_expr {
-                if s.starts_with('$') && env.get(s).is_none() {
-                    match &clause.patterns[i] {
-                        Expr::Number(n) => {
-                            concrete_args.push(Atom::Num(*n));
-                            has_free = true;
-                        }
-                        Expr::Symbol(sym) if !sym.starts_with('$') => {
-                            concrete_args.push(Atom::sym(&sym));
-                            has_free = true;
-                        }
-                        _ => {
-                            concrete_args.clear();
-                            break;
-                        }
-                    }
-                    continue;
-                }
-            }
-            // Normal evaluation
-            let mut evaled = super::core::eval(arg_expr, env, funcs)?;
-            match evaled.next() {
-                Some(a) => concrete_args.push(a),
-                None => { concrete_args.clear(); break; }
-            }
-        }
-        if !has_free || concrete_args.len() != arity {
-            continue;
-        }
-        let mut matched = true;
-        let mut match_env = Env::new();
-        for (pat, arg_val) in clause.patterns.iter().zip(concrete_args.iter()) {
-            match super::pattern::try_match_one(pat, arg_val, &match_env, funcs)? {
-                Some(new_env) => match_env = new_env,
-                None => { matched = false; break; }
-            }
-        }
-        if !matched {
-            continue;
-        }
-        let new_env = super::pattern::prepend_env(match_env, env);
-        let mut body_results = super::core::eval(&clause.body, &new_env, funcs)?;
+        let mut body_results = super::core::eval(&clause.body, env, funcs)?;
         while let Some(atom) = body_results.next() {
             results.push(atom);
         }
     }
     if results.is_empty() {
         return Err(format!(
-            "generator: {}: no clauses with literal patterns for free variables",
+            "generator: {}: no matching definitions",
             fname
         ));
     }
@@ -920,199 +881,3 @@ pub(crate) fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDe
     Ok(NDet::stream(out.into_iter()))
 }
 
-// ========================================================================
-// => and ? — PLN rule definition and query special forms
-// ========================================================================
-//
-// PeTTa's `=>` is a compile-time translator rule: when the translator
-// encounters `(=> (cons , $args) $C $stvImp)`, it COMPILES the rule into
-// Prolog clauses where each premise atom becomes an atomspace lookup that
-// extracts STVs. The foldl-atom then operates on the COLLECTED STVs.
-//
-// Our interpreter has no compile phase, so we implement `=>` and `?` as
-// special forms (arguments NOT pre-evaluated). `=>` builds a nested
-// `(match &self premise ...)` chain that binds free variables in each
-// premise, then evaluates premises as function calls to extract STVs.
-// This mirrors PeTTa's translation but at runtime.
-
-/// Evaluate `(=> premises conclusion stv)` — define a PLN implication rule.
-///
-/// Two patterns (raw, unevaluated args):
-/// - `(=> (, prem1 prem2 ...) conclusion stv)` — multi-premise rule
-/// - `(=> premise conclusion stv)` — single-premise rule
-///
-/// Builds a function body that uses nested `(match &self premise ...)` to
-/// bind free variables in each premise, then evaluates premises as function
-/// calls to extract STVs, folds Truth_ModusPonens over them, and applies
-/// the implication STV.
-pub(crate) fn eval_implication(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
-    if args.len() != 3 {
-        return Err(format!("=>: expected (premises conclusion stv), got {} args", args.len()));
-    }
-
-    // Extract premises list from the first argument.
-    // The convention is (cons , $args) — the first arg is (, prem1 prem2 ...)
-    let premises: Vec<Expr> = match &args[0] {
-        // (cons , $args) pattern: `,` is the first element, premises follow
-        Expr::List(items) if items.len() >= 2
-            && matches!(&items[0], Expr::Symbol(s) if s == ",") =>
-        {
-            items[1..].to_vec()
-        }
-        _ => {
-            // Single premise fallback
-            vec![args[0].clone()]
-        }
-    };
-
-    let conclusion = &args[1];
-    let stv_imp = &args[2];
-
-    // Build the body: nested (match &self premise ...) chain around
-    // a foldl-atom that processes all premise function-call results.
-    let body = build_matched_fold(&premises, stv_imp, conclusion);
-
-    // Build the definition (= conclusion body)
-    let def_expr = Expr::List(vec![
-        Expr::Symbol("=".to_string()),
-        conclusion.clone(),
-        body,
-    ]);
-
-    // Add to atomspace (both full definition and bare conclusion head)
-    let def_atom = subst_and_atomize(&def_expr, env);
-    funcs.space.lock().unwrap().add_atom(&def_atom)?;
-
-
-    // Register as a function clause (same logic as eval_add_atom)
-    if let Atom::Expr(items) = &def_atom {
-        if items.len() == 3 && items[0] == Atom::sym("=") {
-            if let (Ok(head_expr), Ok(body_expr)) = (
-                atom_to_expr(&items[1]),
-                atom_to_expr(&items[2]),
-            ) {
-                let def = Expr::List(vec![
-                    Expr::Symbol("=".to_string()),
-                    head_expr,
-                    body_expr,
-                ]);
-                if let Ok((name, clause)) = crate::compile::compile_definition(&def) {
-                    funcs.add_clause(name, clause.patterns, clause.body);
-                }
-            }
-        }
-    }
-
-    Ok(NDet::single(Atom::sym("true")))
-}
-
-fn build_matched_fold(premises: &[Expr], stv_imp: &Expr, conclusion: &Expr) -> Expr {
-    if premises.is_empty() {
-        return stv_imp.clone();
-    }
-
-    // Build the premise data list: (prem1 prem2 ...)
-    // When evaluated inside the nested match (free vars bound by match),
-    // each premise evaluates as a function call returning its STV.
-    let premise_list = Expr::List(premises.to_vec());
-
-    // (foldl-atom (prem1 prem2 ...) (stv 1.0 1.0) Truth_ModusPonens)
-    let foldl_expr = Expr::List(vec![
-        Expr::Symbol("foldl-atom".to_string()),
-        premise_list,
-        Expr::List(vec![
-            Expr::Symbol("stv".to_string()),
-            Expr::Symbol("1.0".to_string()),
-            Expr::Symbol("1.0".to_string()),
-        ]),
-        Expr::Symbol("Truth_ModusPonens".to_string()),
-    ]);
-
-    // (Truth_ModusPonens foldl_result stv_imp)
-    let stv_result = Expr::List(vec![
-        Expr::Symbol("Truth_ModusPonens".to_string()),
-        foldl_expr,
-        stv_imp.clone(),
-    ]);
-
-    let body = stv_result;
-
-    // Wrap in nested (match &self premise_i ...) for each premise
-    // Iterated in reverse: innermost match is the LAST premise
-    build_match_chain(premises, body)
-}
-
-/// Build (match &self premise (match &self premise2 ... body))
-fn build_match_chain(premises: &[Expr], body: Expr) -> Expr {
-    let mut result = body;
-    for premise in premises.iter().rev() {
-        result = Expr::List(vec![
-            Expr::Symbol("match".to_string()),
-            Expr::Symbol("&self".to_string()),
-            premise.clone(),
-            result,
-        ]);
-    }
-    result
-}
-
-pub(crate) fn eval_query(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
-    if args.len() != 1 {
-        return Err(format!("?: expected (term), got {} args", args.len()));
-    }
-
-    // Convert the raw term expression to an atom (for use in the pair)
-    let term_atom = subst_and_atomize(&args[0], env);
-
-    // Evaluate the term, collecting ALL results.
-    // During evaluation, build_matched_fold materializes ground conclusion
-    // atoms in the space via (add-atom &self conclusion).
-    let mut stream = super::core::eval(&args[0], env, funcs)?;
-    let results: Vec<Atom> = stream.by_ref().collect();
-    if results.is_empty() {
-        return Ok(NDet::Single(None));
-    }
-
-    // Deduplicate results
-    let mut unique: Vec<Atom> = Vec::new();
-    for r in results {
-        if !unique.contains(&r) {
-            unique.push(r);
-        }
-    }
-
-    // PeTTa's ? applies Truth_Revision over ALL results:
-    // (foldl-atom <results> (stv 0.5 0.0) Truth_Revision)
-    // When only one result, use it directly.
-    let merged = if unique.len() == 1 {
-        unique.into_iter().next().unwrap()
-    } else {
-        let mut result_exprs = Vec::with_capacity(unique.len());
-        for r in &unique {
-            result_exprs.push(crate::parser::atom_to_expr(r).unwrap_or_else(|_| {
-                Expr::Symbol(r.to_sexpr_string())
-            }));
-        }
-        let list_expr = Expr::List(result_exprs);
-        let init = Expr::List(vec![
-            Expr::Symbol("stv".to_string()),
-            Expr::Symbol("0.5".to_string()),
-            Expr::Symbol("0.0".to_string()),
-        ]);
-        let foldl_expr = Expr::List(vec![
-            Expr::Symbol("foldl-atom".to_string()),
-            list_expr,
-            init,
-            Expr::Symbol("Truth_Revision".to_string()),
-        ]);
-        let mut fold_stream = super::core::eval(&foldl_expr, env, funcs)?;
-        let fold_results: Vec<Atom> = fold_stream.by_ref().collect();
-        fold_results.into_iter().next().unwrap_or(unique[0].clone())
-    };
-
-    let resolved_term = term_atom;
-
-    // Single (term result) pair, wrapped in a list
-    let pair = Atom::Expr(vec![resolved_term, merged]);
-    Ok(NDet::single(Atom::Expr(vec![pair])))
-}
