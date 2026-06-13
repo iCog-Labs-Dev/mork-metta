@@ -90,11 +90,11 @@ impl Runtime {
         // Move space and state into new table
         let _ = std::mem::replace(&mut *new_table.space.lock().unwrap(), old_space);
         let _ = std::mem::replace(&mut *new_table.state.lock().unwrap(), state);
-        // Re-register user-defined functions
+        // Re-register user-defined functions and populate fn_cache
         for result in matches {
             if let Ok(expr) = parser::atom_to_expr(&result.atom) {
                 if let Ok((name, clause)) = compile_definition(&expr) {
-                    new_table.add_clause(name, clause.patterns, clause.body);
+                    new_table.cache_fn(&name, clause.patterns.len() as u8, clause);
                 }
             }
         }
@@ -129,7 +129,8 @@ impl Runtime {
                             self.funcs.space.lock().unwrap().add_atom(&head_atom)?;
                         }
                     }
-                    self.funcs.add_clause(name, clause.patterns, clause.body);
+                    // Populate fn_cache for fast concurrent dispatch
+                    self.funcs.cache_fn(&name, clause.patterns.len() as u8, clause);
                 }
                 Ok(None)
             }
