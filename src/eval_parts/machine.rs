@@ -119,7 +119,7 @@ impl MachineState {
         match transition {
             Transition::Query => self.apply_query(env, funcs),
             Transition::Chain => self.apply_chain(env, funcs),
-            Transition::Transform => self.apply_transform(),
+            Transition::Transform => self.apply_transform(env, funcs),
             Transition::AddAtom(atom) => self.apply_add_atom(atom, funcs),
             Transition::RemAtom(atom) => self.apply_remove_atom(atom, funcs),
             Transition::Output => self.apply_output(),
@@ -135,7 +135,7 @@ impl MachineState {
     /// ⟨{term} ++ i, k, w, o⟩ → ⟨i, k, w ++ {body[σ]}, o⟩
     /// ```
     ///
-    /// Phase 2: Match input term against all (= head body) definitions in k.
+    /// Matches input term against all (= head body) definitions in knowledge base.
     /// For each matching definition:
     ///   1. Unify term with head → get substitution σ
     ///   2. Apply σ to body → get body[σ]
@@ -171,7 +171,7 @@ impl MachineState {
     /// ⟨i, k, {term} ++ w, o⟩ → ⟨i, k, w ++ {body[σ]}, o⟩
     /// ```
     ///
-    /// Phase 2: Match workspace term against all (= head body) definitions in k.
+    /// Matches workspace term against all (= head body) definitions in knowledge base.
     /// Same as Query, except source/sink both come from workspace.
     fn apply_chain(&mut self, env: &Env, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
         // Pick a term from workspace
@@ -194,12 +194,24 @@ impl MachineState {
 
     /// Helper: query_knowledge(term)
     ///
-    /// Match term against all (= head body) definitions in knowledge base.
-    /// For each successful unification:
-    ///   1. Unify term with head → get substitution σ
-    ///   2. Apply σ to body → get body[σ]
-    ///   3. Evaluate body[σ] → get results
-    ///   4. Add results to return vector
+    /// Core unification-and-evaluation loop for Query and Chain rules.
+    /// Spec Section 3.3 (pages 9-10).
+    ///
+    /// Algorithm:
+    /// 1. FOR EACH atom in k (knowledge base):
+    ///    a. Check if atom matches pattern (= head body)
+    ///    b. Unify term with head using Robinson's algorithm → substitution σ
+    ///    c. Apply σ to body → instantiated_body (body[σ] in spec notation)
+    ///    d. Evaluate instantiated_body → results
+    ///    e. Add all results to output vector
+    ///
+    /// Semantics:
+    /// - Unification: σ = unify(term, head) using Robinson's algorithm
+    /// - Substitution: apply σ to all variables in body (notation body[σ])
+    /// - Evaluation: recursively evaluate the instantiated body
+    /// - All matches: finds ALL atoms in k matching pattern, not just first
+    /// - Variable scoping: σ is local to each unification; different unifications
+    ///   don't share variable bindings
     ///
     /// Returns vector of all results from all matching definitions.
     fn query_knowledge(
@@ -210,35 +222,42 @@ impl MachineState {
     ) -> Result<Vec<Atom>, String> {
         let mut results = Vec::new();
 
+        // Spec Section 3.3: k = {t1, ..., tn} ++ k'
         // Get snapshot of all atoms in k (snapshot to avoid lock issues during iteration)
         let atoms_snapshot: Vec<Atom> = {
             let space = funcs.space.lock().unwrap();
             space.get_atoms()
         };
 
-        // For each atom in k
+        // Spec Section 3.3: for EACH atom in k matching the pattern
         for atom in atoms_snapshot {
-            // Look for (= head body) definitions
+            // Look for (= head body) definitions in k
             if let Atom::Expr(items) = &atom {
                 if items.len() == 3 && items[0] == Atom::sym("=") {
                     let head = &items[1];
                     let body = &items[2];
 
-                    // Try unify(term, head)
+                    // Spec Section 3.3: σ = unify(term, (= head body))
+                    // Robinson's algorithm with occurs check
                     if let Some(substitution) = unify(term, head) {
-                        // Apply substitution to body: body[σ]
+                        // Spec Section 3.3: body[σ] (apply substitution to body)
                         let instantiated_body = apply_substitution(body, &substitution);
 
-                        // Evaluate the body expression
+                        // Spec Section 3.3: evaluate body[σ] → get results
                         // This calls back to the main eval loop to get results
                         match eval_in_context(&instantiated_body, env, funcs) {
-                            Ok(body_results) => results.extend(body_results),
+                            Ok(body_results) => {
+                                // All results from evaluating this instantiated body
+                                // are added to the output
+                                results.extend(body_results);
+                            }
                             Err(_) => {
-                                // Evaluation failed; skip this definition
-                                // In a real implementation, might want to log this
+                                // If evaluation fails, this definition doesn't contribute results
+                                // Continue to next definition in k
                             }
                         }
                     }
+                    // If unification fails, continue to next atom in k
                 }
             }
         }
@@ -257,12 +276,70 @@ impl MachineState {
     ///   → ⟨i, k, {K1[replacementσ1]...Kn[replacementσn]} ++ w, o⟩
     /// ```
     ///
-    /// (not implemented): Transform placeholder
-    /// will implement full code rewriting
-    fn apply_transform(&mut self) -> Result<Option<i64>, String> {
-        // will extract (transform pattern replacement) from input
-        // and apply rewrites to k
-        Err("Transform rule not yet implemented; Phase 4 needed".to_string())
+    /// Extracts (transform pattern replacement) from input register
+    /// and rewrites all matching atoms in knowledge base.
+    pub fn apply_transform(&mut self, _env: &Env, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
+        // Extract (transform pattern replacement) from input
+        let term = match self.input.pop_front() {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        // Parse (transform pattern replacement) structure
+        let (pattern, replacement) = match &term {
+            Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("transform") => {
+                (items[1].clone(), items[2].clone())
+            }
+            _ => {
+                // Invalid transform term; skip
+                return Ok(None);
+            }
+        };
+
+        // Get snapshot of all atoms in k
+        let atoms_snapshot: Vec<Atom> = {
+            let space = funcs.space.lock().unwrap();
+            space.get_atoms()
+        };
+
+        let mut replacements = Vec::new();
+        let mut transformed_atoms = Vec::new();
+
+        // For each atom in k, try to match pattern
+        for atom in &atoms_snapshot {
+            if let Some(subst) = unify(atom, &pattern) {
+                // Compute replacement[σ]
+                let new_atom = apply_substitution(&replacement, &subst);
+                replacements.push((atom.clone(), new_atom.clone()));
+                transformed_atoms.push(new_atom);
+            }
+        }
+
+        // Apply replacements to knowledge base
+        if !replacements.is_empty() {
+            let mut space = funcs.space.lock().unwrap();
+            for (old_atom, new_atom) in replacements {
+                space.remove_atom(&old_atom)?;
+                space.add_atom(&new_atom)?;
+
+                // If new atom is a function definition (= head body), register it
+                // Function registration deferred to integration phase
+                if let Atom::Expr(items) = &new_atom {
+                    if items.len() == 3 && items[0] == Atom::sym("=") {
+                        // This is code evolution: transformed atom is a function definition
+                        // Future: register with funcs for callable lookup
+                    }
+                }
+            }
+        }
+
+        // Add all transformed atoms to workspace
+        for atom in transformed_atoms {
+            self.workspace.push_back(atom);
+        }
+
+        let cost = calculate_cost(&pattern);
+        Ok(cost)
     }
 
     /// AddAtom rule: add atom to k
