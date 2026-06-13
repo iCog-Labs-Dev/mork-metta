@@ -242,7 +242,8 @@ pub(crate) fn process_top_form(form: TopForm, env: &Env, funcs: &FnTable) -> Res
                         funcs.space.lock().unwrap().add_atom(&head_atom)?;
                     }
                 }
-                funcs.add_clause(name, clause.patterns, clause.body);
+                // Populate fn_cache for fast concurrent dispatch
+                funcs.cache_fn(&name, clause.patterns.len() as u8, clause);
             }
             Ok(None)
         }
