@@ -260,18 +260,48 @@ fn test_transform_empty_input() {
 }
 
 #[test]
-fn test_transform_invalid_format() {
+fn test_transform_invalid_format_missing_replacement() {
     let (mut state, env, funcs) = setup();
 
-    // Push invalid transform
+    // Push malformed transform: missing replacement argument
     state.push_input(Atom::expr(vec![
         Atom::sym("transform"),
         Atom::sym("only-one-arg"),
     ]));
 
     let result = state.apply_transform(&env, &funcs);
+    // Should error on malformed input
+    assert!(result.is_err(), "Should error on malformed transform");
+}
+
+#[test]
+fn test_transform_invalid_format_no_args() {
+    let (mut state, env, funcs) = setup();
+
+    // Push malformed transform: no arguments
+    state.push_input(Atom::expr(vec![
+        Atom::sym("transform"),
+    ]));
+
+    let result = state.apply_transform(&env, &funcs);
+    // Should error on malformed input
+    assert!(result.is_err(), "Should error on malformed transform");
+}
+
+#[test]
+fn test_transform_not_builtin() {
+    let (mut state, env, funcs) = setup();
+
+    // Push something that looks like transform but isn't the builtin
+    state.push_input(Atom::expr(vec![
+        Atom::sym("my-transform"),
+        Atom::sym("pattern"),
+        Atom::sym("replacement"),
+    ]));
+
+    let result = state.apply_transform(&env, &funcs);
     assert!(result.is_ok());
-    assert!(state.workspace.is_empty());
+    assert!(state.workspace.is_empty(), "Non-builtin should be silently skipped");
 }
 
 #[test]

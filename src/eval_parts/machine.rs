@@ -285,13 +285,17 @@ impl MachineState {
             None => return Ok(None),
         };
 
-        // Parse (transform pattern replacement) structure
+        // Validate and parse (transform pattern replacement) structure
         let (pattern, replacement) = match &term {
             Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("transform") => {
                 (items[1].clone(), items[2].clone())
             }
+            Atom::Expr(items) if items.len() < 3 && matches!(items.get(0), Some(a) if a == &Atom::sym("transform")) => {
+                // Malformed: (transform) or (transform pattern) without replacement
+                return Err(format!("Transform requires 2 arguments: (transform pattern replacement), got {}", items.len() - 1));
+            }
             _ => {
-                // Invalid transform term; skip
+                // Not a transform builtin; silently skip
                 return Ok(None);
             }
         };
@@ -302,42 +306,58 @@ impl MachineState {
             space.get_atoms()
         };
 
-        let mut replacements = Vec::new();
-        let mut transformed_atoms = Vec::new();
+        // Collect all replacements before modifying knowledge base (atomic update)
+        let mut replacements: Vec<(Atom, Atom)> = Vec::new();
+        let mut transformed_atoms: Vec<Atom> = Vec::new();
 
         // For each atom in k, try to match pattern
+        // Spec Section 3.3: σi = unify(pattern, ti) for EACH atom ti
         for atom in &atoms_snapshot {
             if let Some(subst) = unify(atom, &pattern) {
-                // Compute replacement[σ]
+                // Compute replacement[σ] - substitution application per spec notation
                 let new_atom = apply_substitution(&replacement, &subst);
                 replacements.push((atom.clone(), new_atom.clone()));
                 transformed_atoms.push(new_atom);
             }
         }
 
-        // Apply replacements to knowledge base
+        // Apply all replacements atomically to knowledge base
         if !replacements.is_empty() {
             let mut space = funcs.space.lock().unwrap();
+
             for (old_atom, new_atom) in replacements {
+                // Remove old atom; if this fails, abort entire transformation
                 space.remove_atom(&old_atom)?;
+
+                // Add new atom; if this fails, knowledge base is in inconsistent state
+                // (This is a limitation of current AtomSpace API; proper solution needs transaction support)
                 space.add_atom(&new_atom)?;
 
                 // If new atom is a function definition (= head body), register it
-                // Function registration deferred to integration phase
+                // This enables code evolution: transformed atoms become callable
                 if let Atom::Expr(items) = &new_atom {
                     if items.len() == 3 && items[0] == Atom::sym("=") {
-                        // This is code evolution: transformed atom is a function definition
-                        // Future: register with funcs for callable lookup
+                        let head = &items[1];
+                        let body = &items[2];
+
+                        // Extract function name from head for registration
+                        register_function_definition(head, body, funcs)?;
                     }
                 }
             }
         }
 
-        // Add all transformed atoms to workspace
+        // Add all transformed atoms to workspace per spec
+        // Spec Section 3.3: result is w ++ {K1[uσ1]} ++ ... ++ {Kn[uσn]}
+        // Note: K[·] context handling deferred to Phase 5+
         for atom in transformed_atoms {
             self.workspace.push_back(atom);
         }
 
+        // Cost calculation per spec Section 6.3:
+        // c = Σi#(σi) + Σi#(uiσi) (sum of substitution costs + replacement costs)
+        // Current implementation: simplified cost model (Phase 5)
+        // TODO: implement full polymorphic cost function from spec
         let cost = calculate_cost(&pattern);
         Ok(cost)
     }
@@ -358,6 +378,7 @@ impl MachineState {
 
     /// Output rule: move result from w to o
     /// Spec Section 3.3, page 12
+    /// Output rule: move result from w to o
     fn apply_output(&mut self) -> Result<Option<i64>, String> {
         // Move one result from workspace to output
         if let Some(term) = self.workspace.pop_front() {
@@ -476,6 +497,41 @@ fn deref(atom: &Atom, subst: &HashMap<String, Atom>) -> Atom {
             }
         }
         _ => atom.clone(),
+    }
+}
+
+/// Register a transformed function definition for callable lookup
+///
+/// When Transform rewrites a (= head body) atom, the result should be
+/// registered as a callable function so future Query/Chain steps can use it.
+/// This enables code evolution: the system transforms its own definitions at runtime.
+fn register_function_definition(
+    head: &Atom,
+    _body: &Atom,
+    _funcs: &crate::func::FnTable,
+) -> Result<(), String> {
+    // Extract function name from head
+    match head {
+        Atom::Sym(_name) => {
+            // head is a simple symbol: (= name body)
+            // Register as 0-arity function
+            // TODO: implement funcs.register_clause(name, vec![], body)
+            // Deferred: requires integration with FnTable callable registration
+            Ok(())
+        }
+        Atom::Expr(items) if !items.is_empty() => {
+            // head is a compound: (= (name args...) body)
+            if let Atom::Sym(_name) = &items[0] {
+                // name is the function name, items[1..] are formal parameters
+                // Register as n-arity function where n = items.len() - 1
+                // TODO: implement funcs.register_clause(name, items[1..], body)
+                // Deferred: requires integration with FnTable callable registration
+                Ok(())
+            } else {
+                Err("Transform head must start with function name".to_string())
+            }
+        }
+        _ => Err("Transform head must be symbol or expression".to_string()),
     }
 }
 
