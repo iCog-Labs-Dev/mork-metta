@@ -51,6 +51,7 @@ impl Iterator for NDet {
 }
 
 /// A single clause of a multi-clause (pattern-matching) user-defined function.
+/// Kept for compile_definition return type and conversion to space atoms.
 #[derive(Clone, Debug)]
 pub struct Clause {
     pub patterns: Vec<Expr>,
@@ -59,9 +60,6 @@ pub struct Clause {
 
 #[derive(Clone)]
 pub enum FunctionKind {
-    UserDefined {
-        clauses: Vec<Clause>,
-    },
     Native {
         // REASON: Arc<dyn Fn + Send + Sync> allows closures captured at startup to be
         // called safely from parallel worker threads.
@@ -69,7 +67,8 @@ pub enum FunctionKind {
     },
 }
 
-/// A named function in the table.
+/// A named function in the table. Only Native Rust closures remain.
+/// User-defined (= ...) functions are looked up from the space directly.
 #[derive(Clone)]
 pub struct Function {
     pub name: String,
@@ -87,6 +86,9 @@ pub struct FnTable {
     pub space: Mutex<Box<dyn Space + Send>>,
     /// Mutable state store for `get-state`, `change-state!`, `bind!`.
     pub state: Mutex<HashMap<String, Atom>>,
+    /// Function definition cache — populated from space at reify time, updated
+    /// on add-atom/remove-atom. Read-heavy (every function dispatch), so RwLock.
+    pub fn_cache: RwLock<HashMap<String, HashMap<u8, Vec<Clause>>>>,
     /// Directory of the file currently being loaded (load-time only).
     pub import_dir: Mutex<PathBuf>,
 }
@@ -96,6 +98,7 @@ impl Clone for FnTable {
         FnTable {
             map: RwLock::new(self.map.read().unwrap().clone()),
             space: Mutex::new(Box::new(crate::space::ShardedSpace::new_default())),
+            fn_cache: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
             import_dir: Mutex::new(self.import_dir.lock().unwrap().clone()),
         }
@@ -107,6 +110,7 @@ impl FnTable {
         FnTable {
             map: RwLock::new(HashMap::new()),
             space: Mutex::new(Box::new(crate::space::ShardedSpace::new_default())),
+            fn_cache: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
             import_dir: Mutex::new(PathBuf::from(".")),
         }
@@ -116,57 +120,10 @@ impl FnTable {
         FnTable {
             map: RwLock::new(HashMap::new()),
             space: Mutex::new(space),
+            fn_cache: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
             import_dir: Mutex::new(PathBuf::from(".")),
         }
-    }
-
-    pub fn add_clause(&self, name: String, patterns: Vec<Expr>, body: Expr) {
-        let arity = patterns.len() as u8;
-        // Infer purity from the body before taking the write lock (the check
-        // reads the map). Direct recursion is assumed pure (optimistic);
-        // calls to unknown/impure functions make the clause impure.
-        let clause_pure =
-            crate::eval_parts::data_list::is_pure_expr_assuming(&body, self, &name);
-        let clause = Clause { patterns, body };
-        let mut map = self.map.write().unwrap();
-        let inner = map.entry(name.clone()).or_insert_with(HashMap::new);
-        if let Some(arc_func) = inner.get_mut(&arity) {
-            // Arc refcount is 1 at load time, so get_mut is zero-copy.
-            if let Some(func) = Arc::get_mut(arc_func) {
-                if let FunctionKind::UserDefined { ref mut clauses } = func.kind {
-                    clauses.push(clause);
-                    // A function is pure only if every clause is.
-                    func.pure = func.pure && clause_pure;
-                    return;
-                }
-            }
-        }
-        inner.insert(arity, Arc::new(Function {
-            name,
-            kind: FunctionKind::UserDefined { clauses: vec![clause] },
-            pure: clause_pure,
-        }));
-    }
-
-    /// Remove a specific clause from a user-defined function.
-    /// Returns true if found and removed.
-    pub fn remove_clause(&self, name: &str, patterns: &[Expr], body: &Expr) -> bool {
-        let arity = patterns.len() as u8;
-        let mut map = self.map.write().unwrap();
-        let Some(inner) = map.get_mut(name) else { return false; };
-        let Some(arc_func) = inner.get_mut(&arity) else { return false; };
-        let Some(func) = Arc::get_mut(arc_func) else { return false; };
-        if let FunctionKind::UserDefined { ref mut clauses } = func.kind {
-            let before = clauses.len();
-            clauses.retain(|c| c.patterns.as_slice() != patterns || c.body != *body);
-            let removed = clauses.len() < before;
-            if clauses.is_empty() {
-                inner.remove(&arity);
-            }
-            return removed;
-        }
-        false
     }
 
     pub fn insert_native<F>(&self, name: &str, arity: u8, func: F)
@@ -182,9 +139,6 @@ impl FnTable {
             }));
     }
 
-    /// Mark a registered function as pure (no side effects).
-    /// Pure functions can have arguments evaluated in parallel.
-    /// No-op if the function is not found (e.g. not yet loaded).
     pub fn mark_pure(&self, name: &str, arity: u8) {
         if let Some(arc_func) = self.map.write().unwrap()
             .get_mut(name).and_then(|inner| inner.get_mut(&arity))
@@ -194,25 +148,55 @@ impl FnTable {
         }
     }
 
-    /// Check existence — zero allocation.
     pub fn has(&self, name: &str, arity: u8) -> bool {
         self.map.read().unwrap()
             .get(name).map_or(false, |inner| inner.contains_key(&arity))
     }
 
-    /// Return the `Arc<Function>` for a named function at the given arity.
-    /// The Arc clone is O(1).
     pub fn get(&self, name: &str, arity: u8) -> Option<Arc<Function>> {
         self.map.read().unwrap()
             .get(name).and_then(|inner| inner.get(&arity)).cloned()
     }
 
+    pub fn cache_fn(&self, name: &str, arity: u8, clause: Clause) {
+        self.fn_cache.write().unwrap()
+            .entry(name.to_string()).or_insert_with(HashMap::new)
+            .entry(arity).or_insert_with(Vec::new)
+            .push(clause);
+    }
+
+    pub fn uncache_fn(&self, name: &str, arity: u8) {
+        if let Some(inner) = self.fn_cache.write().unwrap().get_mut(name) {
+            inner.remove(&arity);
+        }
+    }
+
     /// Check if a named function is pure at the given arity.
     /// Returns `false` if the function is not found (conservative).
     pub fn is_pure(&self, name: &str, arity: u8) -> bool {
-        self.map.read().unwrap()
+        if let Some(inner) = self.map.read().unwrap().get(name) {
+            if let Some(f) = inner.get(&arity) {
+                return f.pure;
+            }
+        }
+        // Fallback: check fn_cache for user-defined definitions.
+        if self.fn_cache.read().unwrap()
             .get(name).and_then(|inner| inner.get(&arity))
-            .map(|f| f.pure)
-            .unwrap_or(false)
+            .map_or(false, |clauses| !clauses.is_empty())
+        {
+            return true;
+        }
+        // Final fallback: check space (for test code that adds atoms directly).
+        let pat = crate::space::Pattern::Expr(vec![
+            crate::space::Pattern::Exact(Atom::sym("=")),
+            crate::space::Pattern::Expr(
+                std::iter::once(crate::space::Pattern::Exact(Atom::sym(name)))
+                    .chain((0..arity).map(|_| crate::space::Pattern::Any))
+                    .collect()
+            ),
+            crate::space::Pattern::Any,
+        ]);
+        !self.space.lock().unwrap().match_atoms(&pat).is_empty()
     }
 }
+
