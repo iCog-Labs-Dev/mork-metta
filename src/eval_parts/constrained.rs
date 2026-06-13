@@ -40,38 +40,73 @@ pub(crate) fn eval_constrained(
                 if !fname.starts_with('$') {
                     let arity = (items.len() - 1) as u8;
                     let args = &items[1..];
-                    if let Some(func) = funcs.get(fname, arity) {
-                        if let FunctionKind::UserDefined { clauses } = &func.kind {
-                            // Evaluate each arg with constraint awareness.
-                            let mut arg_streams: Vec<Vec<(Atom, Env)>> =
-                                Vec::with_capacity(args.len());
-                            for arg in args {
-                                arg_streams.push(eval_constrained(arg, env, funcs)?);
-                            }
-                            let combos = constrained_cartesian(arg_streams);
-                            let mut out: Vec<(Atom, Env)> = Vec::new();
-                            for (atom_args, arg_bindings) in &combos {
-                                // Env::new() isolates new bindings for accumulation.
-                                for (clause_bindings, clause) in
-                                    match_clauses(&clauses, atom_args, &Env::new(), funcs)?
-                                {
-                                    let full_env = prepend_env(clause_bindings.clone(), env);
-                                    for (atom, body_bindings) in
-                                        eval_constrained(&clause.body, &full_env, funcs)?
-                                    {
-                                        let accumulated = prepend_env(
-                                            body_bindings,
-                                            &prepend_env(clause_bindings.clone(), arg_bindings),
-                                        );
-                                        out.push((atom, accumulated));
+                    // Space-based dispatch for user-defined functions
+                    // (Native functions handled by fallthrough to eval)
+                    let mut arg_streams: Vec<Vec<(Atom, Env)>> =
+                        Vec::with_capacity(args.len());
+                    for arg in args {
+                        arg_streams.push(eval_constrained(arg, env, funcs)?);
+                    }
+                    let combos = constrained_cartesian(arg_streams);
+                    let mut out: Vec<(Atom, Env)> = Vec::new();
+                    // Look up cached clauses — fast path.
+                    let clauses: Vec<crate::func::Clause> = match funcs.fn_cache.read().unwrap()
+                        .get(fname.as_str()).and_then(|inner| inner.get(&(args.len() as u8)))
+                    {
+                        Some(c) => c.clone(),
+                        // Cache miss — try space (test code that adds atoms directly).
+                        None => {
+                            let mut cls: Vec<crate::func::Clause> = Vec::new();
+                            let pat = crate::space::Pattern::Expr(vec![
+                                crate::space::Pattern::Exact(Atom::sym("=")),
+                                crate::space::Pattern::Expr(
+                                    std::iter::once(crate::space::Pattern::Exact(Atom::sym(fname.as_str())))
+                                        .chain((0..args.len()).map(|_| crate::space::Pattern::Any))
+                                        .collect()
+                                ),
+                                crate::space::Pattern::Any,
+                            ]);
+                            let space_matches = funcs.space.lock().unwrap().match_atoms(&pat);
+                            for m in space_matches {
+                                if let Atom::Expr(items) = &m.atom {
+                                    if items.len() == 3 {
+                                        if let Ok(head_expr) = crate::parser::atom_to_expr(&items[1]) {
+                                            if let crate::parser::Expr::List(head_items) = &head_expr {
+                                                let patterns: Vec<crate::parser::Expr> = head_items[1..].to_vec();
+                                                let body = crate::parser::atom_to_expr(&items[2])
+                                                    .unwrap_or_else(|_| crate::parser::Expr::Symbol(items[2].to_sexpr_string()));
+                                                cls.push(crate::func::Clause { patterns, body });
+                                            }
+                                        }
                                     }
                                 }
                             }
-                            if !out.is_empty() {
-                                return Ok(out);
-                            }
-                            // No clause matched — fall through to eval for error message.
+                            if cls.is_empty() && !out.is_empty() { return Ok(out); }
+                            cls
                         }
+                    };
+                    for (atom_args, arg_bindings) in &combos {
+                        for clause in &clauses {
+                            let mut unif_env = crate::env::Env::new();
+                            let mut matched = true;
+                            for (pat, arg_val) in clause.patterns.iter().zip(atom_args.iter()) {
+                                match crate::eval_parts::pattern::try_match_one(pat, arg_val, &unif_env, funcs) {
+                                    Ok(Some(new_env)) => unif_env = new_env,
+                                    _ => { matched = false; break; }
+                                }
+                            }
+                            if !matched {
+                                continue;
+                            }
+                            let body_env = crate::eval_parts::pattern::prepend_env(unif_env, env);
+                            for (result_atom, body_bindings) in eval_constrained(&clause.body, &body_env, funcs)? {
+                                let accumulated = prepend_env(body_bindings, arg_bindings);
+                                out.push((result_atom, accumulated));
+                            }
+                        }
+                    }
+                    if !out.is_empty() {
+                        return Ok(out);
                     }
                 }
             }
