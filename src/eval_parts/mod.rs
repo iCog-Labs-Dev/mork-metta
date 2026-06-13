@@ -29,7 +29,9 @@ pub mod special;
 pub mod space_ops;
 pub mod io;
 pub mod python;
+pub mod machine;
 
 // Re-export public API (used by lib.rs)
 pub use core::{eval, eval_scope};
 pub use io::load_metta_file;
+pub use machine::{MachineState, unify, apply_substitution, calculate_cost};

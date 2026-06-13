@@ -28,6 +28,9 @@ pub mod space;
 #[cfg(feature = "plugins")]
 pub mod plugin;
 
+// Re-export machine state functions for Phase 1 testing
+pub use eval_parts::{MachineState, unify, apply_substitution, calculate_cost};
+
 use crate::atom::Atom;
 use crate::compile::compile_definition;
 use crate::env::Env;
