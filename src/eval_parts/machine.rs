@@ -51,8 +51,9 @@ pub struct MachineState {
     /// From spec Section 6.3: effort objects limit computation
     pub cost_budget: Option<i64>,
 
-    // Note: Knowledge base (k) is accessed via FnTable.space in the step() method
-    // We don't store it in MachineState to avoid Arc<RwLock<>> lifetime issues
+    /// Deferred RemAtom queue (Phase 5)
+    /// Spec Section 3.3: RemAtom2 rule shows queued removal with cost deferral
+    pub deferred_removals: VecDeque<Atom>,
 }
 
 /// Transition types from Meta-MeTTa spec (Section 3.3)
@@ -94,12 +95,27 @@ impl MachineState {
             workspace: VecDeque::new(),
             output: Vec::new(),
             cost_budget: budget,
+            deferred_removals: VecDeque::new(),
         }
     }
 
     /// Push a term into the input register (new query)
     pub fn push_input(&mut self, atom: Atom) {
         self.input.push_back(atom);
+    }
+
+    /// Calculate cost of a substitution per spec Section 6.3
+    /// Spec: c = Σᵢ#(σᵢ) + Σᵢ#(uᵢσᵢ)
+    /// This helper costs just the substitution part: #(σᵢ)
+    fn cost_substitution(subst: &HashMap<String, Atom>) -> i64 {
+        subst.values().map(calculate_cost).filter_map(|c| c).sum()
+    }
+
+    /// Calculate total cost of constructed terms from substitution
+    /// Given instantiated results from applying σ to body,
+    /// sum costs of all results. This is Σᵢ#(uᵢσᵢ) part of cost formula.
+    fn cost_results(results: &[Atom]) -> i64 {
+        results.iter().map(calculate_cost).filter_map(|c| c).sum()
     }
 
     /// Execute one transition step
@@ -141,24 +157,26 @@ impl MachineState {
     ///   2. Apply σ to body → get body[σ]
     ///   3. Evaluate body[σ] → get results
     ///   4. Add results to workspace
-    fn apply_query(&mut self, env: &Env, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
-        // Pick a term from input register
+    pub fn apply_query(&mut self, env: &Env, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
         let term = match self.input.pop_front() {
             Some(t) => t,
-            None => return Ok(None),  // No more input
+            None => return Ok(None),
         };
 
-        // Query knowledge base: find all matching definitions
-        let results = self.query_knowledge(&term, env, funcs)?;
+        let (results, subst_cost, result_cost) = self.query_knowledge_with_cost(&term, env, funcs)?;
 
-        // Add all results to workspace
         for r in results {
             self.workspace.push_back(r);
         }
 
-        // Cost = #(term) where # is polymorphic cost function
-        let cost = calculate_cost(&term);
-        Ok(cost)
+        // Cost per spec Section 6.3: c = Σᵢ#(σᵢ) + Σᵢ#(uᵢσᵢ)
+        let total_cost = subst_cost + result_cost;
+        if total_cost > 0 {
+            if let Some(budget) = self.cost_budget.as_mut() {
+                *budget -= total_cost;
+            }
+        }
+        Ok(if total_cost > 0 { Some(total_cost) } else { None })
     }
 
     /// Chain rule: match term in w against (= ...) in k → put results in w
@@ -173,95 +191,93 @@ impl MachineState {
     ///
     /// Matches workspace term against all (= head body) definitions in knowledge base.
     /// Same as Query, except source/sink both come from workspace.
-    fn apply_chain(&mut self, env: &Env, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
-        // Pick a term from workspace
+    pub fn apply_chain(&mut self, env: &Env, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
         let term = match self.workspace.pop_front() {
             Some(t) => t,
-            None => return Ok(None),  // No more work
+            None => return Ok(None),
         };
 
-        // Query knowledge base: find all matching definitions
-        let results = self.query_knowledge(&term, env, funcs)?;
+        let (results, subst_cost, result_cost) = self.query_knowledge_with_cost(&term, env, funcs)?;
 
-        // Add all results back to workspace
         for r in results {
             self.workspace.push_back(r);
         }
 
-        let cost = calculate_cost(&term);
-        Ok(cost)
+        // Cost per spec Section 6.3: c = Σᵢ#(σᵢ) + Σᵢ#(uᵢσᵢ)
+        let total_cost = subst_cost + result_cost;
+        if total_cost > 0 {
+            if let Some(budget) = self.cost_budget.as_mut() {
+                *budget -= total_cost;
+            }
+        }
+        Ok(if total_cost > 0 { Some(total_cost) } else { None })
     }
 
-    /// Helper: query_knowledge(term)
+    /// Helper: query_knowledge_with_cost(term)
     ///
     /// Core unification-and-evaluation loop for Query and Chain rules.
-    /// Spec Section 3.3 (pages 9-10).
+    /// Spec Section 3.3 (pages 9-10), Section 6.3 (cost model).
     ///
-    /// Algorithm:
-    /// 1. FOR EACH atom in k (knowledge base):
-    ///    a. Check if atom matches pattern (= head body)
-    ///    b. Unify term with head using Robinson's algorithm → substitution σ
-    ///    c. Apply σ to body → instantiated_body (body[σ] in spec notation)
-    ///    d. Evaluate instantiated_body → results
-    ///    e. Add all results to output vector
+    /// Returns (results, substitution_cost, result_cost) where:
+    /// - results: Vec<Atom> of all matching results
+    /// - substitution_cost: Σᵢ#(σᵢ) sum of unification costs
+    /// - result_cost: Σᵢ#(uᵢσᵢ) sum of result costs
     ///
-    /// Semantics:
-    /// - Unification: σ = unify(term, head) using Robinson's algorithm
-    /// - Substitution: apply σ to all variables in body (notation body[σ])
-    /// - Evaluation: recursively evaluate the instantiated body
-    /// - All matches: finds ALL atoms in k matching pattern, not just first
-    /// - Variable scoping: σ is local to each unification; different unifications
-    ///   don't share variable bindings
-    ///
-    /// Returns vector of all results from all matching definitions.
+    /// Total cost per spec: c = Σᵢ#(σᵢ) + Σᵢ#(uᵢσᵢ)
+    fn query_knowledge_with_cost(
+        &self,
+        term: &Atom,
+        env: &Env,
+        funcs: &crate::func::FnTable,
+    ) -> Result<(Vec<Atom>, i64, i64), String> {
+        let mut results = Vec::new();
+        let mut total_subst_cost: i64 = 0;
+        let mut total_result_cost: i64 = 0;
+
+        let atoms_snapshot: Vec<Atom> = {
+            let space = funcs.space.lock().unwrap();
+            space.get_atoms()
+        };
+
+        for atom in atoms_snapshot {
+            if let Atom::Expr(items) = &atom {
+                if items.len() == 3 && items[0] == Atom::sym("=") {
+                    let head = &items[1];
+                    let body = &items[2];
+
+                    if let Some(substitution) = unify(term, head) {
+                        let instantiated_body = apply_substitution(body, &substitution);
+
+                        match eval_in_context(&instantiated_body, env, funcs) {
+                            Ok(body_results) => {
+                                // Add substitution cost: #(σᵢ)
+                                total_subst_cost += Self::cost_substitution(&substitution);
+
+                                // Add result costs: #(uᵢσᵢ)
+                                total_result_cost += Self::cost_results(&body_results);
+
+                                results.extend(body_results);
+                            }
+                            Err(_) => {
+                                // Evaluation failed; skip this definition
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((results, total_subst_cost, total_result_cost))
+    }
+
+    /// Helper: query_knowledge(term) - backward-compat wrapper
     fn query_knowledge(
         &self,
         term: &Atom,
         env: &Env,
         funcs: &crate::func::FnTable,
     ) -> Result<Vec<Atom>, String> {
-        let mut results = Vec::new();
-
-        // Spec Section 3.3: k = {t1, ..., tn} ++ k'
-        // Get snapshot of all atoms in k (snapshot to avoid lock issues during iteration)
-        let atoms_snapshot: Vec<Atom> = {
-            let space = funcs.space.lock().unwrap();
-            space.get_atoms()
-        };
-
-        // Spec Section 3.3: for EACH atom in k matching the pattern
-        for atom in atoms_snapshot {
-            // Look for (= head body) definitions in k
-            if let Atom::Expr(items) = &atom {
-                if items.len() == 3 && items[0] == Atom::sym("=") {
-                    let head = &items[1];
-                    let body = &items[2];
-
-                    // Spec Section 3.3: σ = unify(term, (= head body))
-                    // Robinson's algorithm with occurs check
-                    if let Some(substitution) = unify(term, head) {
-                        // Spec Section 3.3: body[σ] (apply substitution to body)
-                        let instantiated_body = apply_substitution(body, &substitution);
-
-                        // Spec Section 3.3: evaluate body[σ] → get results
-                        // This calls back to the main eval loop to get results
-                        match eval_in_context(&instantiated_body, env, funcs) {
-                            Ok(body_results) => {
-                                // All results from evaluating this instantiated body
-                                // are added to the output
-                                results.extend(body_results);
-                            }
-                            Err(_) => {
-                                // If evaluation fails, this definition doesn't contribute results
-                                // Continue to next definition in k
-                            }
-                        }
-                    }
-                    // If unification fails, continue to next atom in k
-                }
-            }
-        }
-
+        let (results, _, _) = self.query_knowledge_with_cost(term, env, funcs)?;
         Ok(results)
     }
 
@@ -309,13 +325,24 @@ impl MachineState {
         // Collect all replacements before modifying knowledge base (atomic update)
         let mut replacements: Vec<(Atom, Atom)> = Vec::new();
         let mut transformed_atoms: Vec<Atom> = Vec::new();
+        let mut total_subst_cost: i64 = 0;
+        let mut total_result_cost: i64 = 0;
 
         // For each atom in k, try to match pattern
         // Spec Section 3.3: σi = unify(pattern, ti) for EACH atom ti
         for atom in &atoms_snapshot {
             if let Some(subst) = unify(atom, &pattern) {
+                // Cost of this unification: #(σᵢ)
+                total_subst_cost += Self::cost_substitution(&subst);
+
                 // Compute replacement[σ] - substitution application per spec notation
                 let new_atom = apply_substitution(&replacement, &subst);
+
+                // Cost of constructed result: #(uᵢσᵢ)
+                if let Some(c) = calculate_cost(&new_atom) {
+                    total_result_cost += c;
+                }
+
                 replacements.push((atom.clone(), new_atom.clone()));
                 transformed_atoms.push(new_atom);
             }
@@ -326,65 +353,77 @@ impl MachineState {
             let mut space = funcs.space.lock().unwrap();
 
             for (old_atom, new_atom) in replacements {
-                // Remove old atom; if this fails, abort entire transformation
                 space.remove_atom(&old_atom)?;
-
-                // Add new atom; if this fails, knowledge base is in inconsistent state
-                // (This is a limitation of current AtomSpace API; proper solution needs transaction support)
                 space.add_atom(&new_atom)?;
 
-                // If new atom is a function definition (= head body), register it
-                // This enables code evolution: transformed atoms become callable
                 if let Atom::Expr(items) = &new_atom {
                     if items.len() == 3 && items[0] == Atom::sym("=") {
                         let head = &items[1];
                         let body = &items[2];
-
-                        // Extract function name from head for registration
                         register_function_definition(head, body, funcs)?;
                     }
                 }
             }
         }
 
-        // Add all transformed atoms to workspace per spec
-        // Spec Section 3.3: result is w ++ {K1[uσ1]} ++ ... ++ {Kn[uσn]}
-        // Note: K[·] context handling deferred to Phase 5+
         for atom in transformed_atoms {
             self.workspace.push_back(atom);
         }
 
-        // Cost calculation per spec Section 6.3:
-        // c = Σi#(σi) + Σi#(uiσi) (sum of substitution costs + replacement costs)
-        // Current implementation: simplified cost model (Phase 5)
-        // TODO: implement full polymorphic cost function from spec
-        let cost = calculate_cost(&pattern);
-        Ok(cost)
+        // Cost per spec Section 6.3: c = Σᵢ#(σᵢ) + Σᵢ#(uᵢσᵢ)
+        let total_cost = total_subst_cost + total_result_cost;
+        if total_cost > 0 {
+            if let Some(budget) = self.cost_budget.as_mut() {
+                *budget -= total_cost;
+            }
+        }
+        Ok(if total_cost > 0 { Some(total_cost) } else { None })
     }
 
     /// AddAtom rule: add atom to k
-    /// Spec Section 3.3, page 11
-    fn apply_add_atom(&mut self, atom: Atom, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
+    /// Spec Section 3.3, page 11; Section 6.3 cost model
+    /// Cost: c = #(atom) per spec (AddAtom1 rule shows #(t))
+    pub fn apply_add_atom(&mut self, atom: Atom, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
         funcs.space.lock().unwrap().add_atom(&atom)?;
-        Ok(Some(10))  // AddAtom has fixed cost
+        let cost = calculate_cost(&atom);
+        if let Some(c) = cost {
+            if let Some(budget) = self.cost_budget.as_mut() {
+                *budget -= c;
+            }
+        }
+        Ok(cost)
     }
 
     /// RemAtom rule: remove atom from k
-    /// Spec Section 3.3, page 11
-    fn apply_remove_atom(&mut self, atom: Atom, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
+    /// Spec Section 3.3, page 11; Section 6.3 cost model
+    /// Cost: c = #(atom) per spec (RemAtom1 rule shows #(t))
+    pub fn apply_remove_atom(&mut self, atom: Atom, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
         funcs.space.lock().unwrap().remove_atom(&atom)?;
-        Ok(Some(10))  // RemAtom has fixed cost
+        let cost = calculate_cost(&atom);
+        if let Some(c) = cost {
+            if let Some(budget) = self.cost_budget.as_mut() {
+                *budget -= c;
+            }
+        }
+        Ok(cost)
     }
 
     /// Output rule: move result from w to o
-    /// Spec Section 3.3, page 12
-    /// Output rule: move result from w to o
-    fn apply_output(&mut self) -> Result<Option<i64>, String> {
-        // Move one result from workspace to output
+    /// Spec Section 3.3, page 12; Section 6.3 cost model
+    /// Cost: c = #(u) where u is the term being output (per OUTPUT rule spec)
+    pub fn apply_output(&mut self) -> Result<Option<i64>, String> {
         if let Some(term) = self.workspace.pop_front() {
+            let cost = calculate_cost(&term);
             self.output.push(term);
+            if let Some(c) = cost {
+                if let Some(budget) = self.cost_budget.as_mut() {
+                    *budget -= c;
+                }
+            }
+            Ok(cost)
+        } else {
+            Ok(None)
         }
-        Ok(None)  // Output rule has no cost
     }
 
     /// Check if we should continue: budget remaining and work available
@@ -608,6 +647,31 @@ pub fn calculate_cost(atom: &Atom) -> Option<i64> {
         }
         Atom::Closure(_) => Some(5),       // Closure: cost 5
     }
+}
+
+/// Size-based cost variant (Phase 5)
+/// Cost proportional to serialized representation length
+pub fn calculate_cost_size(atom: &Atom) -> Option<i64> {
+    let s = atom.to_sexpr_string();
+    Some(((s.len() as i64) + 9) / 10)
+}
+
+/// Complexity-variant cost (Phase 5)
+/// Penalizes deeply nested structures
+pub fn calculate_cost_complexity(atom: &Atom) -> Option<i64> {
+    fn cost_depth(a: &Atom, depth: i64) -> i64 {
+        match a {
+            Atom::Sym(_) | Atom::Num(_) | Atom::Closure(_) => 1,
+            Atom::Expr(items) => {
+                let base = 1 + depth;
+                let child_costs: i64 = items.iter()
+                    .map(|item| cost_depth(item, depth + 1))
+                    .sum();
+                base + child_costs
+            }
+        }
+    }
+    Some(cost_depth(atom, 0))
 }
 
 #[cfg(test)]
