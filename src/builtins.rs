@@ -4,16 +4,33 @@
 /// macro-registered — one line per function.
 
 use crate::atom::Atom;
-use crate::func::{Clause, FnTable, FunctionKind, NDet};
+use crate::func::{FnTable, FunctionKind, NDet};
 use crate::parser::Expr;
 
 macro_rules! bool_clause {
     ($table:ident, $name:expr, [$($p:expr),+], $body:expr) => {
-        $table.add_clause(
-            $name.to_string(),
-            vec![$( Expr::Symbol($p.to_string()) ),+],
-            Expr::Symbol($body.to_string()),
-        );
+        let head = Expr::List(vec![
+            Expr::Symbol($name.to_string()),
+            $(Expr::Symbol($p.to_string())),+
+        ]);
+        let body = Expr::Symbol($body.to_string());
+        let def_expr = Expr::List(vec![
+            Expr::Symbol("=".to_string()),
+            head.clone(),
+            body,
+        ]);
+        let def_atom = crate::parser::expr_to_atom(&def_expr);
+        $table.space.lock().unwrap().add_atom(&def_atom).unwrap();
+        // Also store bare head atom for match premise lookup
+        let head_atom = crate::parser::expr_to_atom(&head);
+        $table.space.lock().unwrap().add_atom(&head_atom).unwrap();
+        // Populate fn_cache for fast concurrent dispatch
+        let clause = crate::func::Clause {
+            patterns: vec![$(Expr::Symbol($p.to_string())),+],
+            body: Expr::Symbol($body.to_string()),
+        };
+        let arity = clause.patterns.len() as u8;
+        $table.cache_fn($name, arity, clause);
     };
 }
 
@@ -688,9 +705,6 @@ pub fn register_builtins(table: &FnTable) {
                 .ok_or_else(|| format!("foldl: function {} with arity 2 not found", fname))?;
             let func_ptr = match &func_ref.kind {
                 FunctionKind::Native { func } => func.clone(),
-                FunctionKind::UserDefined { .. } => {
-                    return Err("foldl: only native functions supported as first argument".into());
-                }
             };
             drop(func_ref);
             let mut result = func_ptr(&[acc, item.clone()], table)?;
@@ -712,34 +726,24 @@ pub fn register_builtins(table: &FnTable) {
             Atom::Sym(s) => s.clone(),
             _ => return Err("foldl-atom: last arg must be a symbol (function name)".into()),
         };
-        let func = table.get(&fname, 2)
-            .ok_or_else(|| format!("foldl-atom: function {} with arity 2 not found", fname))?;
-        if let FunctionKind::Native { func: func_ptr } = &func.kind {
-            for item in &items {
-                let mut result = func_ptr(&[acc, item.clone()], table)?;
-                acc = result.next().ok_or_else(|| "foldl-atom: function produced no results".to_string())?;
-            }
-            return Ok(NDet::single(acc));
-        }
-        let clauses = match &func.kind {
-            FunctionKind::UserDefined { clauses } => clauses.clone(),
-            _ => return Err("foldl-atom: unsupported function kind".into()),
-        };
-        drop(func);
-        for item in &items {
-            let args = [acc.clone(), item.clone()];
-            let mut matched = None;
-            for clause in &clauses {
-                if let Some(match_env) = crate::eval_parts::pattern::try_match_clause(
-                    &clause.patterns, &args, &crate::env::Env::new(), table
-                )? {
-                    matched = Some((clause, match_env));
-                    break;
+        if let Some(func) = table.get(&fname, 2) {
+            if let FunctionKind::Native { func: func_ptr } = &func.kind {
+                for item in &items {
+                    let mut result = func_ptr(&[acc, item.clone()], table)?;
+                    acc = result.next().ok_or_else(|| "foldl-atom: function produced no results".to_string())?;
                 }
+                return Ok(NDet::single(acc));
             }
-            let (clause, match_env) = matched.ok_or_else(|| "foldl-atom: no matching clause for args".to_string())?;
-            let mut result = crate::eval_parts::core::eval(&clause.body, &match_env, table)?;
-            acc = result.next().ok_or_else(|| "foldl-atom: clause body produced no results".to_string())?;
+        }
+        // Fallback: use space-based dispatch via normal eval path
+        for item in &items {
+            let call = crate::parser::Expr::List(vec![
+                crate::parser::Expr::Symbol(fname.to_string()),
+                crate::parser::atom_to_expr(&acc).map_err(|e| format!("foldl-atom: {}", e))?,
+                crate::parser::atom_to_expr(item).map_err(|e| format!("foldl-atom: {}", e))?,
+            ]);
+            let mut result = crate::eval_parts::core::eval(&call, &crate::env::Env::new(), table)?;
+            acc = result.next().ok_or_else(|| "foldl-atom: fold function call produced no results".to_string())?;
         }
         Ok(NDet::single(acc))
     });
@@ -818,9 +822,6 @@ pub fn register_builtins(table: &FnTable) {
                 .ok_or_else(|| format!("maplist: function {} with arity 1 not found", fname))?;
             let func_ptr = match &func_ref.kind {
                 FunctionKind::Native { func } => func.clone(),
-                FunctionKind::UserDefined { .. } => {
-                    return Err("maplist: only native functions supported as first argument".into());
-                }
             };
             drop(func_ref);
             let mut result = func_ptr(&[item.clone()], table)?;
@@ -847,9 +848,6 @@ pub fn register_builtins(table: &FnTable) {
                 .ok_or_else(|| format!("filter-atom: function {} with arity 1 not found", fname))?;
             let func_ptr = match &func_ref.kind {
                 FunctionKind::Native { func } => func.clone(),
-                FunctionKind::UserDefined { .. } => {
-                    return Err("filter-atom: only native functions supported as first argument".into());
-                }
             };
             drop(func_ref);
             let mut result = func_ptr(&[item.clone()], table)?;
