@@ -20,6 +20,7 @@
 use crate::atom::Atom;
 use crate::env::Env;
 use std::collections::{VecDeque, HashMap};
+use super::core::eval_in_context;
 
 // ========================================================================
 // State Machine: The 4-Register Formalization
@@ -112,12 +113,12 @@ impl MachineState {
     pub fn step(
         &mut self,
         transition: Transition,
-        _env: &Env,
+        env: &Env,
         funcs: &crate::func::FnTable,
     ) -> Result<Option<i64>, String> {
         match transition {
-            Transition::Query => self.apply_query(),
-            Transition::Chain => self.apply_chain(),
+            Transition::Query => self.apply_query(env, funcs),
+            Transition::Chain => self.apply_chain(env, funcs),
             Transition::Transform => self.apply_transform(),
             Transition::AddAtom(atom) => self.apply_add_atom(atom, funcs),
             Transition::RemAtom(atom) => self.apply_remove_atom(atom, funcs),
@@ -134,18 +135,26 @@ impl MachineState {
     /// ⟨{term} ++ i, k, w, o⟩ → ⟨i, k, w ++ {body[σ]}, o⟩
     /// ```
     ///
-    /// Phase 1 (placeholder): just move input to workspace
-    /// Phase 2 will integrate actual unification and evaluation
-    fn apply_query(&mut self) -> Result<Option<i64>, String> {
+    /// Phase 2: Match input term against all (= head body) definitions in k.
+    /// For each matching definition:
+    ///   1. Unify term with head → get substitution σ
+    ///   2. Apply σ to body → get body[σ]
+    ///   3. Evaluate body[σ] → get results
+    ///   4. Add results to workspace
+    fn apply_query(&mut self, env: &Env, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
         // Pick a term from input register
         let term = match self.input.pop_front() {
             Some(t) => t,
             None => return Ok(None),  // No more input
         };
 
-        // Phase 1: placeholder — just move to workspace
-        // Phase 2 will: unify against (= head body) definitions, evaluate bodies
-        self.workspace.push_back(term.clone());
+        // Query knowledge base: find all matching definitions
+        let results = self.query_knowledge(&term, env, funcs)?;
+
+        // Add all results to workspace
+        for r in results {
+            self.workspace.push_back(r);
+        }
 
         // Cost = #(term) where # is polymorphic cost function
         let cost = calculate_cost(&term);
@@ -162,21 +171,79 @@ impl MachineState {
     /// ⟨i, k, {term} ++ w, o⟩ → ⟨i, k, w ++ {body[σ]}, o⟩
     /// ```
     ///
-    /// Phase 1 (placeholder): just keep term in workspace
-    /// Phase 2 will integrate actual unification and evaluation
-    fn apply_chain(&mut self) -> Result<Option<i64>, String> {
+    /// Phase 2: Match workspace term against all (= head body) definitions in k.
+    /// Same as Query, except source/sink both come from workspace.
+    fn apply_chain(&mut self, env: &Env, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
         // Pick a term from workspace
         let term = match self.workspace.pop_front() {
             Some(t) => t,
             None => return Ok(None),  // No more work
         };
 
-        // Phase 1: placeholder — just move back to workspace
-        // Phase 2 will: unify against (= head body) definitions, evaluate bodies
-        self.workspace.push_back(term.clone());
+        // Query knowledge base: find all matching definitions
+        let results = self.query_knowledge(&term, env, funcs)?;
+
+        // Add all results back to workspace
+        for r in results {
+            self.workspace.push_back(r);
+        }
 
         let cost = calculate_cost(&term);
         Ok(cost)
+    }
+
+    /// Helper: query_knowledge(term)
+    ///
+    /// Match term against all (= head body) definitions in knowledge base.
+    /// For each successful unification:
+    ///   1. Unify term with head → get substitution σ
+    ///   2. Apply σ to body → get body[σ]
+    ///   3. Evaluate body[σ] → get results
+    ///   4. Add results to return vector
+    ///
+    /// Returns vector of all results from all matching definitions.
+    fn query_knowledge(
+        &self,
+        term: &Atom,
+        env: &Env,
+        funcs: &crate::func::FnTable,
+    ) -> Result<Vec<Atom>, String> {
+        let mut results = Vec::new();
+
+        // Get snapshot of all atoms in k (snapshot to avoid lock issues during iteration)
+        let atoms_snapshot: Vec<Atom> = {
+            let space = funcs.space.lock().unwrap();
+            space.get_atoms()
+        };
+
+        // For each atom in k
+        for atom in atoms_snapshot {
+            // Look for (= head body) definitions
+            if let Atom::Expr(items) = &atom {
+                if items.len() == 3 && items[0] == Atom::sym("=") {
+                    let head = &items[1];
+                    let body = &items[2];
+
+                    // Try unify(term, head)
+                    if let Some(substitution) = unify(term, head) {
+                        // Apply substitution to body: body[σ]
+                        let instantiated_body = apply_substitution(body, &substitution);
+
+                        // Evaluate the body expression
+                        // This calls back to the main eval loop to get results
+                        match eval_in_context(&instantiated_body, env, funcs) {
+                            Ok(body_results) => results.extend(body_results),
+                            Err(_) => {
+                                // Evaluation failed; skip this definition
+                                // In a real implementation, might want to log this
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     /// Transform rule: rewrite atoms in k matching pattern

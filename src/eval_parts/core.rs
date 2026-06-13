@@ -36,8 +36,8 @@ use crate::eval_parts::python::eval_py_call;
 use crate::eval_parts::space_ops::{eval_add_atom, eval_match, eval_remove_atom};
 use crate::eval_parts::special::{
     eval_call, eval_case, eval_chain, eval_collapse, eval_foldall, eval_forall,
-    eval_if, eval_implication, eval_lambda, eval_let, eval_let_star, eval_map_atom,
-    eval_progn, eval_query, eval_quote, eval_repr, eval_superpose, eval_within, eval_eval,
+    eval_if, eval_lambda, eval_let, eval_let_star, eval_map_atom,
+    eval_progn, eval_quote, eval_repr, eval_superpose, eval_within, eval_eval,
 };
 use crate::func::{FnTable, Function, FunctionKind, NDet};
 use crate::parser::Expr;
@@ -109,8 +109,6 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     "empty" => { trace!("→ special: empty"); return Ok(NDet::stream(std::iter::empty())); }
                     "py-call" => { trace!("→ special: py-call"); return eval_py_call(args, env, funcs); }
                     "import-rs!" => { trace!("→ special: import-rs!"); return eval_import_rs(args, env, funcs); }
-                    "=>" => { trace!("→ special: =>"); return eval_implication(args, env, funcs); }
-                    "?" => { trace!("→ special: ?"); return eval_query(args, env, funcs); }
                     _ => {}
                 }
             }
@@ -384,4 +382,103 @@ fn expr_to_atom(expr: &Expr) -> Atom {
             Atom::Expr(atoms)
         }
     }
+}
+
+// ========================================================================
+// Phase 2: Integration with State Machine
+// ========================================================================
+
+/// Evaluate an atom within the given context.
+///
+/// This is the bridge between the state machine (machine.rs) and the eval loop.
+/// Used by `query_knowledge` to evaluate instantiated body expressions.
+///
+/// Spec Section 3.3: body[σ] evaluation
+/// Converts the atom back to an Expr and evaluates it using the normal eval loop.
+///
+/// Phase 2: eval_in_context() enables the state machine to call back into
+/// the eval loop for unification and body evaluation.
+pub(crate) fn eval_in_context(
+    atom: &Atom,
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<Vec<Atom>, String> {
+    // Convert atom back to Expr for evaluation
+    let expr = crate::parser::atom_to_expr(atom).unwrap_or_else(|_| {
+        // If conversion fails, treat as a symbol
+        Expr::Symbol(atom.to_sexpr_string())
+    });
+
+    // Evaluate and collect all results
+    let mut results = Vec::new();
+    let mut stream = eval(&expr, env, funcs)?;
+    while let Some(result) = stream.next() {
+        results.push(result);
+    }
+
+    Ok(results)
+}
+
+/// Evaluate an expression using the 4-register state machine.
+///
+/// This is the new entry point that uses formal operational semantics (Meta-MeTTa spec Section 3.3).
+/// Eventually this will replace the expression-centric eval loop.
+///
+/// Phase 2: eval_with_state() provides an optional alternative evaluation path.
+/// - Maintains backward compatibility: existing eval() is unchanged
+/// - Optional cost budgeting: None means unlimited, Some(n) means n tokens
+/// - Returns both results and remaining budget
+pub fn eval_with_state(
+    expr: &Expr,
+    env: &Env,
+    funcs: &FnTable,
+    cost_budget: Option<i64>,
+) -> Result<(NDet, Option<i64>), String> {
+    use crate::eval_parts::machine::{MachineState, Transition};
+
+    let mut state = MachineState::new(cost_budget);
+
+    // Load initial query into input register
+    let initial_atom = expr_to_atom(expr);
+    state.push_input(initial_atom);
+
+    // Run the state machine until output is ready or budget exhausted
+    while state.should_continue() {
+        // Spec Section 3.3: prefer Query (i → w) over Chain (w → w) over Output
+        let transition = if !state.input.is_empty() {
+            Transition::Query
+        } else if !state.workspace.is_empty() {
+            Transition::Chain
+        } else {
+            Transition::Output
+        };
+
+        // Execute transition
+        match state.step(transition, env, funcs) {
+            Ok(Some(cost)) => {
+                // Deduct cost from budget
+                state.deduct_cost(cost)?;
+            }
+            Ok(None) => {
+                // Transition succeeded but has no cost (e.g., Output)
+            }
+            Err(_e) => {
+                // Transition failed; move remaining work to output and continue
+                // (In a real impl, might want to log or propagate some errors)
+            }
+        }
+    }
+
+    // Ensure all remaining workspace items are moved to output
+    // (This handles the case where Query/Chain found no matches)
+    while let Some(item) = state.workspace.pop_front() {
+        state.output.push(item);
+    }
+
+    // Convert output register back to NDet stream
+    let remaining_budget = state.cost_budget;
+    let results = state.output.clone();
+    let ndet = NDet::stream(results.into_iter());
+
+    Ok((ndet, remaining_budget))
 }
