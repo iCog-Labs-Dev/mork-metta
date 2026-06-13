@@ -153,6 +153,10 @@ fn try_call_or_data(
                     return match funcs.get(func_name, args.len() as u8) {
                         Some(func) => call_with_cloned(&*func, func_name, args, env, funcs),
                         None => {
+                            // Try space-based function dispatch before treating as data
+                            if let Some(result) = try_eval_from_space(func_name, args, env, funcs)? {
+                                return Ok(result);
+                            }
                             trace!("→ unknown symbol '{}', treating as data list", s);
                             eval_data_list(all_items, env, funcs)
                         }
@@ -178,6 +182,10 @@ fn try_call_or_data(
                 return match funcs.get(s, args.len() as u8) {
                     Some(func) => call_with_cloned(&*func, s, args, env, funcs),
                     None => {
+                        // Try space-based function dispatch before treating as data
+                        if let Some(result) = try_eval_from_space(s, args, env, funcs)? {
+                            return Ok(result);
+                        }
                         trace!("→ unknown symbol '{}', treating as data list", s);
                         eval_data_list(all_items, env, funcs)
                     }
@@ -194,6 +202,10 @@ fn try_call_or_data(
                     match funcs.get(&func_name, args.len() as u8) {
                         Some(func) => call_with_cloned(&*func, &func_name, args, env, funcs),
                         None => {
+                            // Try space-based function dispatch before treating as data
+                            if let Some(result) = try_eval_from_space(&func_name, args, env, funcs)? {
+                                return Ok(result);
+                            }
                             let head = Some(Atom::Sym(func_name));
                             eval_data_list_with_head(head.unwrap(), args, env, funcs)
                         }
@@ -256,6 +268,167 @@ pub(crate) fn apply_closure(
     eval(body, &full_env, funcs)
 }
 
+/// Try to resolve a function call from (= ...) definitions in the space.
+///
+/// When a symbol+arity doesn't match any native FnTable entry, we fall back
+/// to querying the atom space for user-defined function definitions.
+/// Each matching definition produces its instantiated body (stored `$vars`
+/// already substituted) which is then evaluated.
+///
+/// Returns `Ok(Some(NDet))` if at least one definition was found,
+/// `Ok(None)` if no matching definition exists in the space.
+/// Fallback when fn_cache misses: query the space directly.
+/// Needed when atoms were added to space without going through
+/// the normal add-atom path (e.g. test code that adds atoms directly).
+fn try_eval_from_space_fallback(
+    name: &str,
+    args: &[Expr],
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<Option<NDet>, String> {
+    use crate::eval_parts::constrained::cartesian_product;
+
+    let mut head_patterns: Vec<crate::space::Pattern> = vec![
+        crate::space::Pattern::Exact(Atom::sym(name))
+    ];
+    for _ in 0..args.len() {
+        head_patterns.push(crate::space::Pattern::Any);
+    }
+    let def_pattern = crate::space::Pattern::Expr(vec![
+        crate::space::Pattern::Exact(Atom::sym("=")),
+        crate::space::Pattern::Expr(head_patterns),
+        crate::space::Pattern::Any,
+    ]);
+
+    let matches = funcs.space.lock().unwrap().match_atoms(&def_pattern);
+    if matches.is_empty() {
+        return Ok(None);
+    }
+
+    let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(args.len());
+    for arg in args {
+        let mut results = eval(arg, env, funcs)?;
+        let vals: Vec<Atom> = results.by_ref().collect();
+        if vals.is_empty() {
+            return Ok(None);
+        }
+        arg_options.push(vals);
+    }
+
+    let combos = cartesian_product(&arg_options);
+    let mut streams: Vec<NDet> = Vec::new();
+
+    for arg_vals in &combos {
+        for m in &matches {
+            let (def_head_patterns, body) = match &m.atom {
+                Atom::Expr(items) if items.len() == 3 => {
+                    match &items[1] {
+                        Atom::Expr(head_items) if head_items.len() == args.len() + 1 => {
+                            (&head_items[1..], &items[2])
+                        }
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+
+            let mut unif_env = crate::env::Env::new();
+            let mut matched = true;
+            for (head_pat, arg_val) in def_head_patterns.iter().zip(arg_vals.iter()) {
+                let head_expr = crate::parser::atom_to_expr(head_pat)
+                    .unwrap_or_else(|_| crate::parser::Expr::Symbol(head_pat.to_sexpr_string()));
+                match crate::eval_parts::pattern::try_match_one(&head_expr, arg_val, &unif_env, funcs) {
+                    Ok(Some(new_env)) => unif_env = new_env,
+                    _ => { matched = false; break; }
+                }
+            }
+            if !matched {
+                continue;
+            }
+
+            let body_env = crate::eval_parts::pattern::prepend_env(unif_env, env);
+            let body_expr = crate::parser::atom_to_expr(body)
+                .unwrap_or_else(|_| crate::parser::Expr::Symbol(body.to_sexpr_string()));
+            let mut stream = eval(&body_expr, &body_env, funcs)?;
+            let results: Vec<Atom> = stream.by_ref().collect();
+            if !results.is_empty() {
+                streams.push(NDet::Stream(Box::new(results.into_iter())));
+            }
+        }
+    }
+
+    if streams.is_empty() {
+        Err(format!("no matching clause for ({})", name))
+    } else {
+        Ok(Some(NDet::stream(streams.into_iter().flatten())))
+    }
+}
+
+fn try_eval_from_space(
+    name: &str,
+    args: &[Expr],
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<Option<NDet>, String> {
+    use crate::eval_parts::constrained::cartesian_product;
+
+    // Look up cached clauses — fast path with no space lock.
+    let arity = args.len() as u8;
+    let clauses: Vec<crate::func::Clause> = match funcs.fn_cache.read().unwrap()
+        .get(name).and_then(|inner| inner.get(&arity))
+    {
+        Some(c) => c.clone(),
+        None => {
+            // Cache miss — try to populate from space (e.g. test code that
+            // added atoms directly). This is slower but ensures correctness.
+            return try_eval_from_space_fallback(name, args, env, funcs);
+        }
+    };
+
+    // Evaluate each argument to collect all result alternatives.
+    let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(args.len());
+    for arg in args {
+        let mut results = eval(arg, env, funcs)?;
+        let vals: Vec<Atom> = results.by_ref().collect();
+        if vals.is_empty() {
+            return Ok(None);
+        }
+        arg_options.push(vals);
+    }
+
+    let combos = cartesian_product(&arg_options);
+    let mut streams: Vec<NDet> = Vec::new();
+
+    for arg_vals in &combos {
+        for clause in &clauses {
+            let mut unif_env = crate::env::Env::new();
+            let mut matched = true;
+            for (pat, arg_val) in clause.patterns.iter().zip(arg_vals.iter()) {
+                match crate::eval_parts::pattern::try_match_one(pat, arg_val, &unif_env, funcs) {
+                    Ok(Some(new_env)) => unif_env = new_env,
+                    _ => { matched = false; break; }
+                }
+            }
+            if !matched {
+                continue;
+            }
+
+            let body_env = crate::eval_parts::pattern::prepend_env(unif_env, env);
+            let mut stream = eval(&clause.body, &body_env, funcs)?;
+            let results: Vec<Atom> = stream.by_ref().collect();
+            if !results.is_empty() {
+                streams.push(NDet::Stream(Box::new(results.into_iter())));
+            }
+        }
+    }
+
+    if streams.is_empty() {
+        Err(format!("no matching clause for ({})", name))
+    } else {
+        Ok(Some(NDet::stream(streams.into_iter().flatten())))
+    }
+}
+
 /// Dispatch a function call using a borrowed Function.
 pub(crate) fn call_with_cloned(
     func: &Function,
@@ -266,19 +439,13 @@ pub(crate) fn call_with_cloned(
 ) -> Result<NDet, String> {
     let name = func.name.clone();
     let is_native = matches!(&func.kind, FunctionKind::Native { .. });
-    let clauses: &[crate::func::Clause] = match &func.kind {
-        FunctionKind::UserDefined { clauses } => clauses,
-        FunctionKind::Native { .. } => &[],
-    };
     let native_func: Option<Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static>> = match &func.kind {
         FunctionKind::Native { func: f } => Some(Arc::clone(f)),
-        FunctionKind::UserDefined { .. } => None,
     };
     trace_enter!("call: {} ({} args)", name, args.len());
 
     // Parallel arg eval is safe only when the ARGUMENT expressions themselves
     // are pure — the callee's purity is irrelevant here, since impure args
-    // (add-atom, println!, match, ...) must run in program order. It's
     // worthwhile only when ≥2 args are compound AND the pool isn't already
     // saturated (try_fork): recursive functions would otherwise fork at every
     // level, drowning the work in task-scheduling overhead.
@@ -324,52 +491,34 @@ pub(crate) fn call_with_cloned(
         arg_options
     };
 
-    let cartesian = cartesian_product(&arg_options);
-
-    if is_native {
-        if let Some(f) = native_func {
-            let mut results = Vec::new();
-            let mut last_err: Option<String> = None;
-            for args_slice in cartesian {
-                match f(&args_slice, funcs) {
-                    Ok(mut nd) => {
-                        while let Some(a) = nd.next() {
-                            results.push(a);
-                        }
+    if let Some(f) = native_func {
+        let cartesian = cartesian_product(&arg_options);
+        let mut results = Vec::new();
+        let mut last_err: Option<String> = None;
+        for args_slice in cartesian {
+            match f(&args_slice, funcs) {
+                Ok(mut nd) => {
+                    while let Some(a) = nd.next() {
+                        results.push(a);
                     }
-                    Err(e) => { last_err = Some(e); }
                 }
+                Err(e) => { last_err = Some(e); }
             }
-            if results.is_empty() {
-                if let Some(e) = last_err {
-                    trace_exit!();
-                    return Err(e);
-                }
-            }
-            trace_exit!();
-            return Ok(NDet::Stream(Box::new(results.into_iter())));
         }
+        if results.is_empty() {
+            if let Some(e) = last_err {
+                trace_exit!();
+                return Err(e);
+            }
+        }
+        trace_exit!();
+        return Ok(NDet::Stream(Box::new(results.into_iter())));
     }
 
-    let mut streams: Vec<NDet> = Vec::new();
-    for arg_vals in &cartesian {
-        for (new_env, clause) in match_clauses(&clauses, arg_vals, env, funcs)? {
-            streams.push(eval(&clause.body, &new_env, funcs)?);
-        }
-    }
-    if streams.is_empty() {
-        let example: Vec<String> = arg_options.iter()
-            .filter_map(|opts| opts.first())
-            .map(|a| a.to_sexpr_string())
-            .collect();
-        return Err(format!(
-            "{}: no matching clause for args [{}]",
-            name,
-            example.join(", ")
-        ));
-    }
+    // No native function found — shouldn't reach here since call_with_cloned
+    // is only called when funcs.get() returns Some(...)
     trace_exit!();
-    Ok(NDet::stream(streams.into_iter().flatten()))
+    Err(format!("{}: internal error — missing native function", name))
 }
 
 /// Convert an `Expr` to an `Atom` for tracing output.
@@ -469,9 +618,11 @@ pub fn eval_with_state(
         }
     }
 
-    // Ensure all remaining workspace items are moved to output
-    // (This handles the case where Query/Chain found no matches)
+    // Preserve any remaining work for inspection (budget exhausted or didn't match)
     while let Some(item) = state.workspace.pop_front() {
+        state.output.push(item);
+    }
+    while let Some(item) = state.input.pop_front() {
         state.output.push(item);
     }
 
