@@ -3,14 +3,13 @@
 /// The `Space` trait is the core abstraction: a store of S-expression atoms
 /// that supports add, remove, match, and enumeration.
 ///
-/// Two implementations:
-/// - `LocalSpace` — simple `Vec`-based storage (no dependencies)
-/// - `MorkSpace` — wraps MORK's `PathMap` trie (requires `mork` feature)
+/// Single implementation:
+/// - `MorkSpace` — wraps MORK's `PathMap` trie (the single source of truth).
 
-use std::collections::HashMap;
-use std::sync::RwLock;
 use crate::atom::Atom;
 use crate::parser::Expr;
+
+use pathmap::zipper::{ZipperMoving, ZipperIteration, ZipperAbsolutePath};
 
 /// A pattern for matching against atoms in a space.
 ///
@@ -101,265 +100,56 @@ pub trait Space: Send + Sync {
 }
 
 // ========================================================================
-// LocalSpace — HashMap-indexed storage, no dependencies
-// ========================================================================
-
-/// Extract the index key `(functor, list_len)` for an atom, if it has one.
-/// Only `Atom::Expr` starting with a `Sym` is indexable.
-fn index_key(atom: &Atom) -> Option<(String, usize)> {
-    if let Atom::Expr(items) = atom {
-        if let Some(Atom::Sym(f)) = items.first() {
-            return Some((f.to_string(), items.len()));
-        }
-    }
-    None
-}
-
-/// Extract the index key a pattern can use for O(1) candidate lookup.
-/// Returns `None` when the first position is a wildcard/variable — full scan required.
-fn pattern_index_key(pattern: &Pattern) -> Option<(String, usize)> {
-    match pattern {
-        Pattern::Expr(pats) => match pats.first()? {
-            Pattern::Exact(Atom::Sym(f)) => Some((f.to_string(), pats.len())),
-            _ => None,
-        },
-        Pattern::Exact(Atom::Expr(items)) => match items.first()? {
-            Atom::Sym(f) => Some((f.to_string(), items.len())),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// In-memory space indexed by `(functor, list_length)` for O(1) candidate lookup.
-///
-/// `(foo arg1 arg2)` atoms are stored in a bucket keyed by `("foo", 3)`.
-/// A pattern `(foo $x $y)` resolves to that bucket directly instead of scanning
-/// the entire space — matching k candidates instead of n total atoms.
-/// Bare `Sym`, `Num`, and non-symbol-headed `Expr` atoms fall into a scalar fallback.
-#[derive(Default)]
-pub struct LocalSpace {
-    indexed: std::sync::Mutex<HashMap<(String, usize), Vec<Atom>>>,
-    scalars: std::sync::Mutex<Vec<Atom>>,
-    /// O(1) existence check for exact atom membership.
-    has: std::sync::Mutex<std::collections::HashSet<Atom>>,
-}
-
-impl LocalSpace {
-    pub fn new() -> Self { Self::default() }
-    pub fn new_box() -> Box<dyn Space + Send + Sync> { Box::new(Self::default()) }
-}
-
-impl Space for LocalSpace {
-    fn add_atom(&self, atom: &Atom) -> Result<(), String> {
-        self.has.lock().unwrap().insert(atom.clone());
-        if let Some(key) = index_key(atom) {
-            self.indexed.lock().unwrap().entry(key).or_default().push(atom.clone());
-        } else {
-            self.scalars.lock().unwrap().push(atom.clone());
-        }
-        Ok(())
-    }
-
-    fn remove_atom(&self, atom: &Atom) -> Result<bool, String> {
-        self.has.lock().unwrap().remove(atom);
-        if let Some(key) = index_key(atom) {
-            if let Some(vec) = self.indexed.lock().unwrap().get_mut(&key) {
-                let before = vec.len();
-                vec.retain(|a| a != atom);
-                let removed = vec.len() < before;
-                if vec.is_empty() { self.indexed.lock().unwrap().remove(&key); }
-                return Ok(removed);
-            }
-            return Ok(false);
-        }
-        let before = self.scalars.lock().unwrap().len();
-        self.scalars.lock().unwrap().retain(|a| a != atom);
-        Ok(self.scalars.lock().unwrap().len() < before)
-    }
-
-    fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
-        // Fast path: fully ground pattern — O(1) hash lookup.
-        if let Some(atom) = pattern.as_ground_atom() {
-            return if self.has.lock().unwrap().contains(&atom) {
-                vec![MatchResult { atom, bindings: vec![] }]
-            } else {
-                vec![]
-            };
-        }
-        let indexed = self.indexed.lock().unwrap();
-        let scalars = self.scalars.lock().unwrap();
-
-        // Indexed path: resolve functor+arity bucket and scan only that bucket.
-        if let Some(key) = pattern_index_key(pattern) {
-            return indexed.get(&key)
-                .map(|atoms| atoms.iter().filter_map(|a| match_one(pattern, a)).collect())
-                .unwrap_or_default();
-        }
-        // Full scan: wildcard or variable at functor position.
-        indexed.values()
-            .flat_map(|v| v.iter())
-            .chain(scalars.iter())
-            .filter_map(|a| match_one(pattern, a))
-            .collect()
-    }
-
-    fn get_atoms(&self) -> Vec<Atom> {
-        let indexed = self.indexed.lock().unwrap();
-        let scalars = self.scalars.lock().unwrap();
-        indexed.values()
-            .flat_map(|v| v.iter().cloned())
-            .chain(scalars.iter().cloned())
-            .collect()
-    }
-
-    fn description(&self) -> &str { "LocalSpace (indexed by functor+arity)" }
-}
-
-// ========================================================================
-// ShardedSpace — shard-by-bucket for concurrent read/write
-// ========================================================================
-
-/// Pick a shard index for an atom based on its index key hash.
-/// Atoms without an index key use a fallback hash of the atom itself.
-fn pick_shard(atom: &Atom, n_shards: usize) -> usize {
-    use std::hash::{Hash, Hasher};
-    let key = index_key(atom);
-    let hash = match &key {
-        Some((f, len)) => {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            f.hash(&mut h);
-            len.hash(&mut h);
-            h.finish()
-        }
-        None => {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            atom.hash(&mut h);
-            h.finish()
-        }
-    };
-    (hash as usize) % n_shards
-}
-
-/// Space sharded by `(functor, arity)` key hash for concurrent access.
-///
-/// Each shard is an independent `LocalSpace` behind its own `RwLock`.
-/// - `add_atom` / `remove_atom` lock only the atom's shard (single-writer).
-/// - `match_atoms` with an index key queries one shard (no cross-shard scan).
-/// - `match_atoms` for wildcards fans out to all shards in parallel via Rayon.
-/// - Multiple readers can coexist (readers don't block each other).
-///
-/// The default shard count matches the number of CPU cores.
-pub struct ShardedSpace {
-    n_shards: usize,
-    shards: Vec<RwLock<LocalSpace>>,
-}
-
-impl ShardedSpace {
-    /// Create a new sharded space with `n` shards.
-    pub fn new(n: usize) -> Self {
-        let n_shards = n.max(1);
-        let mut shards = Vec::with_capacity(n_shards);
-        for _ in 0..n_shards {
-            shards.push(RwLock::new(LocalSpace::new()));
-        }
-        ShardedSpace { n_shards, shards }
-    }
-
-    /// Create a new sharded space with one shard per CPU core.
-    pub fn new_default() -> Self {
-        Self::new(std::thread::available_parallelism()
-            .map(|n| n.get()).unwrap_or(4))
-    }
-
-    pub fn new_box(n: usize) -> Box<dyn Space + Send> {
-        Box::new(Self::new(n))
-    }
-}
-
-impl Space for ShardedSpace {
-    fn add_atom(&self, atom: &Atom) -> Result<(), String> {
-        let shard = pick_shard(atom, self.n_shards);
-        self.shards[shard].write().unwrap().add_atom(atom)
-    }
-
-    fn remove_atom(&self, atom: &Atom) -> Result<bool, String> {
-        let shard = pick_shard(atom, self.n_shards);
-        self.shards[shard].write().unwrap().remove_atom(atom)
-    }
-
-    fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
-        if let Some(key) = pattern_index_key(pattern) {
-            // Indexed pattern: only query the relevant shard
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            key.0.hash(&mut h);
-            key.1.hash(&mut h);
-            let shard = (h.finish() as usize) % self.n_shards;
-            return self.shards[shard].read().unwrap().match_atoms(pattern);
-        }
-        // Full scan: query all shards in parallel, merge results
-        use rayon::prelude::*;
-        self.shards.par_iter()
-            .flat_map(|s| s.read().unwrap().match_atoms(pattern))
-            .collect()
-    }
-
-    fn get_atoms(&self) -> Vec<Atom> {
-        // Lock each shard sequentially (parallel would be worse due to contention)
-        let mut all = Vec::new();
-        for shard in &self.shards {
-            all.extend(shard.read().unwrap().get_atoms());
-        }
-        all
-    }
-
-    fn description(&self) -> &str { "ShardedSpace (concurrent, shard-by-bucket)" }
-}
-
-// ========================================================================
 // MorkSpace — wraps MORK's PathMap trie
 // ========================================================================
 
-/// Space backed by MORK's hypergraph trie, with a shadow `LocalSpace` for queries.
+/// Space backed by MORK's PathMap trie as the **single source of truth**.
 ///
-/// Writes go to the kernel PathMap (byte-encoded S-expressions) for persistence.
-/// Reads are served from the shadow — zero serialization round-trip, and first-
-/// argument indexing via `LocalSpace`'s HashMap buckets. The previous design
-/// called `dump_all_sexpr()` on every query, re-parsing the entire space each time.
-#[cfg(feature = "mork")]
+/// There is no shadow store. Writes byte-encode the atom and `insert`/`remove`
+/// it in the trie. Reads traverse the trie directly:
+/// - `match_atoms` narrows to the subtree sharing the pattern's constant byte
+///   prefix (`Expr::prefix` → `read_zipper_at_path`), so a pattern like
+///   `(= (fib $n) $b)` only visits stored `(= (fib …) …)` paths — the real
+///   PathMap prefix-sharing win — then decodes each candidate and runs the
+///   named unifier to extract `$`-bindings.
+/// - `get_atoms` walks the whole trie.
+///
+/// NOTE: the kernel `query_multi`/`dump_sexpr` paths reserve a multi-GiB path
+/// buffer per call (built for bulk transforms), so they are deliberately NOT
+/// used for interactive per-term lookup. A plain `read_zipper` traversal is the
+/// cheap primitive.
+///
+/// Variables round-trip as positional MORK vars (`$a`, `$b`, …) — alpha-
+/// equivalent to the source names, which is all unification requires.
 pub struct MorkSpace {
     inner: std::sync::Mutex<mork::space::Space<mork::weightedsweep::U64AtomHeader>>,
-    /// Mirrors `inner` in Rust form — serves all read operations without going
-    /// through the serialization round-trip.
-    shadow: LocalSpace,
-    /// Reusable scratch for encoding atoms into trie paths. Avoids the kernel
-    /// bulk-load path (`add_all_sexpr`), which allocates a 4GiB scratch Vec
-    /// and runs a multi-expression parse loop for every single atom.
+    /// Reusable scratch for encoding atoms/patterns into trie paths.
     encode_buf: std::sync::Mutex<Vec<u8>>,
 }
 
-#[cfg(feature = "mork")]
 impl MorkSpace {
     pub fn new() -> Self {
         MorkSpace {
             inner: std::sync::Mutex::new(mork::space::Space::new()),
-            shadow: LocalSpace::new(),
             encode_buf: std::sync::Mutex::new(vec![0u8; 1 << 16]),
         }
     }
 
-    /// Encode one atom into the trie's byte format using the reusable buffer.
-    /// Returns the encoded length.
-    fn encode_atom(&self, atom: &Atom) -> Result<usize, String> {
-        let sexpr = atom.to_sexpr_string();
-        // Worst case: every byte of text becomes an 8-byte interned symbol + tag.
+    pub fn new_box() -> Box<dyn Space + Send + Sync> { Box::new(Self::new()) }
+
+    /// Byte-encode an s-expression into `buf` via the kernel parser.
+    /// Returns the encoded length. Symbols are stored literally (no interning
+    /// in this build), so the same bytes decode back via `Expr::serialize2`.
+    fn encode_into(
+        buf: &mut Vec<u8>,
+        inner: &mut mork::space::Space<mork::weightedsweep::U64AtomHeader>,
+        sexpr: &str,
+    ) -> Result<usize, String> {
+        // Worst case: every text byte becomes a tagged symbol entry.
         let cap = sexpr.len() * 8 + 64;
-        let mut buf = self.encode_buf.lock().unwrap();
         if cap > buf.len() {
             buf.resize(cap, 0);
         }
-        let mut inner = self.inner.lock().unwrap();
         let (_expr, len) = inner
             .parse_sexpr(sexpr.as_bytes(), buf.as_mut_ptr())
             .map_err(|e| format!("mork parse: {:?}", e))?;
@@ -367,35 +157,175 @@ impl MorkSpace {
     }
 }
 
-#[cfg(feature = "mork")]
 impl Space for MorkSpace {
     fn add_atom(&self, atom: &Atom) -> Result<(), String> {
-        let len = self.encode_atom(atom)?;
-        let buf = self.encode_buf.lock().unwrap();
-        self.inner.lock().unwrap().btm.insert(&buf[..len], Default::default());
-        drop(buf);
-        self.shadow.add_atom(atom)
+        let sexpr = atom.to_sexpr_string();
+        let mut buf = self.encode_buf.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        let len = Self::encode_into(&mut buf, &mut inner, &sexpr)?;
+        inner.btm.insert(&buf[..len], Default::default());
+        Ok(())
     }
 
     fn remove_atom(&self, atom: &Atom) -> Result<bool, String> {
-        let len = self.encode_atom(atom)?;
-        let buf = self.encode_buf.lock().unwrap();
-        let removed = self.inner.lock().unwrap().btm.remove(&buf[..len]).is_some();
-        drop(buf);
-        self.shadow.remove_atom(atom)?;
-        Ok(removed)
+        let sexpr = atom.to_sexpr_string();
+        let mut buf = self.encode_buf.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        let len = Self::encode_into(&mut buf, &mut inner, &sexpr)?;
+        Ok(inner.btm.remove(&buf[..len]).is_some())
     }
 
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
-        // Shadow: no dump_all_sexpr, no parse loop, first-arg indexed.
-        self.shadow.match_atoms(pattern)
+        // Ground fast-path: exact existence check, O(key length).
+        if let Some(atom) = pattern.as_ground_atom() {
+            let sexpr = atom.to_sexpr_string();
+            let mut buf = self.encode_buf.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap();
+            let len = match Self::encode_into(&mut buf, &mut inner, &sexpr) {
+                Ok(l) => l,
+                Err(_) => return vec![],
+            };
+            return if inner.btm.get_val_at(&buf[..len]).is_some() {
+                vec![MatchResult { atom, bindings: vec![] }]
+            } else {
+                vec![]
+            };
+        }
+
+        // Non-ground: narrow the trie by the pattern's constant byte prefix,
+        // traverse that subtree only, decode each stored atom, and run the
+        // named unifier for $-bindings.
+        let query_sexpr = pattern_to_query_sexpr(pattern);
+        let mut buf = self.encode_buf.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        let prefix: &[u8] = match inner.parse_sexpr(query_sexpr.as_bytes(), buf.as_mut_ptr()) {
+            // prefix() = Ok(proper prefix before first var) | Err(full span).
+            Ok((e, _len)) => match e.prefix() {
+                Ok(p) | Err(p) => unsafe { &*p },
+            },
+            // Parse failure → fall back to a full traversal (empty prefix).
+            Err(_) => &[],
+        };
+
+        let mut results = Vec::new();
+        let mut z = inner.btm.read_zipper_at_path(prefix);
+        while z.to_next_val() {
+            // origin_path = prefix ++ path = the full stored key (encoded atom).
+            if let Some(stored) = decode_expr_bytes(z.origin_path()) {
+                if let Some(mr) = match_one(pattern, &stored) {
+                    results.push(mr);
+                }
+            }
+        }
+        results
     }
 
     fn get_atoms(&self) -> Vec<Atom> {
-        self.shadow.get_atoms()
+        let inner = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        let mut z = inner.btm.read_zipper();
+        while z.to_next_val() {
+            if let Some(a) = decode_expr_bytes(z.path()) {
+                out.push(a);
+            }
+        }
+        out
     }
 
-    fn description(&self) -> &str { "MorkSpace (PathMap trie + indexed shadow)" }
+    fn description(&self) -> &str { "MorkSpace (PathMap trie, single source of truth)" }
+}
+
+/// Render a `Pattern` as a MORK query s-expression: variables/wildcards become
+/// `$` (positional new-vars), exact atoms render literally. Used only to derive
+/// the constant byte prefix for trie narrowing.
+fn pattern_to_query_sexpr(p: &Pattern) -> String {
+    match p {
+        Pattern::Any | Pattern::Var(_) => "$".to_string(),
+        Pattern::Exact(a) => a.to_sexpr_string(),
+        Pattern::Expr(ps) => {
+            let inner: Vec<String> = ps.iter().map(pattern_to_query_sexpr).collect();
+            format!("({})", inner.join(" "))
+        }
+    }
+}
+
+/// Decode a trie key (byte-encoded expression) directly into an `Atom`,
+/// without a serialize→string→parse round-trip.
+///
+/// Symbols are stored literally (no interning in this build). Positional MORK
+/// variables render as `$a`, `$b`, … (`Expr::VARNAMES`), with `NewVar`s numbered
+/// in pre-order — matching what the kernel's own serializer would emit, so the
+/// produced `Atom` is identical to the former parse-based path. Numeric symbols
+/// map to `Atom::Num` per the same rule as `parser::parse_value`.
+fn decode_expr_bytes(bytes: &[u8]) -> Option<Atom> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut pos = 0usize;
+    let mut var_count: u8 = 0;
+    decode_one(bytes, &mut pos, &mut var_count)
+}
+
+fn varname(i: u8) -> Atom {
+    Atom::sym(mork_expr::Expr::VARNAMES.get(i as usize).copied().unwrap_or("$z"))
+}
+
+/// A literal symbol token → `Num` if it is an integer literal, else `Sym`.
+/// Mirrors `parser::parse_value`: optional leading `-` then ASCII digits.
+fn symbol_to_atom(s: &str) -> Atom {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
+        if let Ok(n) = s.parse::<i128>() {
+            return Atom::Num(n);
+        }
+    }
+    Atom::sym(s)
+}
+
+fn decode_one(b: &[u8], pos: &mut usize, var_count: &mut u8) -> Option<Atom> {
+    use mork_expr::{byte_item, Tag, read_arity_at, arity_byte_count_at};
+    if *pos >= b.len() {
+        return None;
+    }
+    match byte_item(b[*pos]) {
+        Tag::NewVar => {
+            let idx = *var_count;
+            *var_count = var_count.saturating_add(1);
+            *pos += 1;
+            Some(varname(idx))
+        }
+        Tag::VarRef(i) => {
+            *pos += 1;
+            Some(varname(i))
+        }
+        Tag::SymbolSize(s) => {
+            *pos += 1;
+            let s = s as usize;
+            if *pos + s > b.len() {
+                return None;
+            }
+            let sym = std::str::from_utf8(&b[*pos..*pos + s]).ok()?;
+            *pos += s;
+            Some(symbol_to_atom(sym))
+        }
+        Tag::Arity(n) => {
+            *pos += 1;
+            decode_children(b, pos, var_count, n as usize)
+        }
+        Tag::LongArity => {
+            let n = read_arity_at(b[*pos..].as_ptr()) as usize;
+            *pos += arity_byte_count_at(b[*pos..].as_ptr());
+            decode_children(b, pos, var_count, n)
+        }
+    }
+}
+
+fn decode_children(b: &[u8], pos: &mut usize, var_count: &mut u8, n: usize) -> Option<Atom> {
+    let mut items = Vec::with_capacity(n);
+    for _ in 0..n {
+        items.push(decode_one(b, pos, var_count)?);
+    }
+    Some(Atom::Expr(items))
 }
 
 // ========================================================================
@@ -598,8 +528,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_local_space_add_match() {
-        let mut space = LocalSpace::new();
+    fn test_mork_space_add_match() {
+        let space = MorkSpace::new();
         space.add_atom(&Atom::expr(vec![Atom::sym("friend"), Atom::sym("sam"), Atom::sym("tim")])).unwrap();
         space.add_atom(&Atom::expr(vec![Atom::sym("friend"), Atom::sym("sam"), Atom::sym("joe")])).unwrap();
 
