@@ -71,7 +71,7 @@ impl Runtime {
         ]);
         // Snapshot matches while holding space lock
         let matches: Vec<_> = {
-            let space = self.funcs.space.lock().unwrap();
+            let space = self.funcs.space.read().unwrap();
             space.match_atoms(&pat)
         };
         // Snapshot state
@@ -81,14 +81,14 @@ impl Runtime {
         };
         // Move space out of current table
         let old_space = std::mem::replace(
-            &mut *self.funcs.space.lock().unwrap(),
+            &mut *self.funcs.space.write().unwrap(),
             crate::space::LocalSpace::new_box(),
         );
         // Fresh table
         let new_table = FnTable::new();
         register_builtins(&new_table);
         // Move space and state into new table
-        let _ = std::mem::replace(&mut *new_table.space.lock().unwrap(), old_space);
+        let _ = std::mem::replace(&mut *new_table.space.write().unwrap(), old_space);
         let _ = std::mem::replace(&mut *new_table.state.lock().unwrap(), state);
         // Re-register user-defined functions and populate fn_cache
         for result in matches {
@@ -119,14 +119,14 @@ impl Runtime {
                 // Store the atom in the space unconditionally — plain data atoms
                 // like `(kb 1)` are valid top-level forms that go into &self.
                 let atom = expr_to_atom(&expr);
-                self.funcs.space.lock().unwrap().add_atom(&atom)?;
+                self.funcs.space.write().unwrap().add_atom(&atom)?;
                 // Only compile as a function if it's a (= head body) form.
                 if let Ok((name, clause)) = compile_definition(&expr) {
                     // Also store the BARE HEAD atom so `match` can find premise atoms
                     if let Expr::List(items) = &expr {
                         if items.len() == 3 {
                             let head_atom = crate::parser::expr_to_atom(&items[1]);
-                            self.funcs.space.lock().unwrap().add_atom(&head_atom)?;
+                            self.funcs.space.write().unwrap().add_atom(&head_atom)?;
                         }
                     }
                     // Populate fn_cache for fast concurrent dispatch
