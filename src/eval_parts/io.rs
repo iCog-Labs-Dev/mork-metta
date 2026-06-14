@@ -248,7 +248,11 @@ pub(crate) fn process_top_form(form: TopForm, env: &Env, funcs: &FnTable) -> Res
             Ok(None)
         }
         TopForm::Runnable(expr) => {
-            let mut results = eval(&expr, env, funcs)?;
+            // Drive the spec's 4-register machine (cost ledger + insensitive gate
+            // live; unbounded budget → results identical to bare eval). This is
+            // the file/CLI run path.
+            let (mut results, _budget) =
+                crate::eval_parts::eval_with_state(&expr, env, funcs, None)?;
             Ok(results.next())
         }
     }
