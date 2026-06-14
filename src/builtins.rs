@@ -20,10 +20,10 @@ macro_rules! bool_clause {
             body,
         ]);
         let def_atom = crate::parser::expr_to_atom(&def_expr);
-        $table.space.lock().unwrap().add_atom(&def_atom).unwrap();
+        $table.space.write().unwrap().add_atom(&def_atom).unwrap();
         // Also store bare head atom for match premise lookup
         let head_atom = crate::parser::expr_to_atom(&head);
-        $table.space.lock().unwrap().add_atom(&head_atom).unwrap();
+        $table.space.write().unwrap().add_atom(&head_atom).unwrap();
         // Populate fn_cache for fast concurrent dispatch
         let clause = crate::func::Clause {
             patterns: vec![$(Expr::Symbol($p.to_string())),+],
@@ -258,7 +258,7 @@ pub fn register_builtins(table: &FnTable) {
     // collects them into a flat list, matching the match+collapse pattern.
     table.insert_native("get-atoms", 1, |args, table| {
         expect_n_args(args, 1, "get-atoms")?;
-        let atoms = table.space.lock().unwrap().get_atoms();
+        let atoms = table.space.read().unwrap().get_atoms();
         Ok(NDet::stream(atoms.into_iter()))
     });
 
