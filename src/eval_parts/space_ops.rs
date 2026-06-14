@@ -109,6 +109,29 @@ pub(crate) fn eval_remove_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Res
     }))
 }
 
+/// Substitute match variable bindings into an atom tree.
+/// Recursively replaces `Atom::Sym(s)` where `s` is a key in `bindings`
+/// with the bound value. This enables match results to carry instantiated
+/// bodies that can be re-evaluated without losing variable context.
+fn subst_match_vars(atom: &Atom, bindings: &[(String, Atom)]) -> Atom {
+    match atom {
+        Atom::Sym(s) if s.starts_with('$') => {
+            if let Some((_, val)) = bindings.iter().find(|(k, _)| k.as_str() == s.as_ref()) {
+                val.clone()
+            } else {
+                atom.clone()
+            }
+        }
+        Atom::Expr(items) => {
+            let new_items: Vec<Atom> = items.iter()
+                .map(|a| subst_match_vars(a, bindings))
+                .collect();
+            Atom::Expr(new_items)
+        }
+        _ => atom.clone(),
+    }
+}
+
 /// Evaluate `(match space pattern body)` — pattern match atoms in a space.
 ///
 /// Evaluates `space` to get the space reference, converts `pattern` to a
@@ -174,7 +197,11 @@ pub(crate) fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
         for (name, val) in &mr.bindings {
             match_env = match_env.extend(name, val.clone());
         }
-        eval(&template, &match_env, funcs).map(|nd| nd.collect())
+        let atoms: Vec<Atom> = eval(&template, &match_env, funcs)?.collect();
+        // Substitute match bindings into each result atom so that definition
+        // body variables (e.g. $a, $b in (= (f $L $a $b) body)) are replaced
+        // with their matched values. This allows match + eval chains to work.
+        Ok(atoms.into_iter().map(|a| subst_match_vars(&a, &mr.bindings)).collect())
     };
     let results: Vec<Result<Vec<Atom>, String>> =
         if matches.len() > 1 && crate::eval_parts::data_list::is_pure_expr(&template, funcs) {
