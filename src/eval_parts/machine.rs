@@ -321,7 +321,7 @@ impl MachineState {
         let mut total_result_cost: i64 = 0;
 
         let atoms_snapshot: Vec<Atom> = {
-            let space = funcs.space.lock().unwrap();
+            let space = funcs.space.write().unwrap();
             space.get_atoms()
         };
 
@@ -436,7 +436,7 @@ impl MachineState {
 
         // Get snapshot of all atoms in k
         let atoms_snapshot: Vec<Atom> = {
-            let space = funcs.space.lock().unwrap();
+            let space = funcs.space.write().unwrap();
             space.get_atoms()
         };
 
@@ -511,7 +511,7 @@ impl MachineState {
             }
         }
 
-        funcs.space.lock().unwrap().add_atom(&atom)?;
+        funcs.space.write().unwrap().add_atom(&atom)?;
         if let Some(c) = cost {
             if let Some(budget) = self.cost_budget.as_mut() {
                 *budget -= c;
@@ -544,7 +544,7 @@ impl MachineState {
             }
         }
 
-        funcs.space.lock().unwrap().remove_atom(&atom)?;
+        funcs.space.write().unwrap().remove_atom(&atom)?;
         if let Some(c) = cost {
             if let Some(budget) = self.cost_budget.as_mut() {
                 *budget -= c;
@@ -567,7 +567,7 @@ impl MachineState {
             // insensitive(u, k) precondition per spec Section 3.3:
             // term must not match any (= ...) definition head in k.
             // If it does, it should be Chain'd, not Output'd.
-            let space = funcs.space.lock().unwrap();
+            let space = funcs.space.write().unwrap();
             let atoms = space.get_atoms();
             let matches_def: bool = atoms.iter().any(|atom| {
                 matches!(atom, Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("=")
@@ -644,7 +644,7 @@ impl MachineState {
                 }
             }
 
-            funcs.space.lock().unwrap().remove_atom(&atom)?;
+            funcs.space.write().unwrap().remove_atom(&atom)?;
             if let Some(c) = cost {
                 if let Some(budget) = self.cost_budget.as_mut() {
                     *budget -= c;
@@ -681,7 +681,7 @@ impl MachineState {
                 }
             }
 
-            funcs.space.lock().unwrap().add_atom(&atom)?;
+            funcs.space.write().unwrap().add_atom(&atom)?;
             if let Some(c) = cost {
                 if let Some(budget) = self.cost_budget.as_mut() {
                     *budget -= c;
