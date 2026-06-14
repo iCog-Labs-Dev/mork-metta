@@ -150,7 +150,7 @@ fn test_phase3_query_rule_single_definition() {
             Atom::sym("$y"),
         ]),
     ]);
-    funcs.space.lock().unwrap().add_atom(&definition).unwrap();
+    funcs.space.write().unwrap().add_atom(&definition).unwrap();
 
     // Create machine state with query in input
     let mut state = MachineState::new(None);
@@ -204,9 +204,9 @@ fn test_phase3_query_rule_multiple_definitions() {
         Atom::sym("r3"),
     ]);
 
-    funcs.space.lock().unwrap().add_atom(&def1).unwrap();
-    funcs.space.lock().unwrap().add_atom(&def2).unwrap();
-    funcs.space.lock().unwrap().add_atom(&def3).unwrap();
+    funcs.space.write().unwrap().add_atom(&def1).unwrap();
+    funcs.space.write().unwrap().add_atom(&def2).unwrap();
+    funcs.space.write().unwrap().add_atom(&def3).unwrap();
 
     let mut state = MachineState::new(None);
     let query = Atom::expr(vec![Atom::sym("p"), Atom::sym("a")]);
@@ -253,8 +253,8 @@ fn test_phase3_chain_rule_workspace_transition() {
         Atom::expr(vec![Atom::sym("r"), Atom::sym("$x")]),
     ]);
 
-    funcs.space.lock().unwrap().add_atom(&def1).unwrap();
-    funcs.space.lock().unwrap().add_atom(&def2).unwrap();
+    funcs.space.write().unwrap().add_atom(&def1).unwrap();
+    funcs.space.write().unwrap().add_atom(&def2).unwrap();
 
     let mut state = MachineState::new(None);
     state.workspace.push_back(Atom::expr(vec![
@@ -262,21 +262,18 @@ fn test_phase3_chain_rule_workspace_transition() {
         Atom::sym("a"),
     ]));
 
-    // Chain step 1
-    state.step(Transition::Chain, &env, &funcs).unwrap();
-    assert_eq!(state.workspace.len(), 1);
-    assert_eq!(
-        state.workspace.front().unwrap(),
-        &Atom::expr(vec![Atom::sym("q"), Atom::sym("a")])
-    );
-
-    // Chain step 2
+    // Chain step 1: (= (p $x) (q $x)) matches `(p a)`, body `(q a)`,
+    // eval dispatches (= (q $x) (r $x)) from space → result `(r a)`
     state.step(Transition::Chain, &env, &funcs).unwrap();
     assert_eq!(state.workspace.len(), 1);
     assert_eq!(
         state.workspace.front().unwrap(),
         &Atom::expr(vec![Atom::sym("r"), Atom::sym("a")])
     );
+
+    // Chain step 2: no definition for `r` → workspace consumed and empty
+    state.step(Transition::Chain, &env, &funcs).unwrap();
+    assert_eq!(state.workspace.len(), 0);
 }
 
 #[test]
@@ -300,7 +297,7 @@ fn test_phase3_identical_variables_in_definition() {
         ]),
         Atom::sym("yes"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     // Test 1: (equals a a) should match
     let mut state1 = MachineState::new(None);
@@ -343,7 +340,7 @@ fn test_phase3_ground_body_no_variables() {
             Atom::sym("c"),
         ]),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     let mut state = MachineState::new(None);
     state.push_input(Atom::expr(vec![Atom::sym("p"), Atom::sym("a")]));
@@ -372,7 +369,7 @@ fn test_phase3_no_matching_definitions() {
         Atom::expr(vec![Atom::sym("p"), Atom::sym("a")]),
         Atom::sym("r"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     let mut state = MachineState::new(None);
     let query = Atom::expr(vec![Atom::sym("q"), Atom::sym("b")]);
@@ -407,8 +404,8 @@ fn test_phase3_variable_scoping() {
         Atom::expr(vec![Atom::sym("not"), Atom::sym("$x")]),
     ]);
 
-    funcs.space.lock().unwrap().add_atom(&def1).unwrap();
-    funcs.space.lock().unwrap().add_atom(&def2).unwrap();
+    funcs.space.write().unwrap().add_atom(&def1).unwrap();
+    funcs.space.write().unwrap().add_atom(&def2).unwrap();
 
     // Query (p a)
     let mut state1 = MachineState::new(None);
@@ -440,7 +437,7 @@ fn test_phase3_cost_model_budget_tracking() {
         Atom::sym("p"),
         Atom::sym("result"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     // Create machine with budget limit
     let mut state = MachineState::new(Some(1000));
