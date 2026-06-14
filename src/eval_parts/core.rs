@@ -300,7 +300,7 @@ fn try_eval_from_space_fallback(
         crate::space::Pattern::Any,
     ]);
 
-    let matches = funcs.space.lock().unwrap().match_atoms(&def_pattern);
+    let matches = funcs.space.read().unwrap().match_atoms(&def_pattern);
     if matches.is_empty() {
         return Ok(None);
     }
@@ -414,11 +414,7 @@ fn try_eval_from_space(
             }
 
             let body_env = crate::eval_parts::pattern::prepend_env(unif_env, env);
-            let mut stream = eval(&clause.body, &body_env, funcs)?;
-            let results: Vec<Atom> = stream.by_ref().collect();
-            if !results.is_empty() {
-                streams.push(NDet::Stream(Box::new(results.into_iter())));
-            }
+            streams.push(eval(&clause.body, &body_env, funcs)?);
         }
     }
 
