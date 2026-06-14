@@ -52,7 +52,7 @@ impl Iterator for NDet {
 
 /// A single clause of a multi-clause (pattern-matching) user-defined function.
 /// Kept for compile_definition return type and conversion to space atoms.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Clause {
     pub patterns: Vec<Expr>,
     pub body: Expr,
@@ -89,28 +89,22 @@ pub struct FnTable {
     /// Function definition cache — populated from space at reify time, updated
     /// on add-atom/remove-atom. Read-heavy (every function dispatch), so RwLock.
     pub fn_cache: RwLock<HashMap<String, HashMap<u8, Vec<Clause>>>>,
+    /// Space-free purity of each user function, computed at definition time and
+    /// recomputed on redefinition (self-evolution-stable). Drives the *only*
+    /// sound parallelization decision: a function is parallel-safe iff it (and
+    /// everything it calls) performs no space access and no IO. Absent ⇒ impure.
+    pub fn_purity: RwLock<HashMap<String, HashMap<u8, bool>>>,
     /// Directory of the file currently being loaded (load-time only).
     pub import_dir: Mutex<PathBuf>,
-}
-
-impl Clone for FnTable {
-    fn clone(&self) -> Self {
-        FnTable {
-            map: RwLock::new(self.map.read().unwrap().clone()),
-            space: RwLock::new(Box::new(crate::space::ShardedSpace::new_default())),
-            fn_cache: RwLock::new(HashMap::new()),
-            state: Mutex::new(HashMap::new()),
-            import_dir: Mutex::new(self.import_dir.lock().unwrap().clone()),
-        }
-    }
 }
 
 impl FnTable {
     pub fn new() -> Self {
         FnTable {
             map: RwLock::new(HashMap::new()),
-            space: RwLock::new(Box::new(crate::space::ShardedSpace::new_default())),
+            space: RwLock::new(Box::new(crate::space::MorkSpace::new())),
             fn_cache: RwLock::new(HashMap::new()),
+            fn_purity: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
             import_dir: Mutex::new(PathBuf::from(".")),
         }
@@ -121,6 +115,7 @@ impl FnTable {
             map: RwLock::new(HashMap::new()),
             space: RwLock::new(space),
             fn_cache: RwLock::new(HashMap::new()),
+            fn_purity: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
             import_dir: Mutex::new(PathBuf::from(".")),
         }
@@ -159,14 +154,40 @@ impl FnTable {
     }
 
     pub fn cache_fn(&self, name: &str, arity: u8, clause: Clause) {
-        self.fn_cache.write().unwrap()
-            .entry(name.to_string()).or_insert_with(HashMap::new)
-            .entry(arity).or_insert_with(Vec::new)
-            .push(clause);
+        // Compute space-free purity BEFORE taking the cache write lock: the
+        // analysis reads fn_cache/fn_purity, so locking first would deadlock.
+        // Self-recursion is optimistically pure, so directly recursive pure
+        // functions (e.g. fib) stay parallelizable.
+        let clause_pure =
+            crate::eval_parts::data_list::is_pure_expr_assuming(&clause.body, self, name);
+
+        {
+            let mut cache = self.fn_cache.write().unwrap();
+            let clauses = cache
+                .entry(name.to_string()).or_insert_with(HashMap::new)
+                .entry(arity).or_insert_with(Vec::new);
+            // Idempotent: the trie gives `(= head body)` set semantics, so the
+            // dispatch cache must too — re-adding an identical clause must not
+            // duplicate it and double the result multiset (already counted in
+            // purity, so skip the update too).
+            if clauses.contains(&clause) {
+                return;
+            }
+            clauses.push(clause);
+        }
+
+        // A function is parallel-safe only if EVERY clause is pure.
+        let mut purity = self.fn_purity.write().unwrap();
+        let entry = purity.entry(name.to_string()).or_insert_with(HashMap::new)
+            .entry(arity).or_insert(true);
+        *entry = *entry && clause_pure;
     }
 
     pub fn uncache_fn(&self, name: &str, arity: u8) {
         if let Some(inner) = self.fn_cache.write().unwrap().get_mut(name) {
+            inner.remove(&arity);
+        }
+        if let Some(inner) = self.fn_purity.write().unwrap().get_mut(name) {
             inner.remove(&arity);
         }
     }
@@ -174,29 +195,20 @@ impl FnTable {
     /// Check if a named function is pure at the given arity.
     /// Returns `false` if the function is not found (conservative).
     pub fn is_pure(&self, name: &str, arity: u8) -> bool {
+        // Native builtins carry an authoritative space-free purity flag.
         if let Some(inner) = self.map.read().unwrap().get(name) {
             if let Some(f) = inner.get(&arity) {
                 return f.pure;
             }
         }
-        // Fallback: check fn_cache for user-defined definitions.
-        if self.fn_cache.read().unwrap()
-            .get(name).and_then(|inner| inner.get(&arity))
-            .map_or(false, |clauses| !clauses.is_empty())
-        {
-            return true;
-        }
-        // Final fallback: check space (for test code that adds atoms directly).
-        let pat = crate::space::Pattern::Expr(vec![
-            crate::space::Pattern::Exact(Atom::sym("=")),
-            crate::space::Pattern::Expr(
-                std::iter::once(crate::space::Pattern::Exact(Atom::sym(name)))
-                    .chain((0..arity).map(|_| crate::space::Pattern::Any))
-                    .collect()
-            ),
-            crate::space::Pattern::Any,
-        ]);
-        !self.space.read().unwrap().match_atoms(&pat).is_empty()
+        // User-defined functions: purity computed at definition time (sound and
+        // self-evolution-stable). Unknown symbols and defs added directly to the
+        // space are treated as impure — never parallelized on an unproven
+        // assumption. (A cache miss still dispatches correctly via the space
+        // fallback; it just runs sequentially.)
+        self.fn_purity.read().unwrap()
+            .get(name).and_then(|inner| inner.get(&arity)).copied()
+            .unwrap_or(false)
     }
 }
 
