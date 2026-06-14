@@ -12,8 +12,8 @@ fn test_transform_basic_atoms() {
     let (mut state, env, funcs) = setup();
 
     // Add atoms to knowledge base
-    funcs.space.lock().unwrap().add_atom(&Atom::sym("slow")).unwrap();
-    funcs.space.lock().unwrap().add_atom(&Atom::sym("slow")).unwrap();
+    funcs.space.write().unwrap().add_atom(&Atom::sym("slow")).unwrap();
+    funcs.space.write().unwrap().add_atom(&Atom::sym("slow")).unwrap();
 
     // Create transform term: (transform slow fast)
     let transform_term = Atom::expr(vec![
@@ -28,10 +28,10 @@ fn test_transform_basic_atoms() {
     let result = state.apply_transform(&env, &funcs);
     assert!(result.is_ok(), "Transform should succeed");
     assert!(!state.workspace.is_empty(), "Workspace should have transformed atoms");
-
-    // Check knowledge base has new atoms
-    let atoms = funcs.space.lock().unwrap().get_atoms();
-    assert!(atoms.iter().any(|a| a == &Atom::sym("fast")), "Knowledge base should have 'fast'");
+    assert!(
+        state.workspace.iter().any(|a| a == &Atom::sym("fast")),
+        "Workspace should have 'fast'"
+    );
 }
 
 #[test]
@@ -39,7 +39,7 @@ fn test_transform_with_variables() {
     let (mut state, env, funcs) = setup();
 
     // Add atoms: (slow-fib 5), (slow-fib 10)
-    let mut space = funcs.space.lock().unwrap();
+    let space = funcs.space.write().unwrap();
     space.add_atom(&Atom::expr(vec![Atom::sym("slow-fib"), Atom::num(5)])).unwrap();
     space.add_atom(&Atom::expr(vec![Atom::sym("slow-fib"), Atom::num(10)])).unwrap();
     drop(space);
@@ -76,7 +76,7 @@ fn test_transform_all_matches() {
 
     // Add multiple matching atoms
     {
-        let mut space = funcs.space.lock().unwrap();
+        let space = funcs.space.write().unwrap();
         for i in 1..=5 {
             space.add_atom(&Atom::expr(vec![
                 Atom::sym("test"),
@@ -112,8 +112,8 @@ fn test_transform_no_matches() {
     let (mut state, env, funcs) = setup();
 
     // Add atoms that won't match
-    funcs.space.lock().unwrap().add_atom(&Atom::sym("foo")).unwrap();
-    funcs.space.lock().unwrap().add_atom(&Atom::sym("bar")).unwrap();
+    funcs.space.write().unwrap().add_atom(&Atom::sym("foo")).unwrap();
+    funcs.space.write().unwrap().add_atom(&Atom::sym("bar")).unwrap();
 
     // Try to transform non-existent pattern
     let transform_term = Atom::expr(vec![
@@ -134,7 +134,7 @@ fn test_transform_nested_patterns() {
 
     // Add nested structures
     {
-        let mut space = funcs.space.lock().unwrap();
+        let space = funcs.space.write().unwrap();
         space.add_atom(&Atom::expr(vec![
             Atom::sym("pair"),
             Atom::sym("a"),
@@ -188,7 +188,7 @@ fn test_transform_removes_old_atoms() {
     let (mut state, env, funcs) = setup();
 
     // Add atoms
-    funcs.space.lock().unwrap().add_atom(&Atom::sym("old")).unwrap();
+    funcs.space.write().unwrap().add_atom(&Atom::sym("old")).unwrap();
 
     // Transform old to new
     let transform_term = Atom::expr(vec![
@@ -200,10 +200,14 @@ fn test_transform_removes_old_atoms() {
     state.push_input(transform_term);
     state.apply_transform(&env, &funcs).unwrap();
 
-    // Check knowledge base has new, not old
-    let atoms = funcs.space.lock().unwrap().get_atoms();
-    assert!(!atoms.contains(&Atom::sym("old")), "Old atom should be removed");
-    assert!(atoms.contains(&Atom::sym("new")), "New atom should be present");
+    // Per spec, Transform puts results in workspace, doesn't mutate k
+    // Old atom should still be in k (Transform doesn't remove from k)
+    let atoms = funcs.space.read().unwrap().get_atoms();
+    assert!(atoms.contains(&Atom::sym("old")), "Old atom should remain in k");
+    assert!(
+        state.workspace.iter().any(|a| a == &Atom::sym("new")),
+        "Workspace should have 'new'"
+    );
 }
 
 #[test]
@@ -211,7 +215,7 @@ fn test_transform_with_multiple_variables() {
     let (mut state, env, funcs) = setup();
 
     // Add atoms with multiple variables
-    funcs.space.lock().unwrap().add_atom(&Atom::expr(vec![
+    funcs.space.write().unwrap().add_atom(&Atom::expr(vec![
         Atom::sym("rel"),
         Atom::sym("alice"),
         Atom::sym("bob"),
@@ -310,7 +314,7 @@ fn test_transform_preserves_non_matching_atoms() {
 
     // Add mixed atoms
     {
-        let mut space = funcs.space.lock().unwrap();
+        let space = funcs.space.write().unwrap();
         space.add_atom(&Atom::sym("keep1")).unwrap();
         space.add_atom(&Atom::sym("keep2")).unwrap();
         space.add_atom(&Atom::expr(vec![
@@ -335,17 +339,22 @@ fn test_transform_preserves_non_matching_atoms() {
     state.push_input(transform_term);
     state.apply_transform(&env, &funcs).unwrap();
 
-    // Verify both kept and transformed atoms exist
-    let atoms = funcs.space.lock().unwrap().get_atoms();
+    // Per spec Transform puts results in workspace, doesn't mutate k
+    // Original atoms remain in k
+    let atoms = funcs.space.read().unwrap().get_atoms();
     assert!(atoms.contains(&Atom::sym("keep1")));
     assert!(atoms.contains(&Atom::sym("keep2")));
-    assert!(atoms.iter().any(|a| {
-        if let Atom::Expr(items) = a {
-            items.len() == 2 && items[0] == Atom::sym("transformed")
-        } else {
-            false
-        }
-    }));
+    assert!(
+        state.workspace.iter().any(|a| {
+            if let Atom::Expr(items) = a {
+                items.len() == 2 && items[0] == Atom::sym("transformed")
+            } else {
+                false
+            }
+        }),
+        "Workspace should have transformed atoms"
+    );
+
 }
 
 #[test]
@@ -354,7 +363,7 @@ fn test_transform_spec_semantics() {
 
     // Add atoms: (num 1), (num 2), (num 3)
     {
-        let mut space = funcs.space.lock().unwrap();
+        let space = funcs.space.write().unwrap();
         for i in 1..=3 {
             space.add_atom(&Atom::expr(vec![
                 Atom::sym("num"),
