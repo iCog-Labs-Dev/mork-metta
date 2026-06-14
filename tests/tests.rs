@@ -160,7 +160,7 @@ fn test_space_stores_function_definitions() {
         Pattern::Expr(vec![Pattern::Exact(Atom::sym("f")), Pattern::Any]),
         Pattern::Any,
     ]);
-    let results = rt.funcs.space.lock().unwrap().match_atoms(&pat);
+    let results = rt.funcs.space.read().unwrap().match_atoms(&pat);
     assert_eq!(results.len(), 1);
 }
 
@@ -172,7 +172,7 @@ fn test_reify_functions_from_space() {
         Atom::Expr(vec![Atom::sym("g"), Atom::sym("$x")]),
         Atom::Expr(vec![Atom::sym("+"), Atom::sym("$x"), Atom::Num(3)]),
     ]);
-    rt.funcs.space.lock().unwrap().add_atom(&def_atom).unwrap();
+    rt.funcs.space.write().unwrap().add_atom(&def_atom).unwrap();
     rt.reify_functions();
     let forms = parse_forms("!(g 5)").unwrap();
     let result = match forms.into_iter().next().unwrap() {
