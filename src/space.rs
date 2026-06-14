@@ -82,12 +82,13 @@ pub struct MatchResult {
 }
 
 /// Space trait: abstract atom storage backend.
-pub trait Space: Send {
-    /// Add an atom to the space.
-    fn add_atom(&mut self, atom: &Atom) -> Result<(), String>;
+/// Uses interior mutability (&self for all methods) to enable RwLock<Box<dyn Space>>.
+pub trait Space: Send + Sync {
+    /// Add an atom to the space. Interior mutability handles actual mutation.
+    fn add_atom(&self, atom: &Atom) -> Result<(), String>;
 
     /// Remove an atom from the space. Returns true if something was removed.
-    fn remove_atom(&mut self, atom: &Atom) -> Result<bool, String>;
+    fn remove_atom(&self, atom: &Atom) -> Result<bool, String>;
 
     /// Match atoms against a pattern. Returns all matching atoms and bindings.
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult>;
@@ -136,76 +137,79 @@ fn pattern_index_key(pattern: &Pattern) -> Option<(String, usize)> {
 /// A pattern `(foo $x $y)` resolves to that bucket directly instead of scanning
 /// the entire space — matching k candidates instead of n total atoms.
 /// Bare `Sym`, `Num`, and non-symbol-headed `Expr` atoms fall into a scalar fallback.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct LocalSpace {
-    indexed: HashMap<(String, usize), Vec<Atom>>,
-    scalars: Vec<Atom>,
-    /// O(1) existence check for exact atom membership. Kept in sync with
-    /// the indexed and scalar stores so `match_atoms` on a ground pattern
-    /// can avoid a full bucket scan.
-    has: std::collections::HashSet<Atom>,
+    indexed: std::sync::Mutex<HashMap<(String, usize), Vec<Atom>>>,
+    scalars: std::sync::Mutex<Vec<Atom>>,
+    /// O(1) existence check for exact atom membership.
+    has: std::sync::Mutex<std::collections::HashSet<Atom>>,
 }
 
 impl LocalSpace {
     pub fn new() -> Self { Self::default() }
-    pub fn new_box() -> Box<dyn Space + Send> { Box::new(Self::default()) }
+    pub fn new_box() -> Box<dyn Space + Send + Sync> { Box::new(Self::default()) }
 }
 
 impl Space for LocalSpace {
-    fn add_atom(&mut self, atom: &Atom) -> Result<(), String> {
-        self.has.insert(atom.clone());
+    fn add_atom(&self, atom: &Atom) -> Result<(), String> {
+        self.has.lock().unwrap().insert(atom.clone());
         if let Some(key) = index_key(atom) {
-            self.indexed.entry(key).or_default().push(atom.clone());
+            self.indexed.lock().unwrap().entry(key).or_default().push(atom.clone());
         } else {
-            self.scalars.push(atom.clone());
+            self.scalars.lock().unwrap().push(atom.clone());
         }
         Ok(())
     }
 
-    fn remove_atom(&mut self, atom: &Atom) -> Result<bool, String> {
-        self.has.remove(atom);
+    fn remove_atom(&self, atom: &Atom) -> Result<bool, String> {
+        self.has.lock().unwrap().remove(atom);
         if let Some(key) = index_key(atom) {
-            if let Some(vec) = self.indexed.get_mut(&key) {
+            if let Some(vec) = self.indexed.lock().unwrap().get_mut(&key) {
                 let before = vec.len();
                 vec.retain(|a| a != atom);
                 let removed = vec.len() < before;
-                if vec.is_empty() { self.indexed.remove(&key); }
+                if vec.is_empty() { self.indexed.lock().unwrap().remove(&key); }
                 return Ok(removed);
             }
             return Ok(false);
         }
-        let before = self.scalars.len();
-        self.scalars.retain(|a| a != atom);
-        Ok(self.scalars.len() < before)
+        let before = self.scalars.lock().unwrap().len();
+        self.scalars.lock().unwrap().retain(|a| a != atom);
+        Ok(self.scalars.lock().unwrap().len() < before)
     }
 
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
         // Fast path: fully ground pattern — O(1) hash lookup.
         if let Some(atom) = pattern.as_ground_atom() {
-            return if self.has.contains(&atom) {
+            return if self.has.lock().unwrap().contains(&atom) {
                 vec![MatchResult { atom, bindings: vec![] }]
             } else {
                 vec![]
             };
         }
+        let indexed = self.indexed.lock().unwrap();
+        let scalars = self.scalars.lock().unwrap();
+
         // Indexed path: resolve functor+arity bucket and scan only that bucket.
         if let Some(key) = pattern_index_key(pattern) {
-            return self.indexed.get(&key)
+            return indexed.get(&key)
                 .map(|atoms| atoms.iter().filter_map(|a| match_one(pattern, a)).collect())
                 .unwrap_or_default();
         }
         // Full scan: wildcard or variable at functor position.
-        self.indexed.values()
+        indexed.values()
             .flat_map(|v| v.iter())
-            .chain(self.scalars.iter())
+            .chain(scalars.iter())
             .filter_map(|a| match_one(pattern, a))
             .collect()
     }
 
     fn get_atoms(&self) -> Vec<Atom> {
-        self.indexed.values()
+        let indexed = self.indexed.lock().unwrap();
+        let scalars = self.scalars.lock().unwrap();
+        indexed.values()
             .flat_map(|v| v.iter().cloned())
-            .chain(self.scalars.iter().cloned())
+            .chain(scalars.iter().cloned())
             .collect()
     }
 
@@ -274,12 +278,12 @@ impl ShardedSpace {
 }
 
 impl Space for ShardedSpace {
-    fn add_atom(&mut self, atom: &Atom) -> Result<(), String> {
+    fn add_atom(&self, atom: &Atom) -> Result<(), String> {
         let shard = pick_shard(atom, self.n_shards);
         self.shards[shard].write().unwrap().add_atom(atom)
     }
 
-    fn remove_atom(&mut self, atom: &Atom) -> Result<bool, String> {
+    fn remove_atom(&self, atom: &Atom) -> Result<bool, String> {
         let shard = pick_shard(atom, self.n_shards);
         self.shards[shard].write().unwrap().remove_atom(atom)
     }
@@ -325,38 +329,39 @@ impl Space for ShardedSpace {
 /// called `dump_all_sexpr()` on every query, re-parsing the entire space each time.
 #[cfg(feature = "mork")]
 pub struct MorkSpace {
-    inner: mork::space::Space<mork::weightedsweep::U64AtomHeader>,
+    inner: std::sync::Mutex<mork::space::Space<mork::weightedsweep::U64AtomHeader>>,
     /// Mirrors `inner` in Rust form — serves all read operations without going
     /// through the serialization round-trip.
     shadow: LocalSpace,
     /// Reusable scratch for encoding atoms into trie paths. Avoids the kernel
     /// bulk-load path (`add_all_sexpr`), which allocates a 4GiB scratch Vec
     /// and runs a multi-expression parse loop for every single atom.
-    encode_buf: Vec<u8>,
+    encode_buf: std::sync::Mutex<Vec<u8>>,
 }
 
 #[cfg(feature = "mork")]
 impl MorkSpace {
     pub fn new() -> Self {
         MorkSpace {
-            inner: mork::space::Space::new(),
+            inner: std::sync::Mutex::new(mork::space::Space::new()),
             shadow: LocalSpace::new(),
-            encode_buf: vec![0u8; 1 << 16],
+            encode_buf: std::sync::Mutex::new(vec![0u8; 1 << 16]),
         }
     }
 
     /// Encode one atom into the trie's byte format using the reusable buffer.
     /// Returns the encoded length.
-    fn encode_atom(&mut self, atom: &Atom) -> Result<usize, String> {
+    fn encode_atom(&self, atom: &Atom) -> Result<usize, String> {
         let sexpr = atom.to_sexpr_string();
         // Worst case: every byte of text becomes an 8-byte interned symbol + tag.
         let cap = sexpr.len() * 8 + 64;
-        if cap > self.encode_buf.len() {
-            self.encode_buf.resize(cap, 0);
+        let mut buf = self.encode_buf.lock().unwrap();
+        if cap > buf.len() {
+            buf.resize(cap, 0);
         }
-        let (_expr, len) = self
-            .inner
-            .parse_sexpr(sexpr.as_bytes(), self.encode_buf.as_mut_ptr())
+        let mut inner = self.inner.lock().unwrap();
+        let (_expr, len) = inner
+            .parse_sexpr(sexpr.as_bytes(), buf.as_mut_ptr())
             .map_err(|e| format!("mork parse: {:?}", e))?;
         Ok(len)
     }
@@ -364,15 +369,19 @@ impl MorkSpace {
 
 #[cfg(feature = "mork")]
 impl Space for MorkSpace {
-    fn add_atom(&mut self, atom: &Atom) -> Result<(), String> {
+    fn add_atom(&self, atom: &Atom) -> Result<(), String> {
         let len = self.encode_atom(atom)?;
-        self.inner.btm.insert(&self.encode_buf[..len], Default::default());
+        let buf = self.encode_buf.lock().unwrap();
+        self.inner.lock().unwrap().btm.insert(&buf[..len], Default::default());
+        drop(buf);
         self.shadow.add_atom(atom)
     }
 
-    fn remove_atom(&mut self, atom: &Atom) -> Result<bool, String> {
+    fn remove_atom(&self, atom: &Atom) -> Result<bool, String> {
         let len = self.encode_atom(atom)?;
-        let removed = self.inner.btm.remove(&self.encode_buf[..len]).is_some();
+        let buf = self.encode_buf.lock().unwrap();
+        let removed = self.inner.lock().unwrap().btm.remove(&buf[..len]).is_some();
+        drop(buf);
         self.shadow.remove_atom(atom)?;
         Ok(removed)
     }
