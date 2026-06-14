@@ -39,12 +39,12 @@ pub(crate) fn eval_add_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
     // (e.g. $N in (= (fib $N) ...)) stay as $-symbols. Matches PeTTa: add-atom
     // receives the Prolog term where unified variables already hold their values.
     let atom = crate::eval_parts::special::subst_and_atomize(&args[1], env);
-    funcs.space.lock().unwrap().add_atom(&atom).map_err(|e| format!("add-atom: {}", e))?;
+    funcs.space.write().unwrap().add_atom(&atom).map_err(|e| format!("add-atom: {}", e))?;
     // If the atom is a function definition (= head body), also store the bare
     // head atom so `match` can find premise atoms (e.g. (= (f $x) $x) → (f $x)).
     if let Atom::Expr(items) = &atom {
         if items.len() == 3 && items[0] == Atom::sym("=") {
-            funcs.space.lock().unwrap().add_atom(&items[1])?;
+            funcs.space.write().unwrap().add_atom(&items[1])?;
             // Also populate fn_cache
             if let Ok(expr) = crate::parser::atom_to_expr(&atom) {
                 if let Ok((name, clause)) = crate::compile::compile_definition(&expr) {
@@ -78,7 +78,7 @@ pub(crate) fn eval_remove_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Res
     // Hold the lock across snapshot + removal so a concurrent template can't
     // mutate the space between matching an atom and removing it (TOCTOU).
     let removed_atoms: Vec<Atom> = {
-        let mut space = funcs.space.lock().unwrap();
+        let mut space = funcs.space.write().unwrap();
         let matches = space.match_atoms(&pattern);
         let mut removed = Vec::new();
         for m in matches {
@@ -146,7 +146,7 @@ pub(crate) fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
         Pattern::from_expr(&substituted)
     };
     // Query the space — brief lock, collect all results, then release.
-    let matches = funcs.space.lock().unwrap().match_atoms(&pattern);
+    let matches = funcs.space.read().unwrap().match_atoms(&pattern);
     if matches.is_empty() {
         return Ok(NDet::Single(None)); // empty stream — no match
     }
