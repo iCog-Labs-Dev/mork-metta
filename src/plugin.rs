@@ -207,7 +207,7 @@ unsafe fn load_and_register_plugin(so_path: &Path, table: &FnTable) -> Result<()
 
     // Keep the library alive
     LOADED_LIBS
-        .lock()
+        .write()
         .map_err(|e| format!("plugin registry lock: {}", e))?
         .push(lib);
 
