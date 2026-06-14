@@ -82,8 +82,8 @@ type FuncMap = HashMap<String, HashMap<u8, Arc<Function>>>;
 pub struct FnTable {
     /// Read-heavy: many concurrent lookups during eval, writes only at load time.
     map: RwLock<FuncMap>,
-    /// Atom storage — wrapped in Mutex so Space impls don't need to be Sync.
-    pub space: Mutex<Box<dyn Space + Send>>,
+    /// Atom storage — RwLock allows concurrent readers (queries), exclusive writers (add/remove).
+    pub space: RwLock<Box<dyn Space + Send + Sync>>,
     /// Mutable state store for `get-state`, `change-state!`, `bind!`.
     pub state: Mutex<HashMap<String, Atom>>,
     /// Function definition cache — populated from space at reify time, updated
@@ -97,7 +97,7 @@ impl Clone for FnTable {
     fn clone(&self) -> Self {
         FnTable {
             map: RwLock::new(self.map.read().unwrap().clone()),
-            space: Mutex::new(Box::new(crate::space::ShardedSpace::new_default())),
+            space: RwLock::new(Box::new(crate::space::ShardedSpace::new_default())),
             fn_cache: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
             import_dir: Mutex::new(self.import_dir.lock().unwrap().clone()),
@@ -109,7 +109,7 @@ impl FnTable {
     pub fn new() -> Self {
         FnTable {
             map: RwLock::new(HashMap::new()),
-            space: Mutex::new(Box::new(crate::space::ShardedSpace::new_default())),
+            space: RwLock::new(Box::new(crate::space::ShardedSpace::new_default())),
             fn_cache: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
             import_dir: Mutex::new(PathBuf::from(".")),
@@ -119,7 +119,7 @@ impl FnTable {
     pub fn with_space(space: Box<dyn Space + Send>) -> Self {
         FnTable {
             map: RwLock::new(HashMap::new()),
-            space: Mutex::new(space),
+            space: RwLock::new(space),
             fn_cache: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
             import_dir: Mutex::new(PathBuf::from(".")),
@@ -196,7 +196,7 @@ impl FnTable {
             ),
             crate::space::Pattern::Any,
         ]);
-        !self.space.lock().unwrap().match_atoms(&pat).is_empty()
+        !self.space.read().unwrap().match_atoms(&pat).is_empty()
     }
 }
 
