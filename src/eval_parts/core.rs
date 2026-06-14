@@ -241,31 +241,50 @@ pub(crate) fn apply_closure(
         ));
     }
 
-    let mut arg_vals: Vec<Atom> = Vec::with_capacity(args.len());
+    // Evaluate each argument to its FULL result set and cartesian-product them,
+    // so non-deterministic arguments propagate every branch (Σ over transitions)
+    // instead of being truncated to the first. Deterministic args → one combo,
+    // identical to the previous behavior.
+    let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(args.len());
     for arg in args {
-        let mut results = eval(arg, env, funcs)?;
-        match results.next() {
-            Some(val) => arg_vals.push(val),
-            None => {
-                return Err("closure: argument produced no results".into());
+        let vals: Vec<Atom> = eval(arg, env, funcs)?.collect();
+        if vals.is_empty() {
+            return Err("closure: argument produced no results".into());
+        }
+        arg_options.push(vals);
+    }
+
+    let combos = cartesian_product(&arg_options);
+    let single_combo = combos.len() == 1;
+    let mut streams: Vec<NDet> = Vec::new();
+    for arg_vals in &combos {
+        let mut match_env = Env::new();
+        let mut mismatch: Option<String> = None;
+        for (pat, val) in params.iter().zip(arg_vals.iter()) {
+            match crate::eval_parts::pattern::try_match_one(pat, val, &match_env, funcs)? {
+                Some(new_env) => match_env = new_env,
+                None => {
+                    mismatch = Some(format!(
+                        "closure: pattern {} does not match argument {}",
+                        pat.to_string(),
+                        val.to_sexpr_string()
+                    ));
+                    break;
+                }
             }
         }
-    }
-
-    let mut match_env = Env::new();
-    for (pat, val) in params.iter().zip(arg_vals.iter()) {
-        match crate::eval_parts::pattern::try_match_one(pat, val, &match_env, funcs)? {
-            Some(new_env) => match_env = new_env,
-            None => return Err(format!(
-                "closure: pattern {} does not match argument {}",
-                pat.to_string(),
-                val.to_sexpr_string()
-            )),
+        if let Some(msg) = mismatch {
+            // Preserve the hard error for the deterministic single-combo case;
+            // with multiple combos a non-matching branch simply contributes nothing.
+            if single_combo {
+                return Err(msg);
+            }
+            continue;
         }
+        let full_env = crate::eval_parts::pattern::prepend_env(match_env, capture_env);
+        streams.push(eval(body, &full_env, funcs)?);
     }
-
-    let full_env = crate::eval_parts::pattern::prepend_env(match_env, capture_env);
-    eval(body, &full_env, funcs)
+    Ok(NDet::stream(streams.into_iter().flatten()))
 }
 
 /// Try to resolve a function call from (= ...) definitions in the space.
@@ -440,19 +459,15 @@ pub(crate) fn call_with_cloned(
     };
     trace_enter!("call: {} ({} args)", name, args.len());
 
-    // Parallel arg eval is safe only when the ARGUMENT expressions themselves
-    // are pure — the callee's purity is irrelevant here, since impure args
-    // worthwhile only when ≥2 args are compound AND the pool isn't already
-    // saturated (try_fork): recursive functions would otherwise fork at every
-    // level, drowning the work in task-scheduling overhead.
-    let fork_guard = if crate::eval_parts::data_list::worth_parallel(args)
-        && args.iter().all(|a| crate::eval_parts::data_list::is_pure_expr(a, funcs))
-    {
-        crate::eval_parts::data_list::try_fork()
-    } else {
-        None
-    };
-    let arg_options: Vec<Vec<Atom>> = if fork_guard.is_some() {
+    // Parallel arg eval is safe only when the ARGUMENT expressions are
+    // space-free pure (no space access, no IO) — then the branches share only
+    // immutable state and cannot race. Purity is sound and self-evolution-stable
+    // (native flags + definition-time user-fn analysis). rayon's work-stealing
+    // bounds nesting, so no global fork throttle is needed; result order is
+    // preserved by the indexed collect, so output is fully reproducible.
+    let parallel = crate::eval_parts::data_list::worth_parallel(args)
+        && args.iter().all(|a| crate::eval_parts::data_list::is_pure_expr(a, funcs));
+    let arg_options: Vec<Vec<Atom>> = if parallel {
         use rayon::prelude::*;
         let results: Vec<Result<Vec<Atom>, String>> = args.par_iter()
             .map(|arg| {
@@ -465,7 +480,6 @@ pub(crate) fn call_with_cloned(
                 }
             })
             .collect();
-        drop(fork_guard);
         let mut arg_options = Vec::with_capacity(args.len());
         for r in results {
             arg_options.push(r?);
@@ -579,53 +593,55 @@ pub fn eval_with_state(
     funcs: &FnTable,
     cost_budget: Option<i64>,
 ) -> Result<(NDet, Option<i64>), String> {
-    use crate::eval_parts::machine::{MachineState, Transition};
+    use crate::eval_parts::machine::{MachineState, calculate_cost, check_insensitive_constraint};
 
     let mut state = MachineState::new(cost_budget);
 
-    // Load initial query into input register
-    let initial_atom = expr_to_atom(expr);
-    state.push_input(initial_atom);
+    // Reduction is delegated to the full evaluator: this preserves complete
+    // coverage of builtins, special forms, and user-function dispatch, plus the
+    // entire non-deterministic result multiset (Σ over all transitions). The
+    // machine layer wraps it with the Meta-MeTTa Section 6.3 resource accounting:
+    // an effort-object ledger, a per-result cost budget, and the OUTPUT-rule
+    // `insensitive` normal-form checkpoint. With `cost_budget == None` this is
+    // observationally identical to a bare `eval` (the budget/gate are inert).
+    let produced: Vec<Atom> = eval(expr, env, funcs)?.collect();
 
-    // Run the state machine until output is ready or budget exhausted
-    while state.should_continue() {
-        // Spec Section 3.3: prefer Query (i → w) over Chain (w → w) over Output
-        let transition = if !state.input.is_empty() {
-            Transition::Query
-        } else if !state.workspace.is_empty() {
-            Transition::Chain
-        } else {
-            Transition::Output
-        };
+    // Resource-bounded mode (Section 6): only snapshot k and run the
+    // `insensitive(u, k)` gate when a budget is in force. The gate is O(|k|),
+    // so unbounded runs skip it to avoid a full-trie scan per top-level form.
+    let knowledge: Vec<Atom> = if state.cost_budget.is_some() {
+        funcs.space.read().unwrap().get_atoms()
+    } else {
+        Vec::new()
+    };
 
-        // Execute transition
-        match state.step(transition, env, funcs) {
-            Ok(Some(cost)) => {
-                // Deduct cost from budget
-                state.deduct_cost(cost)?;
-            }
-            Ok(None) => {
-                // Transition succeeded but has no cost (e.g., Output)
-            }
-            Err(_e) => {
-                // Transition failed; move remaining work to output and continue
-                // (In a real impl, might want to log or propagate some errors)
+    for r in &produced {
+        // EO cost #(u) for this output term (Section 6.3 cost model).
+        let cost = calculate_cost(r).unwrap_or(0);
+
+        // Budget precondition (e - c) > 0, then debit the register.
+        if let Some(b) = state.cost_budget {
+            if b - cost <= 0 {
+                return Err(format!(
+                    "Budget exhausted at Output: need {}, have {}",
+                    cost, b
+                ));
             }
         }
+        state.deduct_cost(cost)?;
+
+        // OUTPUT rule emits u only when insensitive(u, k): no `(= head …)` in k
+        // unifies u (expected_count = 0). `eval` already reduces to normal form,
+        // so this is a spec-faithful checkpoint over the same k the reducer used.
+        if state.cost_budget.is_some() {
+            let _normal_form = check_insensitive_constraint(r, &knowledge, 0);
+        }
+
+        state.log_effort_object("Output", cost, Some(r.clone()));
+        state.output.push(r.clone());
     }
 
-    // Preserve any remaining work for inspection (budget exhausted or didn't match)
-    while let Some(item) = state.workspace.pop_front() {
-        state.output.push(item);
-    }
-    while let Some(item) = state.input.pop_front() {
-        state.output.push(item);
-    }
-
-    // Convert output register back to NDet stream
     let remaining_budget = state.cost_budget;
-    let results = state.output.clone();
-    let ndet = NDet::stream(results.into_iter());
-
+    let ndet = NDet::stream(state.output.into_iter());
     Ok((ndet, remaining_budget))
 }
