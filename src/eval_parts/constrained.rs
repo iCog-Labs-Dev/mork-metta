@@ -66,7 +66,7 @@ pub(crate) fn eval_constrained(
                                 ),
                                 crate::space::Pattern::Any,
                             ]);
-                            let space_matches = funcs.space.lock().unwrap().match_atoms(&pat);
+                            let space_matches = funcs.space.read().unwrap().match_atoms(&pat);
                             for m in space_matches {
                                 if let Atom::Expr(items) = &m.atom {
                                     if items.len() == 3 {
