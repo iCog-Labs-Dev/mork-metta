@@ -26,7 +26,7 @@ fn test_phase2_query_knowledge_with_simple_definition() {
         Atom::Expr(vec![Atom::sym("test")]),
         Atom::sym("ok"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     // Create machine state and query
     let mut state = MachineState::new(Some(1000));
@@ -61,8 +61,8 @@ fn test_phase2_eval_with_state_undefined_symbol() {
     assert!(result.is_ok());
 
     let (mut ndet, budget) = result.unwrap();
-    // Budget is deducted: Query rule costs #(undefined) = 1 (symbol costs 1)
-    assert_eq!(budget, Some(999));
+    // No matches for undefined symbol — cost is 0, budget unchanged
+    assert_eq!(budget, Some(1000));
 
     // Since there's no definition for "undefined", Query returns no matches
     // Result: output register is empty
@@ -98,7 +98,7 @@ fn test_phase2_query_matches_definition_but_chain_consumes_result() {
         Atom::Expr(vec![Atom::sym("choice")]),
         Atom::sym("ok"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     // Test through direct machine state manipulation instead
     let mut state = MachineState::new(Some(1000));
@@ -148,7 +148,7 @@ fn test_phase2_complex_unification_multiple_variables() {
             Atom::sym("$y"),
         ]),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     let mut state = MachineState::new(Some(1000));
     let query = Atom::Expr(vec![
@@ -197,7 +197,7 @@ fn test_phase2_nested_expressions_unification() {
         ]),
         Atom::sym("$x"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     let mut state = MachineState::new(Some(1000));
     let query = Atom::Expr(vec![
@@ -233,7 +233,7 @@ fn test_phase2_cost_budget_exhaustion_stops_execution() {
         Atom::Expr(vec![Atom::sym("test")]),
         Atom::sym("ok"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     // Very low budget: Query for (test) costs 3 tokens
     // (2 * 1 base for expr + 1 for symbol recursive cost = 3)
@@ -284,7 +284,7 @@ fn test_phase2_identical_variables_in_pattern() {
         ]),
         Atom::sym("same"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     // Test 1: matching query (equal a a)
     let mut state1 = MachineState::new(Some(1000));
@@ -343,8 +343,8 @@ fn test_phase2_multiple_query_iterations() {
         Atom::Expr(vec![Atom::sym("b")]),
         Atom::sym("result2"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def1).unwrap();
-    funcs.space.lock().unwrap().add_atom(&def2).unwrap();
+    funcs.space.write().unwrap().add_atom(&def1).unwrap();
+    funcs.space.write().unwrap().add_atom(&def2).unwrap();
 
     let mut state = MachineState::new(Some(1000));
     // Push multiple queries to input
@@ -422,7 +422,7 @@ fn test_phase2_definition_with_ground_body() {
             Atom::sym("baz"),
         ]),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     let mut state = MachineState::new(Some(1000));
     let query = Atom::Expr(vec![Atom::sym("constant")]);
@@ -460,7 +460,7 @@ fn test_phase2_overlapping_patterns_all_match() {
             Atom::Expr(vec![Atom::sym("test")]),
             Atom::sym(*result),
         ]);
-        funcs.space.lock().unwrap().add_atom(&def).unwrap();
+        funcs.space.write().unwrap().add_atom(&def).unwrap();
     }
 
     let mut state = MachineState::new(Some(1000));
@@ -503,7 +503,7 @@ fn test_phase2_query_with_unification() {
             Atom::sym("$x"),
         ]),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     // Create machine state and query
     let mut state = MachineState::new(Some(1000));
@@ -546,7 +546,7 @@ fn test_phase2_chain_rule_workspace_to_workspace() {
         ]),
         Atom::sym("$x"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     // Create machine state with term in workspace
     let mut state = MachineState::new(Some(1000));
@@ -567,13 +567,11 @@ fn test_phase2_chain_rule_workspace_to_workspace() {
     );
 
     assert!(result.is_ok());
-    // After Chain, workspace should have (id a) — the result of applying id
+    // After Chain, workspace should have a — the result of applying id twice
+    // (Chain matches (= (id $x) $x) → body (id a), then eval-in-context
+    // dispatches (id a) through space definition → a)
     assert_eq!(state.workspace.len(), 1);
-    let expected = Atom::Expr(vec![
-        Atom::sym("id"),
-        Atom::sym("a"),
-    ]);
-    assert_eq!(state.workspace.front().unwrap(), &expected);
+    assert_eq!(state.workspace.front().unwrap(), &Atom::sym("a"));
 }
 
 #[test]
@@ -595,7 +593,7 @@ fn test_phase2_full_loop_query_chain_output() {
         ]),
         Atom::sym("$x"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     // Create machine state
     let mut state = MachineState::new(Some(1000));
@@ -638,7 +636,7 @@ fn test_phase2_cost_budget_tracking() {
         Atom::Expr(vec![Atom::sym("test")]),
         Atom::sym("ok"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def).unwrap();
+    funcs.space.write().unwrap().add_atom(&def).unwrap();
 
     // Create machine state with limited budget
     let mut state = MachineState::new(Some(100));
@@ -701,7 +699,7 @@ fn test_phase2_multiple_definitions_match() {
         Atom::Expr(vec![Atom::sym("choice")]),
         Atom::sym("a"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def1).unwrap();
+    funcs.space.write().unwrap().add_atom(&def1).unwrap();
 
     // Add second definition: (= (choice) b)
     let def2 = Atom::Expr(vec![
@@ -709,7 +707,7 @@ fn test_phase2_multiple_definitions_match() {
         Atom::Expr(vec![Atom::sym("choice")]),
         Atom::sym("b"),
     ]);
-    funcs.space.lock().unwrap().add_atom(&def2).unwrap();
+    funcs.space.write().unwrap().add_atom(&def2).unwrap();
 
     // Create machine state and query
     let mut state = MachineState::new(Some(1000));
