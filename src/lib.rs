@@ -48,7 +48,7 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Create a new runtime with a `LocalSpace` backend.
+    /// Create a new runtime backed by MORK's PathMap trie.
     pub fn new() -> Self {
         let funcs = FnTable::new();
         register_builtins(&funcs);
@@ -60,45 +60,6 @@ impl Runtime {
         let funcs = FnTable::with_space(space);
         register_builtins(&funcs);
         Runtime { funcs }
-    }
-
-    /// Rebuild the function table by scanning the space for `(= ...)` atoms.
-    pub fn reify_functions(&mut self) {
-        let pat = Pattern::Expr(vec![
-            Pattern::Exact(Atom::sym("=")),
-            Pattern::Any,
-            Pattern::Any,
-        ]);
-        // Snapshot matches while holding space lock
-        let matches: Vec<_> = {
-            let space = self.funcs.space.read().unwrap();
-            space.match_atoms(&pat)
-        };
-        // Snapshot state
-        let state: std::collections::HashMap<String, Atom> = {
-            let s = self.funcs.state.lock().unwrap();
-            s.clone()
-        };
-        // Move space out of current table
-        let old_space = std::mem::replace(
-            &mut *self.funcs.space.write().unwrap(),
-            crate::space::LocalSpace::new_box(),
-        );
-        // Fresh table
-        let new_table = FnTable::new();
-        register_builtins(&new_table);
-        // Move space and state into new table
-        let _ = std::mem::replace(&mut *new_table.space.write().unwrap(), old_space);
-        let _ = std::mem::replace(&mut *new_table.state.lock().unwrap(), state);
-        // Re-register user-defined functions and populate fn_cache
-        for result in matches {
-            if let Ok(expr) = parser::atom_to_expr(&result.atom) {
-                if let Ok((name, clause)) = compile_definition(&expr) {
-                    new_table.cache_fn(&name, clause.patterns.len() as u8, clause);
-                }
-            }
-        }
-        self.funcs = new_table;
     }
 
     /// Process a single top-level form.
@@ -136,7 +97,10 @@ impl Runtime {
             }
             TopForm::Runnable(expr) => {
                 let env = Env::new();
-                let mut results = eval_scope(&expr, &env, &self.funcs)?;
+                // Drive the spec's 4-register machine (cost ledger + insensitive
+                // gate live; unbounded budget → results identical to bare eval).
+                let (mut results, _budget) =
+                    crate::eval_parts::eval_with_state(&expr, &env, &self.funcs, None)?;
                 Ok(results.next())
             }
         }
