@@ -461,6 +461,15 @@ impl MachineState {
                     total_result_cost += c;
                 }
 
+                // Self-evolution: if the rewrite produced a `(= head body)`
+                // definition, register it as callable so future evaluation can
+                // dispatch to the newly-evolved rule.
+                if let Atom::Expr(parts) = &new_atom {
+                    if parts.len() == 3 && parts[0] == Atom::sym("=") {
+                        register_function_definition(&parts[1], &parts[2], funcs)?;
+                    }
+                }
+
                 // Phase 7: each match ti produces Ki[replacementσ_i]. In a flat space
                 // Ki is trivial (Ki[u] = u), so push the result directly.
                 self.workspace.push_back(new_atom);
@@ -840,32 +849,22 @@ fn deref(atom: &Atom, subst: &HashMap<String, Atom>) -> Atom {
 /// This enables code evolution: the system transforms its own definitions at runtime.
 fn register_function_definition(
     head: &Atom,
-    _body: &Atom,
-    _funcs: &crate::func::FnTable,
+    body: &Atom,
+    funcs: &crate::func::FnTable,
 ) -> Result<(), String> {
-    // Extract function name from head
+    // Reconstruct `(= head body)`, compile it to a clause, and install it in the
+    // dispatch cache so the freshly-evolved rule is immediately callable by the
+    // live evaluator. This is the self-evolution closure: Transform rewrites a
+    // definition and the result becomes executable code.
     match head {
-        Atom::Sym(_name) => {
-            // head is a simple symbol: (= name body)
-            // Register as 0-arity function
-            // TODO: implement funcs.register_clause(name, vec![], body)
-            // Deferred: requires integration with FnTable callable registration
-            Ok(())
-        }
-        Atom::Expr(items) if !items.is_empty() => {
-            // head is a compound: (= (name args...) body)
-            if let Atom::Sym(_name) = &items[0] {
-                // name is the function name, items[1..] are formal parameters
-                // Register as n-arity function where n = items.len() - 1
-                // TODO: implement funcs.register_clause(name, items[1..], body)
-                // Deferred: requires integration with FnTable callable registration
-                Ok(())
-            } else {
-                Err("Transform head must start with function name".to_string())
-            }
-        }
-        _ => Err("Transform head must be symbol or expression".to_string()),
+        Atom::Sym(_) | Atom::Expr(_) => {}
+        _ => return Err("Transform head must be a symbol or expression".to_string()),
     }
+    let def = Atom::Expr(vec![Atom::sym("="), head.clone(), body.clone()]);
+    let expr = crate::parser::atom_to_expr(&def)?;
+    let (name, clause) = crate::compile::compile_definition(&expr)?;
+    funcs.cache_fn(&name, clause.patterns.len() as u8, clause);
+    Ok(())
 }
 
 /// Occurs check: does variable v occur in term?
