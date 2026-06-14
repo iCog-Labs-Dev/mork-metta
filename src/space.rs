@@ -210,13 +210,28 @@ impl Space for MorkSpace {
         let mut results = Vec::new();
         let mut z = inner.btm.read_zipper_at_path(prefix);
         while z.to_next_val() {
-            // origin_path = prefix ++ path = the full stored key (encoded atom).
             if let Some(stored) = decode_expr_bytes(z.origin_path()) {
                 if let Some(mr) = match_one(pattern, &stored) {
                     results.push(mr);
                 }
             }
         }
+
+        // Prefix-based traversal may miss atoms that have $var symbols where the
+        // pattern has ground values (e.g. pattern (= (f (42) $x) ...) against
+        // stored atom (= (f $L $a $b) ...)).  When that happens, fall back to
+        // a full trie traversal — the per-atom unify handles stored $vars.
+        if results.is_empty() && !prefix.is_empty() {
+            let mut z = inner.btm.read_zipper();
+            while z.to_next_val() {
+                if let Some(stored) = decode_expr_bytes(z.origin_path()) {
+                    if let Some(mr) = match_one(pattern, &stored) {
+                        results.push(mr);
+                    }
+                }
+            }
+        }
+
         results
     }
 
