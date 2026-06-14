@@ -21,6 +21,8 @@ use crate::parser::Expr;
 /// single `Atom::Expr`.
 ///
 /// (including nested function calls), then collected into one list atom.
+use crate::eval_parts::constrained::cartesian_product;
+
 pub(crate) fn eval_data_list(items: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     eval_data_list_par(items, env, funcs)
 }
@@ -35,61 +37,30 @@ pub(crate) fn eval_data_list_with_head(
     env: &Env,
     funcs: &FnTable,
 ) -> Result<NDet, String> {
-    let all_pure = worth_parallel(rest) && rest.iter().all(|item| is_pure_expr(item, funcs));
-    if all_pure {
-        use rayon::prelude::*;
-        let mut atoms = Vec::with_capacity(rest.len() + 1);
-        atoms.push(head);
-        let results: Vec<Result<Option<Atom>, String>> = rest.par_iter()
-            .map(|item| eval_data_item(item, env, funcs))
-            .collect();
-        for r in results {
-            match r? {
-                Some(a) => atoms.push(a),
-                None => return Ok(NDet::stream(std::iter::empty())),
-            }
-        }
-        Ok(NDet::single(Atom::Expr(atoms)))
-    } else {
-        let mut atoms = Vec::with_capacity(rest.len() + 1);
-        atoms.push(head);
-        for item in rest {
-            match eval_data_item(item, env, funcs)? {
-                Some(a) => atoms.push(a),
-                None => return Ok(NDet::stream(std::iter::empty())),
-            }
-        }
-        Ok(NDet::single(Atom::Expr(atoms)))
+    let per_elem = eval_elements(rest, env, funcs)?;
+    if per_elem.iter().any(|e| e.is_empty()) {
+        return Ok(NDet::stream(std::iter::empty()));
     }
+    // Cartesian-product the tail; prepend the (already-evaluated) head to each.
+    let combos = cartesian_product(&per_elem);
+    let lists: Vec<Atom> = combos
+        .into_iter()
+        .map(|rest_vals| {
+            let mut atoms = Vec::with_capacity(rest_vals.len() + 1);
+            atoms.push(head.clone());
+            atoms.extend(rest_vals);
+            Atom::Expr(atoms)
+        })
+        .collect();
+    Ok(NDet::stream(lists.into_iter()))
 }
 
-/// Count of currently-active parallel fork regions. Used as a saturation
-/// gate: once enough concurrent forks exist to feed every worker, deeper
-/// recursion levels evaluate sequentially. Without this, recursive functions
-/// fork at EVERY level — exponentially many micro-tasks whose scheduling
-/// overhead dwarfs the work (observed: 10x CPU burn for 4x wall-clock).
-static ACTIVE_FORKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// RAII guard for a parallel fork region.
-pub(crate) struct ForkGuard;
-impl Drop for ForkGuard {
-    fn drop(&mut self) {
-        ACTIVE_FORKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Try to claim a fork slot. Returns a guard while the pool is unsaturated,
-/// `None` once active forks ≥ worker count (callers then go sequential).
-pub(crate) fn try_fork() -> Option<ForkGuard> {
-    let limit = rayon::current_num_threads();
-    let prev = ACTIVE_FORKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if prev < limit {
-        Some(ForkGuard)
-    } else {
-        ACTIVE_FORKS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        None
-    }
-}
+// Nested parallelism is bounded by rayon's work-stealing scheduler itself: when
+// the pool is saturated, `par_iter`/`join` run inline on the current worker
+// instead of spawning, so recursion does NOT create exponential live tasks. No
+// global fork counter is needed (it only added cross-thread atomic contention
+// and made the parallel/sequential choice depend on wall-clock timing, i.e.
+// non-reproducible). Granularity is gated cheaply by `worth_parallel` below.
 
 /// Heuristic: is parallel evaluation of these expressions worth the rayon
 /// task overhead? Only when at least two of them are compound (non-empty
@@ -153,53 +124,63 @@ fn is_pure_expr_inner(expr: &Expr, funcs: &FnTable, assume_pure: Option<&str>) -
     }
 }
 
-/// Evaluate a data list in parallel when all elements are pure.
-/// Otherwise, evaluates sequentially (preserves side-effect ordering).
-pub(crate) fn eval_data_list_par(items: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+/// Evaluate every element of a list to its FULL result set (parallel when all
+/// elements are pure, else sequential to preserve side-effect ordering).
+/// Returns one `Vec<Atom>` per element — the element's complete non-deterministic
+/// result multiset, which the caller cartesian-products into list values.
+fn eval_elements(items: &[Expr], env: &Env, funcs: &FnTable) -> Result<Vec<Vec<Atom>>, String> {
     let all_pure = worth_parallel(items) && items.iter().all(|item| is_pure_expr(item, funcs));
     if all_pure {
         use rayon::prelude::*;
-        let results: Vec<Result<Option<Atom>, String>> = items.par_iter()
-            .map(|item| eval_data_item(item, env, funcs))
+        let results: Vec<Result<Vec<Atom>, String>> = items.par_iter()
+            .map(|item| eval_data_item_all(item, env, funcs))
             .collect();
-        let mut atoms = Vec::with_capacity(items.len());
+        let mut per_elem = Vec::with_capacity(items.len());
         for r in results {
-            match r? {
-                Some(a) => atoms.push(a),
-                None => return Ok(NDet::stream(std::iter::empty())),
-            }
+            per_elem.push(r?);
         }
-        Ok(NDet::single(Atom::Expr(atoms)))
+        Ok(per_elem)
     } else {
-        // Sequential path (preserves order + side-effect visibility)
-        let mut atoms = Vec::with_capacity(items.len());
+        let mut per_elem = Vec::with_capacity(items.len());
         for item in items {
-            match eval_data_item(item, env, funcs)? {
-                Some(a) => atoms.push(a),
-                None => return Ok(NDet::stream(std::iter::empty())),
-            }
+            per_elem.push(eval_data_item_all(item, env, funcs)?);
         }
-        Ok(NDet::single(Atom::Expr(atoms)))
+        Ok(per_elem)
     }
 }
 
-/// Evaluate one element of a data list. Returns `None` if the expression produces
-/// no results (empty NDet), which callers propagate as empty.
-pub(crate) fn eval_data_item(item: &Expr, env: &Env, funcs: &FnTable) -> Result<Option<Atom>, String> {
+/// Evaluate a data list, preserving non-determinism. Each element contributes
+/// its full result set; the list value is the cartesian product of those sets
+/// (so `(a (superpose (1 2)))` yields both `(a 1)` and `(a 2)`). When every
+/// element is deterministic this is exactly one list — identical to before.
+pub(crate) fn eval_data_list_par(items: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    let per_elem = eval_elements(items, env, funcs)?;
+    // Any element with no results collapses the whole list to empty (non-det zero).
+    if per_elem.iter().any(|e| e.is_empty()) {
+        return Ok(NDet::stream(std::iter::empty()));
+    }
+    let combos = cartesian_product(&per_elem);
+    let lists: Vec<Atom> = combos.into_iter().map(Atom::Expr).collect();
+    Ok(NDet::stream(lists.into_iter()))
+}
+
+/// Evaluate one element of a data list to its complete result multiset.
+/// An empty vec means the element produced no results (caller propagates empty).
+pub(crate) fn eval_data_item_all(item: &Expr, env: &Env, funcs: &FnTable) -> Result<Vec<Atom>, String> {
     match item {
-        Expr::Number(n) => Ok(Some(Atom::Num(*n))),
+        Expr::Number(n) => Ok(vec![Atom::Num(*n)]),
         Expr::Symbol(s) => {
             if s.starts_with('$') {
-                Ok(Some(env.get(s).unwrap_or_else(|| Atom::sym(s))))
+                Ok(vec![env.get(s).unwrap_or_else(|| Atom::sym(s))])
             } else {
-                Ok(Some(Atom::sym(s)))
+                Ok(vec![Atom::sym(s)])
             }
         }
         Expr::List(inner) => {
             if inner.is_empty() {
-                Ok(Some(Atom::Expr(vec![])))
+                Ok(vec![Atom::Expr(vec![])])
             } else {
-                Ok(eval(item, env, funcs)?.next())
+                Ok(eval(item, env, funcs)?.collect())
             }
         }
     }
