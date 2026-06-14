@@ -594,52 +594,38 @@ pub fn eval_with_state(
     funcs: &FnTable,
     cost_budget: Option<i64>,
 ) -> Result<(NDet, Option<i64>), String> {
-    use crate::eval_parts::machine::{MachineState, calculate_cost, check_insensitive_constraint};
+    use crate::eval_parts::machine::{MachineState, Transition};
 
     let mut state = MachineState::new(cost_budget);
 
     // Reduction is delegated to the full evaluator: this preserves complete
     // coverage of builtins, special forms, and user-function dispatch, plus the
     // entire non-deterministic result multiset (Σ over all transitions). The
-    // machine layer wraps it with the Meta-MeTTa Section 6.3 resource accounting:
-    // an effort-object ledger, a per-result cost budget, and the OUTPUT-rule
-    // `insensitive` normal-form checkpoint. With `cost_budget == None` this is
-    // observationally identical to a bare `eval` (the budget/gate are inert).
+    // machine layer wraps it with the formal 4-register operational semantics:
+    //   ⟨i, k, w, o⟩ → ⟨i, k, w, {u} ++ o⟩  (OUTPUT rule)
+    // with Section 6.3 resource accounting (effort-object ledger + cost budget).
+    // With `cost_budget == None` this is observationally identical to bare `eval`.
     let produced: Vec<Atom> = eval(expr, env, funcs)?.collect();
 
-    // Resource-bounded mode (Section 6): only snapshot k and run the
-    // `insensitive(u, k)` gate when a budget is in force. The gate is O(|k|),
-    // so unbounded runs skip it to avoid a full-trie scan per top-level form.
-    let knowledge: Vec<Atom> = if state.cost_budget.is_some() {
-        funcs.space.read().unwrap().get_atoms()
-    } else {
-        Vec::new()
-    };
+    // Push all evaluation results into the workspace register, then let the
+    // state machine step loop drive them through formal transitions.
+    for r in produced {
+        state.workspace.push_back(r);
+    }
 
-    for r in &produced {
-        // EO cost #(u) for this output term (Section 6.3 cost model).
-        let cost = calculate_cost(r).unwrap_or(0);
-
-        // Budget precondition (e - c) > 0, then debit the register.
-        if let Some(b) = state.cost_budget {
-            if b - cost <= 0 {
-                return Err(format!(
-                    "Budget exhausted at Output: need {}, have {}",
-                    cost, b
-                ));
-            }
-        }
-        state.deduct_cost(cost)?;
-
-        // OUTPUT rule emits u only when insensitive(u, k): no `(= head …)` in k
-        // unifies u (expected_count = 0). `eval` already reduces to normal form,
-        // so this is a spec-faithful checkpoint over the same k the reducer used.
-        if state.cost_budget.is_some() {
-            let _normal_form = check_insensitive_constraint(r, &knowledge, 0);
-        }
-
-        state.log_effort_object("Output", cost, Some(r.clone()));
-        state.output.push(r.clone());
+    // Step loop: apply the OUTPUT rule to each term in workspace.
+    // Each call to step() with Transition::Output:
+    //   1. Checks insensitive(u, k) — no (= ...) head in k matches u
+    //   2. Checks budget precondition (e - #(u)) > 0
+    //   3. Moves u from w to o
+    //   4. Deducts cost #(u) and logs an effort object
+    //
+    // Only Output transitions are used here, never Chain: eval() already
+    // reduces every expression to its normal form, so a result that still
+    // matches a definition head would only arise from quote/sread/repr
+    // (data forms that must NOT be further reduced).
+    while !state.workspace.is_empty() {
+        state.step(Transition::Output, env, funcs)?;
     }
 
     let remaining_budget = state.cost_budget;
