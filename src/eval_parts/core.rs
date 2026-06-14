@@ -37,7 +37,7 @@ use crate::eval_parts::space_ops::{eval_add_atom, eval_match, eval_remove_atom};
 use crate::eval_parts::special::{
     eval_call, eval_case, eval_chain, eval_collapse, eval_foldall, eval_forall,
     eval_if, eval_lambda, eval_let, eval_let_star, eval_map_atom,
-    eval_progn, eval_quote, eval_repr, eval_superpose, eval_within, eval_eval,
+    eval_once, eval_progn, eval_quote, eval_repr, eval_superpose, eval_within, eval_eval,
 };
 use crate::func::{FnTable, Function, FunctionKind, NDet};
 use crate::parser::Expr;
@@ -107,6 +107,7 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     "repr" => { trace!("→ special: repr"); return eval_repr(args, env); }
                     "within" => { trace!("→ special: within"); return eval_within(args, env, funcs); }
                     "empty" => { trace!("→ special: empty"); return Ok(NDet::stream(std::iter::empty())); }
+                    "once" => { trace!("→ special: once"); return eval_once(args, env, funcs); }
                     "py-call" => { trace!("→ special: py-call"); return eval_py_call(args, env, funcs); }
                     "import-rs!" => { trace!("→ special: import-rs!"); return eval_import_rs(args, env, funcs); }
                     _ => {}

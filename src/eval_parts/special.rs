@@ -494,6 +494,22 @@ pub(crate) fn eval_collapse(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
     Ok(NDet::single(Atom::Expr(results)))
 }
 
+/// Evaluate `(once expr)` — return first result from the stream, discard the rest.
+///
+/// PeTTa semantics: `once(Conj)` commits to the first proof.
+/// This is equivalent to calling `stream.next()` on the evaluated expression's
+/// nondeterministic stream. If the expression produces no results, returns empty.
+pub(crate) fn eval_once(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 1 {
+        return Err(format!("once: expected 1 arg, got {}", args.len()));
+    }
+    let mut stream = super::core::eval(&args[0], env, funcs)?;
+    match stream.next() {
+        Some(v) => Ok(NDet::single(v)),
+        None => Ok(NDet::stream(std::iter::empty())),
+    }
+}
+
 // ========================================================================
 // foldall — fold over nondeterministic stream
 // ========================================================================

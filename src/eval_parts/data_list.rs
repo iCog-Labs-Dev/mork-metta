@@ -99,7 +99,7 @@ fn is_pure_expr_inner(expr: &Expr, funcs: &FnTable, assume_pure: Option<&str>) -
             if let Expr::Symbol(s) = op {
                 match s.as_str() {
                     // Pure regardless of args (args not evaluated / no effects)
-                    "quote" | "superpose" | "empty" | "repr" | "|->" => true,
+                    "quote" | "superpose" | "empty" | "repr" | "|->" | "once" => true,
                     // Control forms: pure iff every subexpression is pure
                     "if" | "progn" | "let" | "let*" | "chain" | "collapse" => args_pure(),
                     // Effectful or opaque special forms
