@@ -30,6 +30,7 @@ pub mod space_ops;
 pub mod io;
 pub mod python;
 pub mod machine;
+pub mod cek;
 
 // Re-export public API (used by lib.rs)
 pub use core::{eval, eval_scope, eval_with_state};

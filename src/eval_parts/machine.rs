@@ -576,16 +576,22 @@ impl MachineState {
             // insensitive(u, k) precondition per spec Section 3.3:
             // term must not match any (= ...) definition head in k.
             // If it does, it should be Chain'd, not Output'd.
-            let space = funcs.space.write().unwrap();
-            let atoms = space.get_atoms();
-            let matches_def: bool = atoms.iter().any(|atom| {
-                matches!(atom, Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("=")
-                    && unify(&term, &items[1]).is_some())
-            });
-            drop(space);
-            if matches_def {
-                self.workspace.push_front(term);
-                return Ok(None);
+            //
+            // Only checked when a cost budget is in force (Section 6.3).
+            // Unbounded mode skips the scan to avoid a full-space lock+walk
+            // per term — a multiplicative overhead (O(N·|k|)) on every result.
+            if self.cost_budget.is_some() {
+                let space = funcs.space.read().unwrap();
+                let atoms = space.get_atoms();
+                let matches_def: bool = atoms.iter().any(|atom| {
+                    matches!(atom, Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("=")
+                        && unify(&term, &items[1]).is_some())
+                });
+                drop(space);
+                if matches_def {
+                    self.workspace.push_front(term);
+                    return Ok(None);
+                }
             }
 
             let cost = calculate_cost(&term);

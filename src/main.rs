@@ -11,6 +11,9 @@ use mork_metta::Runtime;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // Select the evaluation engine (recursive | cek) from METTA_EVAL.
+    mork_metta::eval_parts::cek::init_engine_from_env();
+
     let path = args
         .iter()
         .skip(1)
@@ -18,18 +21,16 @@ fn main() {
         .cloned()
         .expect("usage: mork-metta <file.metta>");
 
-    // Deep recursion (e.g. Peano at 300 levels) needs big stacks on EVERY thread
-    // that may run eval — including rayon workers, which default to 2MB and
-    // continue the recursion whenever evaluation passes through a parallel
-    // region. Configure the global pool before any rayon use.
-    rayon::ThreadPoolBuilder::new()
-        .stack_size(32 * 1024 * 1024)
-        .build_global()
-        .expect("failed to configure rayon thread pool");
-
+    // The default CEK engine reifies the evaluation stack onto the heap, so
+    // MeTTa recursion depth no longer consumes the native call stack — the 32MB
+    // per-thread workaround (which zeroed ~384MB of rayon worker stacks at
+    // startup, the bulk of a profiled regression) is gone. Rayon workers use
+    // their 2MB default; the eval thread keeps a modest 8MB cushion only for
+    // structurally deep *expressions* (e.g. eval_constrained / data lists),
+    // which is bounded by source nesting, not runtime recursion.
     let builder = std::thread::Builder::new()
         .name("eval-worker".into())
-        .stack_size(32 * 1024 * 1024);
+        .stack_size(8 * 1024 * 1024);
 
     let handle = builder
         .spawn(move || -> Result<(), String> {

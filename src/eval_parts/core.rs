@@ -45,8 +45,18 @@ use crate::{trace, trace_enter, trace_exit};
 use std::sync::Arc;
 
 /// Top-level entry point: evaluate an expression.
+///
+/// Dispatches to the active evaluation engine (see [`crate::eval_parts::cek`]):
+/// the recursive tree-walk (`eval`) or the iterative CEK machine. All callers
+/// that want engine-switchable evaluation must go through `eval_scope`, not
+/// `eval` directly.
 pub fn eval_scope(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
-    eval(expr, env, funcs)
+    match crate::eval_parts::cek::current_engine() {
+        crate::eval_parts::cek::Engine::Recursive => eval(expr, env, funcs),
+        crate::eval_parts::cek::Engine::Cek => {
+            crate::eval_parts::cek::run_as_ndet(expr, env, funcs)
+        }
+    }
 }
 
 /// Evaluate an expression, returning a (possibly empty) stream of results.
@@ -596,16 +606,23 @@ pub fn eval_with_state(
 ) -> Result<(NDet, Option<i64>), String> {
     use crate::eval_parts::machine::{MachineState, Transition};
 
-    let mut state = MachineState::new(cost_budget);
+    // Reduction runs on the CEK machine, which IS the spec's operational machine:
+    // each user-function reduction is a Query/Chain step debiting the budget
+    // (`Σ#(uᵢσᵢ)`), halting early when exhausted. The recursive engine has no
+    // in-loop budget, so its reduction is unbudgeted (cost applied only at Output).
+    let mut budget = cost_budget;
+    let produced: Vec<Atom> = match crate::eval_parts::cek::current_engine() {
+        crate::eval_parts::cek::Engine::Cek => {
+            crate::eval_parts::cek::run_budgeted(expr, env, funcs, &mut budget)?
+        }
+        crate::eval_parts::cek::Engine::Recursive => eval(expr, env, funcs)?.collect(),
+    };
 
-    // Reduction is delegated to the full evaluator: this preserves complete
-    // coverage of builtins, special forms, and user-function dispatch, plus the
-    // entire non-deterministic result multiset (Σ over all transitions). The
-    // machine layer wraps it with the formal 4-register operational semantics:
-    //   ⟨i, k, w, o⟩ → ⟨i, k, w, {u} ++ o⟩  (OUTPUT rule)
-    // with Section 6.3 resource accounting (effort-object ledger + cost budget).
-    // With `cost_budget == None` this is observationally identical to bare `eval`.
-    let produced: Vec<Atom> = eval(expr, env, funcs)?.collect();
+    // The machine layer then applies the OUTPUT rule to each produced term:
+    //   ⟨i, k, w, o⟩ → ⟨i, k, w, {u} ++ o⟩
+    // with the insensitive(u, k) gate, the Output cost `#(u)`, and the effort
+    // ledger (Section 3.3 / 6.3). `budget` already reflects Query/Chain spending.
+    let mut state = MachineState::new(budget);
 
     // Push all evaluation results into the workspace register, then let the
     // state machine step loop drive them through formal transitions.
