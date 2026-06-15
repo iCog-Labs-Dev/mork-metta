@@ -33,15 +33,15 @@
 //! the harness infrastructure is established. Later phases replace the body with
 //! the real step loop.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::Arc;
 
 use crate::atom::{Atom, ClosureData};
 use crate::env::Env;
 use crate::eval_parts::constrained::{cartesian_product, eval_constrained};
 use crate::eval_parts::special::{generate_free_var_values, subst_and_atomize};
 use crate::func::{FnTable, FunctionKind, NDet};
-use crate::parser::{Expr, atom_to_expr};
+use crate::parser::{atom_to_expr, Expr};
 
 /// A fully-reduced non-deterministic result multiset, with the bindings each
 /// result carries (free-variable solutions threaded by `if`/`forall`, etc.).
@@ -177,7 +177,6 @@ enum Task {
     },
 }
 
-/// Resolved call head, decided at dispatch time (before args are evaluated).
 enum Head {
     /// A native (grounded) Rust builtin.
     Native(Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static>),
@@ -545,10 +544,6 @@ fn dispatch(
     }
 }
 
-/// Resolve a plain-symbol-headed list to a call (native or user-fn) or a data
-/// list, pushing the appropriate frame + argument `Eval` tasks. When args are
-/// pure and compound, pushes a single `ParEval` task instead of sequential
-/// `Eval` tasks, enabling fork-join parallelism via rayon.
 fn dispatch_call(
     name: &str,
     args: &[Expr],
@@ -573,7 +568,6 @@ fn dispatch_call(
     };
 
     let all_items_arc = Arc::new(all_items.to_vec());
-
     match head {
         Some(head) => {
             let frame = Frame::Call {
@@ -582,15 +576,16 @@ fn dispatch_call(
                 env: env.clone(),
                 all_items: Arc::clone(&all_items_arc),
             };
-            // Pure, compound args can be evaluated in parallel via rayon.
-            let par = crate::eval_parts::data_list::worth_parallel(args)
+            let parallel = crate::eval_parts::data_list::worth_parallel(args)
                 && args
                     .iter()
                     .all(|a| crate::eval_parts::data_list::is_pure_expr(a, funcs));
-            if par {
+            if parallel {
                 let tasks: Vec<(Arc<Expr>, Env)> = args
                     .iter()
-                    .map(|a| (Arc::new(a.clone()), env.clone()))
+                    .cloned()
+                    .map(Arc::new)
+                    .map(|expr| (expr, env.clone()))
                     .collect();
                 work.push(Task::ParEval {
                     tasks,
@@ -605,35 +600,13 @@ fn dispatch_call(
                     });
                 }
             }
+            Ok(())
         }
         None => {
-            // Data list: evaluate every item (head included), then combine.
-            let n = all_items.len();
-            let par = crate::eval_parts::data_list::worth_parallel(all_items)
-                && all_items
-                    .iter()
-                    .all(|a| crate::eval_parts::data_list::is_pure_expr(a, funcs));
-            if par {
-                let tasks: Vec<(Arc<Expr>, Env)> = all_items
-                    .iter()
-                    .map(|a| (Arc::new(a.clone()), env.clone()))
-                    .collect();
-                work.push(Task::ParEval {
-                    tasks,
-                    frame: Box::new(Frame::DataList { n }),
-                });
-            } else {
-                work.push(Task::Apply(Frame::DataList { n }));
-                for item in all_items.iter().rev() {
-                    work.push(Task::Eval {
-                        expr: Arc::new(item.clone()),
-                        env: env.clone(),
-                    });
-                }
-            }
+            dispatch_data_list(&all_items_arc, env, work);
+            Ok(())
         }
     }
-    Ok(())
 }
 
 /// `(if cond then [else])`: evaluate the (shallow) condition eagerly via
@@ -1539,6 +1512,7 @@ pub(crate) fn is_special_form(s: &str) -> bool {
             | "call"
             | "reduce"
             | "eval"
+            | "transform"
             | "add-atom"
             | "remove-atom"
             | "match"

@@ -10,7 +10,6 @@
 /// Pure lists (all elements are pure expressions) can be evaluated in
 /// parallel via Rayon. Impure lists fall back to sequential evaluation to
 /// preserve side-effect ordering.
-
 use crate::atom::Atom;
 use crate::env::Env;
 use crate::eval_parts::core::eval;
@@ -67,9 +66,11 @@ pub(crate) fn eval_data_list_with_head(
 /// lists). Symbols and numbers evaluate in nanoseconds — forking for them
 /// creates a micro-task storm that costs far more than it saves.
 pub(crate) fn worth_parallel(items: &[Expr]) -> bool {
-    items.iter()
+    items
+        .iter()
         .filter(|e| matches!(e, Expr::List(l) if !l.is_empty()))
-        .count() >= 2
+        .count()
+        >= 2
 }
 
 /// Recursively check if an expression is pure (no side effects).
@@ -94,8 +95,11 @@ fn is_pure_expr_inner(expr: &Expr, funcs: &FnTable, assume_pure: Option<&str>) -
         Expr::List(items) if items.is_empty() => true,
         Expr::List(items) => {
             let op = &items[0];
-            let args_pure =
-                || items[1..].iter().all(|e| is_pure_expr_inner(e, funcs, assume_pure));
+            let args_pure = || {
+                items[1..]
+                    .iter()
+                    .all(|e| is_pure_expr_inner(e, funcs, assume_pure))
+            };
             if let Expr::Symbol(s) = op {
                 match s.as_str() {
                     // Pure regardless of args (args not evaluated / no effects)
@@ -103,10 +107,9 @@ fn is_pure_expr_inner(expr: &Expr, funcs: &FnTable, assume_pure: Option<&str>) -
                     // Control forms: pure iff every subexpression is pure
                     "if" | "progn" | "let" | "let*" | "chain" | "collapse" => args_pure(),
                     // Effectful or opaque special forms
-                    "eval" | "call" | "reduce"
-                    | "add-atom" | "remove-atom" | "match" | "import!" | "readln!"
-                    | "println!" | "case" | "foldall" | "map-atom"
-                    | "forall" | "within" | "py-call" | "import-rs!" => false,
+                    "eval" | "call" | "reduce" | "transform" | "add-atom" | "remove-atom"
+                    | "match" | "import!" | "readln!" | "println!" | "case" | "foldall"
+                    | "map-atom" | "forall" | "within" | "py-call" | "import-rs!" => false,
                     // Function call: callee must be pure (or the function being
                     // defined, assumed pure) AND every argument must be pure —
                     // a pure callee does not launder impure args.
@@ -132,7 +135,8 @@ fn eval_elements(items: &[Expr], env: &Env, funcs: &FnTable) -> Result<Vec<Vec<A
     let all_pure = worth_parallel(items) && items.iter().all(|item| is_pure_expr(item, funcs));
     if all_pure {
         use rayon::prelude::*;
-        let results: Vec<Result<Vec<Atom>, String>> = items.par_iter()
+        let results: Vec<Result<Vec<Atom>, String>> = items
+            .par_iter()
             .map(|item| eval_data_item_all(item, env, funcs))
             .collect();
         let mut per_elem = Vec::with_capacity(items.len());
@@ -153,7 +157,11 @@ fn eval_elements(items: &[Expr], env: &Env, funcs: &FnTable) -> Result<Vec<Vec<A
 /// its full result set; the list value is the cartesian product of those sets
 /// (so `(a (superpose (1 2)))` yields both `(a 1)` and `(a 2)`). When every
 /// element is deterministic this is exactly one list — identical to before.
-pub(crate) fn eval_data_list_par(items: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+pub(crate) fn eval_data_list_par(
+    items: &[Expr],
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<NDet, String> {
     let per_elem = eval_elements(items, env, funcs)?;
     // Any element with no results collapses the whole list to empty (non-det zero).
     if per_elem.iter().any(|e| e.is_empty()) {
@@ -166,7 +174,11 @@ pub(crate) fn eval_data_list_par(items: &[Expr], env: &Env, funcs: &FnTable) -> 
 
 /// Evaluate one element of a data list to its complete result multiset.
 /// An empty vec means the element produced no results (caller propagates empty).
-pub(crate) fn eval_data_item_all(item: &Expr, env: &Env, funcs: &FnTable) -> Result<Vec<Atom>, String> {
+pub(crate) fn eval_data_item_all(
+    item: &Expr,
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<Vec<Atom>, String> {
     match item {
         Expr::Number(n) => Ok(vec![Atom::Num(*n)]),
         Expr::Symbol(s) => {

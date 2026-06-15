@@ -1,3 +1,8 @@
+use crate::atom::Atom;
+use crate::parser::Expr;
+use crate::space::Space;
+use std::collections::HashMap;
+use std::path::PathBuf;
 /// Function dispatch table.
 ///
 /// Stores both user-defined functions (compiled from `(= ...)` forms) and
@@ -11,13 +16,7 @@
 ///   from the Space implementors (which may use `Cell` internally, e.g. MorkSpace).
 /// - `FunctionKind::Native` requires `Send + Sync` on the function pointer so that
 ///   native closures registered at startup are safe to call from worker threads.
-
 use std::sync::{Arc, Mutex, RwLock};
-use std::collections::HashMap;
-use std::path::PathBuf;
-use crate::parser::Expr;
-use crate::atom::Atom;
-use crate::space::Space;
 
 /// An iterator over nondeterministic results from evaluation.
 ///
@@ -29,7 +28,9 @@ pub enum NDet {
     Stream(Box<dyn Iterator<Item = Atom> + Send>),
 }
 impl NDet {
-    pub fn single(atom: Atom) -> Self { NDet::Single(Some(atom)) }
+    pub fn single(atom: Atom) -> Self {
+        NDet::Single(Some(atom))
+    }
     pub fn stream(iter: impl Iterator<Item = Atom> + Send + 'static) -> Self {
         NDet::Stream(Box::new(iter))
     }
@@ -84,6 +85,8 @@ pub struct FnTable {
     map: RwLock<FuncMap>,
     /// Atom storage — RwLock allows concurrent readers (queries), exclusive writers (add/remove).
     pub space: RwLock<Box<dyn Space + Send + Sync>>,
+    /// Lazily-created named spaces addressed by `&name`.
+    pub named_spaces: Mutex<HashMap<String, Box<dyn Space + Send + Sync>>>,
     /// Mutable state store for `get-state`, `change-state!`, `bind!`.
     pub state: Mutex<HashMap<String, Atom>>,
     /// Function definition cache — populated from space at reify time, updated
@@ -103,6 +106,7 @@ impl FnTable {
         FnTable {
             map: RwLock::new(HashMap::new()),
             space: RwLock::new(Box::new(crate::space::MorkSpace::new())),
+            named_spaces: Mutex::new(HashMap::new()),
             fn_cache: RwLock::new(HashMap::new()),
             fn_purity: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
@@ -114,6 +118,7 @@ impl FnTable {
         FnTable {
             map: RwLock::new(HashMap::new()),
             space: RwLock::new(space),
+            named_spaces: Mutex::new(HashMap::new()),
             fn_cache: RwLock::new(HashMap::new()),
             fn_purity: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
@@ -125,18 +130,30 @@ impl FnTable {
     where
         F: Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static,
     {
-        self.map.write().unwrap()
-            .entry(name.to_string()).or_insert_with(HashMap::new)
-            .insert(arity, Arc::new(Function {
-                name: name.to_string(),
-                kind: FunctionKind::Native { func: Arc::new(func) },
-                pure: false,
-            }));
+        self.map
+            .write()
+            .unwrap()
+            .entry(name.to_string())
+            .or_insert_with(HashMap::new)
+            .insert(
+                arity,
+                Arc::new(Function {
+                    name: name.to_string(),
+                    kind: FunctionKind::Native {
+                        func: Arc::new(func),
+                    },
+                    pure: false,
+                }),
+            );
     }
 
     pub fn mark_pure(&self, name: &str, arity: u8) {
-        if let Some(arc_func) = self.map.write().unwrap()
-            .get_mut(name).and_then(|inner| inner.get_mut(&arity))
+        if let Some(arc_func) = self
+            .map
+            .write()
+            .unwrap()
+            .get_mut(name)
+            .and_then(|inner| inner.get_mut(&arity))
             .and_then(|a| Arc::get_mut(a))
         {
             arc_func.pure = true;
@@ -144,13 +161,44 @@ impl FnTable {
     }
 
     pub fn has(&self, name: &str, arity: u8) -> bool {
-        self.map.read().unwrap()
-            .get(name).map_or(false, |inner| inner.contains_key(&arity))
+        self.map
+            .read()
+            .unwrap()
+            .get(name)
+            .map_or(false, |inner| inner.contains_key(&arity))
     }
 
     pub fn get(&self, name: &str, arity: u8) -> Option<Arc<Function>> {
-        self.map.read().unwrap()
-            .get(name).and_then(|inner| inner.get(&arity)).cloned()
+        self.map
+            .read()
+            .unwrap()
+            .get(name)
+            .and_then(|inner| inner.get(&arity))
+            .cloned()
+    }
+
+    pub fn with_resolved_space<R>(
+        &self,
+        space_ref: &Atom,
+        f: impl FnOnce(&dyn Space) -> Result<R, String>,
+    ) -> Result<R, String> {
+        match space_ref {
+            Atom::Sym(name) if name.as_ref() == "&self" => {
+                let space = self.space.read().unwrap();
+                f(space.as_ref())
+            }
+            Atom::Sym(name) if name.starts_with('&') => {
+                let mut spaces = self.named_spaces.lock().unwrap();
+                let space = spaces.entry(name.to_string()).or_insert_with(|| {
+                    Box::new(crate::space::MorkSpace::new()) as Box<dyn Space + Send + Sync>
+                });
+                f(space.as_ref())
+            }
+            other => Err(format!(
+                "expected space reference, got {}",
+                other.to_sexpr_string()
+            )),
+        }
     }
 
     pub fn cache_fn(&self, name: &str, arity: u8, clause: Clause) {
@@ -164,8 +212,10 @@ impl FnTable {
         {
             let mut cache = self.fn_cache.write().unwrap();
             let clauses = cache
-                .entry(name.to_string()).or_insert_with(HashMap::new)
-                .entry(arity).or_insert_with(Vec::new);
+                .entry(name.to_string())
+                .or_insert_with(HashMap::new)
+                .entry(arity)
+                .or_insert_with(Vec::new);
             // Idempotent: the trie gives `(= head body)` set semantics, so the
             // dispatch cache must too — re-adding an identical clause must not
             // duplicate it and double the result multiset (already counted in
@@ -178,8 +228,11 @@ impl FnTable {
 
         // A function is parallel-safe only if EVERY clause is pure.
         let mut purity = self.fn_purity.write().unwrap();
-        let entry = purity.entry(name.to_string()).or_insert_with(HashMap::new)
-            .entry(arity).or_insert(true);
+        let entry = purity
+            .entry(name.to_string())
+            .or_insert_with(HashMap::new)
+            .entry(arity)
+            .or_insert(true);
         *entry = *entry && clause_pure;
     }
 
@@ -206,9 +259,12 @@ impl FnTable {
         // space are treated as impure — never parallelized on an unproven
         // assumption. (A cache miss still dispatches correctly via the space
         // fallback; it just runs sequentially.)
-        self.fn_purity.read().unwrap()
-            .get(name).and_then(|inner| inner.get(&arity)).copied()
+        self.fn_purity
+            .read()
+            .unwrap()
+            .get(name)
+            .and_then(|inner| inner.get(&arity))
+            .copied()
             .unwrap_or(false)
     }
 }
-

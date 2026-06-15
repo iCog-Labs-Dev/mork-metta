@@ -23,21 +23,18 @@
 /// - `par_iter` in `call_with_cloned` (pure function arg eval)
 /// - `par_iter` in `eval_data_list_par` (pure data list elements)
 /// All use Rayon's global thread pool.
-
 use crate::atom::Atom;
 use crate::env::Env;
 use crate::eval_parts::constrained::cartesian_product;
 use crate::eval_parts::data_list::{eval_data_list, eval_data_list_with_head};
-use crate::eval_parts::io::{
-    eval_import, eval_import_rs, eval_println, eval_readln,
-};
+use crate::eval_parts::io::{eval_import, eval_import_rs, eval_println, eval_readln};
 use crate::eval_parts::pattern::match_clauses;
 use crate::eval_parts::python::eval_py_call;
-use crate::eval_parts::space_ops::{eval_add_atom, eval_match, eval_remove_atom};
+use crate::eval_parts::space_ops::{eval_add_atom, eval_match, eval_remove_atom, eval_transform};
 use crate::eval_parts::special::{
-    eval_call, eval_case, eval_chain, eval_collapse, eval_foldall, eval_forall,
-    eval_if, eval_lambda, eval_let, eval_let_star, eval_map_atom,
-    eval_once, eval_progn, eval_quote, eval_repr, eval_superpose, eval_within, eval_eval,
+    eval_call, eval_case, eval_chain, eval_collapse, eval_eval, eval_foldall, eval_forall, eval_if,
+    eval_lambda, eval_let, eval_let_star, eval_map_atom, eval_once, eval_progn, eval_quote,
+    eval_repr, eval_superpose, eval_within,
 };
 use crate::func::{FnTable, Function, FunctionKind, NDet};
 use crate::parser::Expr;
@@ -92,34 +89,122 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
             // ---- Special forms (operator NOT evaluated) ----
             if let Expr::Symbol(s) = op {
                 match s.as_str() {
-                    "if" => { trace!("→ special: if"); return eval_if(args, env, funcs); }
-                    "progn" => { trace!("→ special: progn"); return eval_progn(args, env, funcs); }
-                    "let" => { trace!("→ special: let"); return eval_let(args, env, funcs); }
-                    "let*" => { trace!("→ special: let*"); return eval_let_star(args, env, funcs); }
-                    "quote" => { trace!("→ special: quote"); return eval_quote(args, env); }
-                    "call" => { trace!("→ special: call"); return eval_call(args, env, funcs); }
-                    "reduce" => { trace!("→ special: reduce"); return eval_call(args, env, funcs); }
-                    "eval" => { trace!("→ special: eval"); return eval_eval(args, env, funcs); }
-                    "add-atom" => { trace!("→ special: add-atom"); return eval_add_atom(args, env, funcs); }
-                    "remove-atom" => { trace!("→ special: remove-atom"); return eval_remove_atom(args, env, funcs); }
-                    "match" => { trace!("→ special: match"); return eval_match(args, env, funcs); }
-                    "import!" => { trace!("→ special: import!"); return eval_import(args, env, funcs); }
-                    "readln!" => { trace!("→ special: readln!"); return eval_readln(args, env, funcs); }
-                    "println!" => { trace!("→ special: println!"); return eval_println(args, env, funcs); }
-                    "superpose" => { trace!("→ special: superpose"); return eval_superpose(args, env, funcs); }
-                    "collapse" => { trace!("→ special: collapse"); return eval_collapse(args, env, funcs); }
-                    "chain" => { trace!("→ special: chain"); return eval_chain(args, env, funcs); }
-                    "case" => { trace!("→ special: case"); return eval_case(args, env, funcs); }
-                    "foldall" => { trace!("→ special: foldall"); return eval_foldall(args, env, funcs); }
-                    "map-atom" => { trace!("→ special: map-atom"); return eval_map_atom(args, env, funcs); }
-                    "|->" => { trace!("→ special: lambda"); return eval_lambda(args, env); }
-                    "forall" => { trace!("→ special: forall"); return eval_forall(args, env, funcs); }
-                    "repr" => { trace!("→ special: repr"); return eval_repr(args, env); }
-                    "within" => { trace!("→ special: within"); return eval_within(args, env, funcs); }
-                    "empty" => { trace!("→ special: empty"); return Ok(NDet::stream(std::iter::empty())); }
-                    "once" => { trace!("→ special: once"); return eval_once(args, env, funcs); }
-                    "py-call" => { trace!("→ special: py-call"); return eval_py_call(args, env, funcs); }
-                    "import-rs!" => { trace!("→ special: import-rs!"); return eval_import_rs(args, env, funcs); }
+                    "if" => {
+                        trace!("→ special: if");
+                        return eval_if(args, env, funcs);
+                    }
+                    "progn" => {
+                        trace!("→ special: progn");
+                        return eval_progn(args, env, funcs);
+                    }
+                    "let" => {
+                        trace!("→ special: let");
+                        return eval_let(args, env, funcs);
+                    }
+                    "let*" => {
+                        trace!("→ special: let*");
+                        return eval_let_star(args, env, funcs);
+                    }
+                    "quote" => {
+                        trace!("→ special: quote");
+                        return eval_quote(args, env);
+                    }
+                    "call" => {
+                        trace!("→ special: call");
+                        return eval_call(args, env, funcs);
+                    }
+                    "reduce" => {
+                        trace!("→ special: reduce");
+                        return eval_call(args, env, funcs);
+                    }
+                    "eval" => {
+                        trace!("→ special: eval");
+                        return eval_eval(args, env, funcs);
+                    }
+                    "add-atom" => {
+                        trace!("→ special: add-atom");
+                        return eval_add_atom(args, env, funcs);
+                    }
+                    "transform" => {
+                        trace!("→ special: transform");
+                        return eval_transform(args, env, funcs);
+                    }
+                    "remove-atom" => {
+                        trace!("→ special: remove-atom");
+                        return eval_remove_atom(args, env, funcs);
+                    }
+                    "match" => {
+                        trace!("→ special: match");
+                        return eval_match(args, env, funcs);
+                    }
+                    "import!" => {
+                        trace!("→ special: import!");
+                        return eval_import(args, env, funcs);
+                    }
+                    "readln!" => {
+                        trace!("→ special: readln!");
+                        return eval_readln(args, env, funcs);
+                    }
+                    "println!" => {
+                        trace!("→ special: println!");
+                        return eval_println(args, env, funcs);
+                    }
+                    "superpose" => {
+                        trace!("→ special: superpose");
+                        return eval_superpose(args, env, funcs);
+                    }
+                    "collapse" => {
+                        trace!("→ special: collapse");
+                        return eval_collapse(args, env, funcs);
+                    }
+                    "chain" => {
+                        trace!("→ special: chain");
+                        return eval_chain(args, env, funcs);
+                    }
+                    "case" => {
+                        trace!("→ special: case");
+                        return eval_case(args, env, funcs);
+                    }
+                    "foldall" => {
+                        trace!("→ special: foldall");
+                        return eval_foldall(args, env, funcs);
+                    }
+                    "map-atom" => {
+                        trace!("→ special: map-atom");
+                        return eval_map_atom(args, env, funcs);
+                    }
+                    "|->" => {
+                        trace!("→ special: lambda");
+                        return eval_lambda(args, env);
+                    }
+                    "forall" => {
+                        trace!("→ special: forall");
+                        return eval_forall(args, env, funcs);
+                    }
+                    "repr" => {
+                        trace!("→ special: repr");
+                        return eval_repr(args, env);
+                    }
+                    "within" => {
+                        trace!("→ special: within");
+                        return eval_within(args, env, funcs);
+                    }
+                    "empty" => {
+                        trace!("→ special: empty");
+                        return Ok(NDet::stream(std::iter::empty()));
+                    }
+                    "once" => {
+                        trace!("→ special: once");
+                        return eval_once(args, env, funcs);
+                    }
+                    "py-call" => {
+                        trace!("→ special: py-call");
+                        return eval_py_call(args, env, funcs);
+                    }
+                    "import-rs!" => {
+                        trace!("→ special: import-rs!");
+                        return eval_import_rs(args, env, funcs);
+                    }
                     _ => {}
                 }
             }
@@ -146,14 +231,20 @@ fn try_call_or_data(
     funcs: &FnTable,
 ) -> Result<NDet, String> {
     // Helper: if a head atom is a lambda closure, apply it.
-    let try_apply_lambda = |head: &Atom, env: &Env, args: &[Expr]| -> Option<Result<NDet, String>> {
-        if let Atom::Closure(data) = head {
-            return Some(apply_closure(
-                &data.params, &data.body, &data.env, args, env, funcs,
-            ));
-        }
-        None
-    };
+    let try_apply_lambda =
+        |head: &Atom, env: &Env, args: &[Expr]| -> Option<Result<NDet, String>> {
+            if let Atom::Closure(data) = head {
+                return Some(apply_closure(
+                    &data.params,
+                    &data.body,
+                    &data.env,
+                    args,
+                    env,
+                    funcs,
+                ));
+            }
+            None
+        };
 
     match op {
         Expr::Symbol(s) if s.starts_with('$') => {
@@ -165,7 +256,8 @@ fn try_call_or_data(
                         Some(func) => call_with_cloned(&*func, func_name, args, env, funcs),
                         None => {
                             // Try space-based function dispatch before treating as data
-                            if let Some(result) = try_eval_from_space(func_name, args, env, funcs)? {
+                            if let Some(result) = try_eval_from_space(func_name, args, env, funcs)?
+                            {
                                 return Ok(result);
                             }
                             trace!("→ unknown symbol '{}', treating as data list", s);
@@ -214,7 +306,8 @@ fn try_call_or_data(
                         Some(func) => call_with_cloned(&*func, &func_name, args, env, funcs),
                         None => {
                             // Try space-based function dispatch before treating as data
-                            if let Some(result) = try_eval_from_space(&func_name, args, env, funcs)? {
+                            if let Some(result) = try_eval_from_space(&func_name, args, env, funcs)?
+                            {
                                 return Ok(result);
                             }
                             let head = Some(Atom::Sym(func_name));
@@ -318,9 +411,8 @@ fn try_eval_from_space_fallback(
 ) -> Result<Option<NDet>, String> {
     use crate::eval_parts::constrained::cartesian_product;
 
-    let mut head_patterns: Vec<crate::space::Pattern> = vec![
-        crate::space::Pattern::Exact(Atom::sym(name))
-    ];
+    let mut head_patterns: Vec<crate::space::Pattern> =
+        vec![crate::space::Pattern::Exact(Atom::sym(name))];
     for _ in 0..args.len() {
         head_patterns.push(crate::space::Pattern::Any);
     }
@@ -351,14 +443,12 @@ fn try_eval_from_space_fallback(
     for arg_vals in &combos {
         for m in &matches {
             let (def_head_patterns, body) = match &m.atom {
-                Atom::Expr(items) if items.len() == 3 => {
-                    match &items[1] {
-                        Atom::Expr(head_items) if head_items.len() == args.len() + 1 => {
-                            (&head_items[1..], &items[2])
-                        }
-                        _ => continue,
+                Atom::Expr(items) if items.len() == 3 => match &items[1] {
+                    Atom::Expr(head_items) if head_items.len() == args.len() + 1 => {
+                        (&head_items[1..], &items[2])
                     }
-                }
+                    _ => continue,
+                },
                 _ => continue,
             };
 
@@ -367,9 +457,14 @@ fn try_eval_from_space_fallback(
             for (head_pat, arg_val) in def_head_patterns.iter().zip(arg_vals.iter()) {
                 let head_expr = crate::parser::atom_to_expr(head_pat)
                     .unwrap_or_else(|_| crate::parser::Expr::Symbol(head_pat.to_sexpr_string()));
-                match crate::eval_parts::pattern::try_match_one(&head_expr, arg_val, &unif_env, funcs) {
+                match crate::eval_parts::pattern::try_match_one(
+                    &head_expr, arg_val, &unif_env, funcs,
+                ) {
                     Ok(Some(new_env)) => unif_env = new_env,
-                    _ => { matched = false; break; }
+                    _ => {
+                        matched = false;
+                        break;
+                    }
                 }
             }
             if !matched {
@@ -404,8 +499,12 @@ fn try_eval_from_space(
 
     // Look up cached clauses — fast path with no space lock.
     let arity = args.len() as u8;
-    let clauses: Vec<crate::func::Clause> = match funcs.fn_cache.read().unwrap()
-        .get(name).and_then(|inner| inner.get(&arity))
+    let clauses: Vec<crate::func::Clause> = match funcs
+        .fn_cache
+        .read()
+        .unwrap()
+        .get(name)
+        .and_then(|inner| inner.get(&arity))
     {
         Some(c) => c.clone(),
         None => {
@@ -436,7 +535,10 @@ fn try_eval_from_space(
             for (pat, arg_val) in clause.patterns.iter().zip(arg_vals.iter()) {
                 match crate::eval_parts::pattern::try_match_one(pat, arg_val, &unif_env, funcs) {
                     Ok(Some(new_env)) => unif_env = new_env,
-                    _ => { matched = false; break; }
+                    _ => {
+                        matched = false;
+                        break;
+                    }
                 }
             }
             if !matched {
@@ -455,7 +557,6 @@ fn try_eval_from_space(
     }
 }
 
-/// Dispatch a function call using a borrowed Function.
 pub(crate) fn call_with_cloned(
     func: &Function,
     op_name: &str,
@@ -464,8 +565,9 @@ pub(crate) fn call_with_cloned(
     funcs: &FnTable,
 ) -> Result<NDet, String> {
     let name = func.name.clone();
-    let is_native = matches!(&func.kind, FunctionKind::Native { .. });
-    let native_func: Option<Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static>> = match &func.kind {
+    let native_func: Option<
+        Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static>,
+    > = match &func.kind {
         FunctionKind::Native { func: f } => Some(Arc::clone(f)),
     };
     trace_enter!("call: {} ({} args)", name, args.len());
@@ -477,10 +579,13 @@ pub(crate) fn call_with_cloned(
     // bounds nesting, so no global fork throttle is needed; result order is
     // preserved by the indexed collect, so output is fully reproducible.
     let parallel = crate::eval_parts::data_list::worth_parallel(args)
-        && args.iter().all(|a| crate::eval_parts::data_list::is_pure_expr(a, funcs));
+        && args
+            .iter()
+            .all(|a| crate::eval_parts::data_list::is_pure_expr(a, funcs));
     let arg_options: Vec<Vec<Atom>> = if parallel {
         use rayon::prelude::*;
-        let results: Vec<Result<Vec<Atom>, String>> = args.par_iter()
+        let results: Vec<Result<Vec<Atom>, String>> = args
+            .par_iter()
             .map(|arg| {
                 let mut results = eval(arg, env, funcs)?;
                 let vals: Vec<Atom> = results.by_ref().collect();
@@ -502,10 +607,7 @@ pub(crate) fn call_with_cloned(
             let mut results = eval(arg, env, funcs)?;
             let vals: Vec<Atom> = results.by_ref().collect();
             if vals.is_empty() {
-                return Err(format!(
-                    "{}: argument {} produced no results",
-                    name, i + 1
-                ));
+                return Err(format!("{}: argument {} produced no results", name, i + 1));
             }
             arg_options.push(vals);
         }
@@ -523,7 +625,9 @@ pub(crate) fn call_with_cloned(
                         results.push(a);
                     }
                 }
-                Err(e) => { last_err = Some(e); }
+                Err(e) => {
+                    last_err = Some(e);
+                }
             }
         }
         if results.is_empty() {
@@ -539,7 +643,10 @@ pub(crate) fn call_with_cloned(
     // No native function found — shouldn't reach here since call_with_cloned
     // is only called when funcs.get() returns Some(...)
     trace_exit!();
-    Err(format!("{}: internal error — missing native function", name))
+    Err(format!(
+        "{}: internal error — missing native function",
+        op_name
+    ))
 }
 
 /// Convert an `Expr` to an `Atom` for tracing output.
@@ -558,30 +665,18 @@ fn expr_to_atom(expr: &Expr) -> Atom {
 // Phase 2: Integration with State Machine
 // ========================================================================
 
-/// Evaluate an atom within the given context.
-///
-/// This is the bridge between the state machine (machine.rs) and the eval loop.
-/// Used by `query_knowledge` to evaluate instantiated body expressions.
-///
-/// Spec Section 3.3: body[σ] evaluation
-/// Converts the atom back to an Expr and evaluates it using the normal eval loop.
-///
-/// Phase 2: eval_in_context() enables the state machine to call back into
-/// the eval loop for unification and body evaluation.
 pub(crate) fn eval_in_context(
     atom: &Atom,
     env: &Env,
     funcs: &FnTable,
 ) -> Result<Vec<Atom>, String> {
-    // Convert atom back to Expr for evaluation
     let expr = crate::parser::atom_to_expr(atom).unwrap_or_else(|_| {
-        // If conversion fails, treat as a symbol
+        // If conversion fails, treat the atom as a symbol fallback.
         Expr::Symbol(atom.to_sexpr_string())
     });
 
-    // Evaluate and collect all results
     let mut results = Vec::new();
-    let mut stream = eval(&expr, env, funcs)?;
+    let mut stream = eval_scope(&expr, env, funcs)?;
     while let Some(result) = stream.next() {
         results.push(result);
     }
@@ -589,15 +684,6 @@ pub(crate) fn eval_in_context(
     Ok(results)
 }
 
-/// Evaluate an expression using the 4-register state machine.
-///
-/// This is the new entry point that uses formal operational semantics (Meta-MeTTa spec Section 3.3).
-/// Eventually this will replace the expression-centric eval loop.
-///
-/// Phase 2: eval_with_state() provides an optional alternative evaluation path.
-/// - Maintains backward compatibility: existing eval() is unchanged
-/// - Optional cost budgeting: None means unlimited, Some(n) means n tokens
-/// - Returns both results and remaining budget
 pub fn eval_with_state(
     expr: &Expr,
     env: &Env,
@@ -606,10 +692,10 @@ pub fn eval_with_state(
 ) -> Result<(NDet, Option<i64>), String> {
     use crate::eval_parts::machine::{MachineState, Transition};
 
-    // Reduction runs on the CEK machine, which IS the spec's operational machine:
-    // each user-function reduction is a Query/Chain step debiting the budget
-    // (`Σ#(uᵢσᵢ)`), halting early when exhausted. The recursive engine has no
-    // in-loop budget, so its reduction is unbudgeted (cost applied only at Output).
+    // Ordinary runtime evaluation still runs through the active evaluator so
+    // user-function calls preserve eager argument evaluation and existing
+    // special-form behavior. Machine-native surface forms such as transform,
+    // add-atom, and remove-atom are routed through transitions inside eval().
     let mut budget = cost_budget;
     let produced: Vec<Atom> = match crate::eval_parts::cek::current_engine() {
         crate::eval_parts::cek::Engine::Cek => {
@@ -618,29 +704,11 @@ pub fn eval_with_state(
         crate::eval_parts::cek::Engine::Recursive => eval(expr, env, funcs)?.collect(),
     };
 
-    // The machine layer then applies the OUTPUT rule to each produced term:
-    //   ⟨i, k, w, o⟩ → ⟨i, k, w, {u} ++ o⟩
-    // with the insensitive(u, k) gate, the Output cost `#(u)`, and the effort
-    // ledger (Section 3.3 / 6.3). `budget` already reflects Query/Chain spending.
     let mut state = MachineState::new(budget);
-
-    // Push all evaluation results into the workspace register, then let the
-    // state machine step loop drive them through formal transitions.
     for r in produced {
         state.workspace.push_back(r);
     }
 
-    // Step loop: apply the OUTPUT rule to each term in workspace.
-    // Each call to step() with Transition::Output:
-    //   1. Checks insensitive(u, k) — no (= ...) head in k matches u
-    //   2. Checks budget precondition (e - #(u)) > 0
-    //   3. Moves u from w to o
-    //   4. Deducts cost #(u) and logs an effort object
-    //
-    // Only Output transitions are used here, never Chain: eval() already
-    // reduces every expression to its normal form, so a result that still
-    // matches a definition head would only arise from quote/sread/repr
-    // (data forms that must NOT be further reduced).
     while !state.workspace.is_empty() {
         state.step(Transition::Output, env, funcs)?;
     }

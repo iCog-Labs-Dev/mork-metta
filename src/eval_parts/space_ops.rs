@@ -9,98 +9,88 @@
 /// - `(add-atom space atom)` — add an atom to the space
 /// - `(remove-atom space atom)` — remove an atom from the space
 /// - `(match space pattern body)` — pattern match atoms in a space
-
 use crate::atom::Atom;
 use crate::env::Env;
 use crate::eval_parts::core::eval;
 use crate::eval_parts::data_list::eval_data_list;
+use crate::eval_parts::machine::{self, MachineState, Transition};
 use crate::eval_parts::pattern::prepend_env;
 use crate::func::{FnTable, NDet};
 use crate::parser::{atom_to_expr, Expr};
 use crate::space::Pattern;
 
-/// Evaluate `(add-atom space atom)` — add an atom to the space.
-///
-/// This is a special form (not a builtin) because its arguments are NOT
-/// evaluated before being passed — PeTTa semantics: `add-atom` receives
-/// raw expressions so that `$` variable names in definitions are preserved
-/// rather than triggering variable lookup errors.
 pub(crate) fn eval_add_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 2 {
-        return Err(format!("add-atom: expected (space atom), got {} args", args.len()));
+        return Err(format!(
+            "add-atom: expected (space atom), got {} args",
+            args.len()
+        ));
     }
-    // Evaluate space reference (should evaluate to &self or similar)
+
     let mut space_results = eval(&args[0], env, funcs)?;
-    let _space_ref = space_results.next().ok_or_else(|| {
-        "add-atom: space expression produced no results".to_string()
-    })?;
-    // Convert the atom expression substituting bound $vars from env.
-    // Bound vars (e.g. $body in evalCustom) get their values; unbound vars
-    // (e.g. $N in (= (fib $N) ...)) stay as $-symbols. Matches PeTTa: add-atom
-    // receives the Prolog term where unified variables already hold their values.
+    let space_ref = space_results
+        .next()
+        .ok_or_else(|| "add-atom: space expression produced no results".to_string())?;
+
     let atom = crate::eval_parts::special::subst_and_atomize(&args[1], env);
-    funcs.space.write().unwrap().add_atom(&atom).map_err(|e| format!("add-atom: {}", e))?;
-    // If the atom is a function definition (= head body), also store the bare
-    // head atom so `match` can find premise atoms (e.g. (= (f $x) $x) → (f $x)).
-    if let Atom::Expr(items) = &atom {
-        if items.len() == 3 && items[0] == Atom::sym("=") {
-            funcs.space.write().unwrap().add_atom(&items[1])?;
-            // Also populate fn_cache
-            if let Ok(expr) = crate::parser::atom_to_expr(&atom) {
-                if let Ok((name, clause)) = crate::compile::compile_definition(&expr) {
-                    funcs.cache_fn(&name, clause.patterns.len() as u8, clause);
-                }
-            }
-        }
+    if matches!(&space_ref, Atom::Sym(name) if name.as_ref() == "&self") {
+        let mut state = MachineState::new(None);
+        state
+            .step(Transition::AddAtom(atom), env, funcs)
+            .map_err(|e| format!("add-atom: {}", e))?;
+    } else {
+        funcs
+            .with_resolved_space(&space_ref, |space| space.add_atom(&atom))
+            .map_err(|e| format!("add-atom: {}", e))?;
     }
+
     Ok(NDet::single(Atom::sym("true")))
 }
 
-/// Evaluate `(remove-atom space atom)` — remove an atom from the space.
-/// Same special-form treatment as add-atom (arguments not pre-evaluated).
-/// Uses pattern matching (like `retract/1`): substitutes env-bound $vars,
-/// converts to a pattern, removes all exact matches found.
 pub(crate) fn eval_remove_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 2 {
-        return Err(format!("remove-atom: expected (space atom), got {} args", args.len()));
+        return Err(format!(
+            "remove-atom: expected (space atom), got {} args",
+            args.len()
+        ));
     }
-    // Evaluate space reference
+
     let mut space_results = eval(&args[0], env, funcs)?;
-    let _space_ref = space_results.next().ok_or_else(|| {
-        "remove-atom: space expression produced no results".to_string()
-    })?;
-    // In PeTTa, remove-atom uses pattern matching (like `retract/1`).
-    // Substitute env-bound $vars first (e.g. $1/$2 bound by an enclosing match),
-    // then match the atom as a pattern and remove all exact matches found.
+    let space_ref = space_results
+        .next()
+        .ok_or_else(|| "remove-atom: space expression produced no results".to_string())?;
+
     let expr = crate::eval_parts::special::subst_expr_vars(&args[1], env);
     let pattern = crate::space::Pattern::from_expr(&expr);
-    let mut removed_any = false;
-    // Hold the lock across snapshot + removal so a concurrent template can't
-    // mutate the space between matching an atom and removing it (TOCTOU).
-    let removed_atoms: Vec<Atom> = {
-        let mut space = funcs.space.write().unwrap();
-        let matches = space.match_atoms(&pattern);
-        let mut removed = Vec::new();
-        for m in matches {
-            if let Ok(true) = space.remove_atom(&m.atom) {
-                removed_any = true;
-                removed.push(m.atom);
-            }
+
+    let removed_any = if matches!(&space_ref, Atom::Sym(name) if name.as_ref() == "&self") {
+        let matches = funcs
+            .with_resolved_space(&space_ref, |space| Ok(space.match_atoms(&pattern)))
+            .map_err(|e| format!("remove-atom: {}", e))?;
+
+        let mut removed_any = false;
+        let mut state = MachineState::new(None);
+        for matched in matches {
+            state
+                .step(Transition::RemAtom(matched.atom.clone()), env, funcs)
+                .map_err(|e| format!("remove-atom: {}", e))?;
+            removed_any = true;
         }
-        removed
-    };
-    // Invalidate fn_cache for any removed function definitions.
-    for atom in &removed_atoms {
-        if let Atom::Expr(items) = atom {
-            if items.len() == 3 && items[0] == Atom::sym("=") {
-                if let Ok(expr) = crate::parser::atom_to_expr(atom) {
-                    if let Ok((name, clause)) = crate::compile::compile_definition(&expr) {
-                        funcs.uncache_fn(&name, clause.patterns.len() as u8);
+        removed_any
+    } else {
+        funcs
+            .with_resolved_space(&space_ref, |space| {
+                let matches = space.match_atoms(&pattern);
+                let mut removed_any = false;
+                for matched in matches {
+                    if space.remove_atom(&matched.atom)? {
+                        removed_any = true;
                     }
                 }
-            }
-        }
-    }
+                Ok(removed_any)
+            })
+            .map_err(|e| format!("remove-atom: {}", e))?
+    };
 
     Ok(NDet::single(if removed_any {
         Atom::sym("true")
@@ -123,7 +113,8 @@ fn subst_match_vars(atom: &Atom, bindings: &[(String, Atom)]) -> Atom {
             }
         }
         Atom::Expr(items) => {
-            let new_items: Vec<Atom> = items.iter()
+            let new_items: Vec<Atom> = items
+                .iter()
                 .map(|a| subst_match_vars(a, bindings))
                 .collect();
             Atom::Expr(new_items)
@@ -132,14 +123,120 @@ fn subst_match_vars(atom: &Atom, bindings: &[(String, Atom)]) -> Atom {
     }
 }
 
-/// Evaluate `(match space pattern body)` — pattern match atoms in a space.
-///
-/// Evaluates `space` to get the space reference, converts `pattern` to a
-/// `Pattern`, queries the space for matching atoms, then evaluates `body`
-/// once per match with variables bound from the pattern.
-///
-/// PeTTa semantics: `match(Space, Pattern, Out, Out)` — matches atoms in
-/// the space, binds variables from the pattern to the matched atom.
+fn matches_definition_head(term: &Atom, funcs: &FnTable) -> bool {
+    let space = funcs.space.read().unwrap();
+    space.get_atoms().iter().any(|atom| match atom {
+        Atom::Expr(items)
+            if items.len() == 3
+                && items[0] == Atom::sym("=")
+                && machine::unify(term, &items[1]).is_some() =>
+        {
+            true
+        }
+        _ => false,
+    })
+}
+
+pub(crate) fn eval_transform(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "transform: expected (pattern replacement), got {} args",
+            args.len()
+        ));
+    }
+
+    let pattern = crate::eval_parts::special::subst_and_atomize(&args[0], env);
+    let replacement = crate::eval_parts::special::subst_and_atomize(&args[1], env);
+    let mut state = MachineState::new(None);
+    state.push_input(Atom::Expr(vec![
+        Atom::sym("transform"),
+        pattern,
+        replacement,
+    ]));
+
+    while state.should_continue() {
+        if !state.input.is_empty() {
+            state
+                .step(Transition::Transform, env, funcs)
+                .map_err(|e| format!("transform: {}", e))?;
+            continue;
+        }
+
+        if let Some(term) = state.workspace.front().cloned() {
+            let transition = if matches_definition_head(&term, funcs) {
+                Transition::Chain
+            } else {
+                Transition::Output
+            };
+            state
+                .step(transition, env, funcs)
+                .map_err(|e| format!("transform: {}", e))?;
+        }
+    }
+
+    Ok(NDet::stream(state.output.into_iter()))
+}
+
+fn merge_match_bindings(
+    base: &[(String, Atom)],
+    extra: &[(String, Atom)],
+) -> Option<Vec<(String, Atom)>> {
+    let mut merged = base.to_vec();
+    for (name, value) in extra {
+        if let Some((_, existing)) = merged.iter().find(|(bound, _)| bound == name) {
+            if existing != value {
+                return None;
+            }
+        } else {
+            merged.push((name.clone(), value.clone()));
+        }
+    }
+    Some(merged)
+}
+
+fn collect_match_results(
+    space_ref: &Atom,
+    pattern_expr: &Expr,
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<Vec<crate::space::MatchResult>, String> {
+    if let Expr::List(items) = pattern_expr {
+        if let Some(Expr::Symbol(op)) = items.first() {
+            if op == "," {
+                let mut bindings_sets: Vec<Vec<(String, Atom)>> = vec![Vec::new()];
+                for subpattern in items.iter().skip(1) {
+                    let submatches = collect_match_results(space_ref, subpattern, env, funcs)?;
+                    let mut next = Vec::new();
+                    for bindings in &bindings_sets {
+                        for matched in &submatches {
+                            if let Some(merged) = merge_match_bindings(bindings, &matched.bindings)
+                            {
+                                next.push(merged);
+                            }
+                        }
+                    }
+                    bindings_sets = next;
+                    if bindings_sets.is_empty() {
+                        break;
+                    }
+                }
+
+                return Ok(bindings_sets
+                    .into_iter()
+                    .map(|bindings| crate::space::MatchResult {
+                        atom: Atom::Expr(vec![Atom::sym(",")]),
+                        bindings,
+                    })
+                    .collect());
+            }
+        }
+    }
+
+    let substituted = crate::eval_parts::special::subst_expr_vars(pattern_expr, env);
+    let pattern = Pattern::from_expr(&substituted);
+    funcs.with_resolved_space(space_ref, |space| Ok(space.match_atoms(&pattern)))
+}
+
 pub(crate) fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 3 {
         return Err(format!(
@@ -147,62 +244,37 @@ pub(crate) fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
             args.len()
         ));
     }
-    // Evaluate space reference (must evaluate to &self or similar)
+
     let mut space_results = eval(&args[0], env, funcs)?;
-    let _space_ref = space_results.next().ok_or_else(|| {
-        "match: space expression produced no results".to_string()
-    })?;
-    // Build pattern: substitute any already-bound variables in the pattern expression
-    // (e.g., in nested matches, $2 might be bound from outer match), then build pattern.
-    let pattern = if let Expr::Symbol(s) = &args[1] {
-        if s.starts_with('$') {
-            if let Some(atom) = env.get(s) {
-                Pattern::from_atom(&atom)
-            } else {
-                Pattern::from_expr(&args[1])
-            }
-        } else {
-            Pattern::from_expr(&args[1])
-        }
-    } else {
-        let substituted = crate::eval_parts::special::subst_expr_vars(&args[1], env);
-        Pattern::from_expr(&substituted)
-    };
-    // Query the space — brief lock, collect all results, then release.
-    let matches = funcs.space.read().unwrap().match_atoms(&pattern);
-    if matches.is_empty() {
-        return Ok(NDet::Single(None)); // empty stream — no match
-    }
-    // Template: if args[2] is a $var bound in env, resolve to atom then convert to
-    // expr so that match bindings (e.g. $1 → 1) are applied when evaluating it.
+    let space_ref = space_results
+        .next()
+        .ok_or_else(|| "match: space expression produced no results".to_string())?;
+
+    let matches = collect_match_results(&space_ref, &args[1], env, funcs)
+        .map_err(|e| format!("match: {}", e))?;
     let template: Expr = if let Expr::Symbol(s) = &args[2] {
         if s.starts_with('$') {
-            if let Some(atom) = env.get(s) {
-                crate::parser::atom_to_expr(&atom)?
-            } else {
-                args[2].clone()
-            }
+            crate::eval_parts::special::subst_expr_vars(&args[2], env)
         } else {
             args[2].clone()
         }
     } else {
-        args[2].clone()
+        crate::eval_parts::special::subst_expr_vars(&args[2], env)
     };
-    // Evaluate the template once per match. Parallel only when the template is
-    // pure — impure templates (add-atom/remove-atom/nested match/IO) must run
-    // sequentially in match order, otherwise side effects interleave between
-    // workers and per-op Mutex atomicity does not protect the sequences.
+
     let eval_one = |mr: &crate::space::MatchResult| -> Result<Vec<Atom>, String> {
         let mut match_env = env.clone();
         for (name, val) in &mr.bindings {
             match_env = match_env.extend(name, val.clone());
         }
+
         let atoms: Vec<Atom> = eval(&template, &match_env, funcs)?.collect();
-        // Substitute match bindings into each result atom so that definition
-        // body variables (e.g. $a, $b in (= (f $L $a $b) body)) are replaced
-        // with their matched values. This allows match + eval chains to work.
-        Ok(atoms.into_iter().map(|a| subst_match_vars(&a, &mr.bindings)).collect())
+        Ok(atoms
+            .into_iter()
+            .map(|a| subst_match_vars(&a, &mr.bindings))
+            .collect())
     };
+
     let results: Vec<Result<Vec<Atom>, String>> =
         if matches.len() > 1 && crate::eval_parts::data_list::is_pure_expr(&template, funcs) {
             use rayon::prelude::*;
@@ -210,10 +282,11 @@ pub(crate) fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
         } else {
             matches.iter().map(eval_one).collect()
         };
-    // Propagate the first error instead of silently dropping failed branches.
+
     let mut result_vecs = Vec::with_capacity(results.len());
     for r in results {
         result_vecs.push(r?);
     }
+
     Ok(NDet::stream(result_vecs.into_iter().flatten()))
 }

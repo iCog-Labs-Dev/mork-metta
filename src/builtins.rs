@@ -2,7 +2,6 @@
 ///
 /// Following maintainability rules: builtins are a single table,
 /// macro-registered — one line per function.
-
 use crate::atom::Atom;
 use crate::func::{FnTable, FunctionKind, NDet};
 use crate::parser::Expr;
@@ -39,10 +38,14 @@ macro_rules! bool_clause {
 fn atom_as_f64(atom: &Atom, name: &str) -> Result<f64, String> {
     match atom {
         Atom::Num(n) => Ok(*n as f64), // SAFETY: precision loss for very large i128 but no panic
-        Atom::Sym(s) => s.parse::<f64>().map_err(|_| {
-            format!("{}: expected number, got {}", name, s)
-        }),
-        other => Err(format!("{}: expected number, got {}", name, other.to_sexpr_string())),
+        Atom::Sym(s) => s
+            .parse::<f64>()
+            .map_err(|_| format!("{}: expected number, got {}", name, s)),
+        other => Err(format!(
+            "{}: expected number, got {}",
+            name,
+            other.to_sexpr_string()
+        )),
     }
 }
 
@@ -110,16 +113,16 @@ macro_rules! math_binary {
 /// Register all built-in functions into the given function table.
 pub fn register_builtins(table: &FnTable) {
     // Boolean truth tables (user-defined clauses so constraint eval threads bindings)
-    bool_clause!(table, "or",  ["True",  "True"],  "True");
-    bool_clause!(table, "or",  ["True",  "False"], "True");
-    bool_clause!(table, "or",  ["False", "True"],  "True");
-    bool_clause!(table, "or",  ["False", "False"], "False");
-    bool_clause!(table, "and", ["True",  "True"],  "True");
-    bool_clause!(table, "and", ["True",  "False"], "False");
-    bool_clause!(table, "and", ["False", "True"],  "False");
+    bool_clause!(table, "or", ["True", "True"], "True");
+    bool_clause!(table, "or", ["True", "False"], "True");
+    bool_clause!(table, "or", ["False", "True"], "True");
+    bool_clause!(table, "or", ["False", "False"], "False");
+    bool_clause!(table, "and", ["True", "True"], "True");
+    bool_clause!(table, "and", ["True", "False"], "False");
+    bool_clause!(table, "and", ["False", "True"], "False");
     bool_clause!(table, "and", ["False", "False"], "False");
-    bool_clause!(table, "not", ["True"],           "False");
-    bool_clause!(table, "not", ["False"],          "True");
+    bool_clause!(table, "not", ["True"], "False");
+    bool_clause!(table, "not", ["False"], "True");
 
     // Arithmetic: integer ops when both args are Num, float ops otherwise
     num_binary!(table, "+", |a: i128, b: i128| a + b, |a: f64, b: f64| a + b);
@@ -129,57 +132,69 @@ pub fn register_builtins(table: &FnTable) {
     num_binary!(table, "%", |a: i128, b: i128| a % b, |a: f64, b: f64| a % b);
 
     // Comparison — use f64 so floats compare correctly
-    cmp_binary!(table, "<",  |a: f64, b: f64| a < b);
-    cmp_binary!(table, ">",  |a: f64, b: f64| a > b);
+    cmp_binary!(table, "<", |a: f64, b: f64| a < b);
+    cmp_binary!(table, ">", |a: f64, b: f64| a > b);
     cmp_binary!(table, "<=", |a: f64, b: f64| a <= b);
     cmp_binary!(table, ">=", |a: f64, b: f64| a >= b);
 
     // != (negated structural equality)
     table.insert_native("!=", 2, |args, _| {
-        Ok(NDet::single(if args[0] != args[1] { Atom::sym("True") } else { Atom::sym("False") }))
+        Ok(NDet::single(if args[0] != args[1] {
+            Atom::sym("True")
+        } else {
+            Atom::sym("False")
+        }))
     });
 
     // xor truth table (user-defined so constraint eval threads bindings)
-    bool_clause!(table, "xor", ["True",  "False"], "True");
-    bool_clause!(table, "xor", ["False", "True"],  "True");
-    bool_clause!(table, "xor", ["True",  "True"],  "False");
+    bool_clause!(table, "xor", ["True", "False"], "True");
+    bool_clause!(table, "xor", ["False", "True"], "True");
+    bool_clause!(table, "xor", ["True", "True"], "False");
     bool_clause!(table, "xor", ["False", "False"], "False");
 
     // implies truth table (boolean implication)
-    bool_clause!(table, "implies", ["True",  "True"],  "True");
-    bool_clause!(table, "implies", ["True",  "False"], "False");
-    bool_clause!(table, "implies", ["False", "True"],  "True");
+    bool_clause!(table, "implies", ["True", "True"], "True");
+    bool_clause!(table, "implies", ["True", "False"], "False");
+    bool_clause!(table, "implies", ["False", "True"], "True");
     bool_clause!(table, "implies", ["False", "False"], "True");
 
     // Float unary math — (fn-math x)
-    math_unary!(table, "sqrt-math",  |x: f64| x.sqrt());
-    math_unary!(table, "abs-math",   |x: f64| x.abs());
+    math_unary!(table, "sqrt-math", |x: f64| x.sqrt());
+    math_unary!(table, "abs-math", |x: f64| x.abs());
     math_unary!(table, "trunc-math", |x: f64| x.trunc());
-    math_unary!(table, "ceil-math",  |x: f64| x.ceil());
+    math_unary!(table, "ceil-math", |x: f64| x.ceil());
     math_unary!(table, "floor-math", |x: f64| x.floor());
     math_unary!(table, "round-math", |x: f64| x.round());
-    math_unary!(table, "sin-math",   |x: f64| x.sin());
-    math_unary!(table, "asin-math",  |x: f64| x.asin());
-    math_unary!(table, "cos-math",   |x: f64| x.cos());
-    math_unary!(table, "acos-math",  |x: f64| x.acos());
-    math_unary!(table, "tan-math",   |x: f64| x.tan());
-    math_unary!(table, "atan-math",  |x: f64| x.atan());
-    math_unary!(table, "exp",        |x: f64| x.exp());
+    math_unary!(table, "sin-math", |x: f64| x.sin());
+    math_unary!(table, "asin-math", |x: f64| x.asin());
+    math_unary!(table, "cos-math", |x: f64| x.cos());
+    math_unary!(table, "acos-math", |x: f64| x.acos());
+    math_unary!(table, "tan-math", |x: f64| x.tan());
+    math_unary!(table, "atan-math", |x: f64| x.atan());
+    math_unary!(table, "exp", |x: f64| x.exp());
 
     // Float binary math
     math_binary!(table, "pow-math", |a: f64, b: f64| a.powf(b));
     math_binary!(table, "log-math", |a: f64, b: f64| a.log(b));
-    math_binary!(table, "min",      |a: f64, b: f64| a.min(b));
-    math_binary!(table, "max",      |a: f64, b: f64| a.max(b));
+    math_binary!(table, "min", |a: f64, b: f64| a.min(b));
+    math_binary!(table, "max", |a: f64, b: f64| a.max(b));
 
     // isnan-math / isinf-math predicates
     table.insert_native("isnan-math", 1, |args, _| {
         let x = atom_as_f64(&args[0], "isnan-math")?;
-        Ok(NDet::single(if x.is_nan() { Atom::sym("True") } else { Atom::sym("False") }))
+        Ok(NDet::single(if x.is_nan() {
+            Atom::sym("True")
+        } else {
+            Atom::sym("False")
+        }))
     });
     table.insert_native("isinf-math", 1, |args, _| {
         let x = atom_as_f64(&args[0], "isinf-math")?;
-        Ok(NDet::single(if x.is_infinite() { Atom::sym("True") } else { Atom::sym("False") }))
+        Ok(NDet::single(if x.is_infinite() {
+            Atom::sym("True")
+        } else {
+            Atom::sym("False")
+        }))
     });
 
     // min-atom / max-atom: (min-atom (list...)) → Number
@@ -248,9 +263,7 @@ pub fn register_builtins(table: &FnTable) {
             a => vec![a.clone()],
         };
         let mut sorted = items;
-        sorted.sort_by(|a, b| {
-            a.to_sexpr_string().cmp(&b.to_sexpr_string())
-        });
+        sorted.sort_by(|a, b| a.to_sexpr_string().cmp(&b.to_sexpr_string()));
         Ok(NDet::single(Atom::Expr(sorted)))
     });
     // get-atoms: (get-atoms space) → stream of all atoms in the space
@@ -258,7 +271,7 @@ pub fn register_builtins(table: &FnTable) {
     // collects them into a flat list, matching the match+collapse pattern.
     table.insert_native("get-atoms", 1, |args, table| {
         expect_n_args(args, 1, "get-atoms")?;
-        let atoms = table.space.read().unwrap().get_atoms();
+        let atoms = table.with_resolved_space(&args[0], |space| Ok(space.get_atoms()))?;
         Ok(NDet::stream(atoms.into_iter()))
     });
 
@@ -270,9 +283,7 @@ pub fn register_builtins(table: &FnTable) {
             a => vec![a.clone()],
         };
         let mut sorted = items;
-        sorted.sort_by(|a, b| {
-            a.to_sexpr_string().cmp(&b.to_sexpr_string())
-        });
+        sorted.sort_by(|a, b| a.to_sexpr_string().cmp(&b.to_sexpr_string()));
         sorted.dedup();
         Ok(NDet::single(Atom::Expr(sorted)))
     });
@@ -327,13 +338,17 @@ pub fn register_builtins(table: &FnTable) {
         }
     });
 
-
     // get-state: (get-state key) — retrieves state value
     table.insert_native("get-state", 1, |args, table| {
         expect_n_args(args, 1, "get-state")?;
         let key = match &args[0] {
             Atom::Sym(s) => s.to_string(),
-            other => return Err(format!("get-state: key must be a symbol, got {}", other.to_sexpr_string())),
+            other => {
+                return Err(format!(
+                    "get-state: key must be a symbol, got {}",
+                    other.to_sexpr_string()
+                ));
+            }
         };
         let state = table.state.lock().unwrap();
         match state.get(&key) {
@@ -347,9 +362,14 @@ pub fn register_builtins(table: &FnTable) {
         expect_n_args(args, 2, "change-state!")?;
         let key = match &args[0] {
             Atom::Sym(s) => s.to_string(),
-            other => return Err(format!("change-state!: key must be a symbol, got {}", other.to_sexpr_string())),
+            other => {
+                return Err(format!(
+                    "change-state!: key must be a symbol, got {}",
+                    other.to_sexpr_string()
+                ));
+            }
         };
-                table.state.lock().unwrap().insert(key, args[1].clone());
+        table.state.lock().unwrap().insert(key, args[1].clone());
         Ok(NDet::single(Atom::sym("true")))
     });
 
@@ -359,7 +379,12 @@ pub fn register_builtins(table: &FnTable) {
         expect_n_args(args, 2, "bind!")?;
         let key = match &args[0] {
             Atom::Sym(s) => s.to_string(),
-            other => return Err(format!("bind!: key must be a symbol, got {}", other.to_sexpr_string())),
+            other => {
+                return Err(format!(
+                    "bind!: key must be a symbol, got {}",
+                    other.to_sexpr_string()
+                ));
+            }
         };
         // PeTTa semantics: destructure (new-state value) wrapper
         let value = match &args[1] {
@@ -368,7 +393,7 @@ pub fn register_builtins(table: &FnTable) {
             }
             other => other.clone(),
         };
-                table.state.lock().unwrap().insert(key, value);
+        table.state.lock().unwrap().insert(key, value);
         Ok(NDet::single(Atom::sym("true")))
     });
 
@@ -400,7 +425,10 @@ pub fn register_builtins(table: &FnTable) {
         match &args[0] {
             Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
             Atom::Expr(_) => Err("car-atom: empty list".into()),
-            other => Err(format!("car-atom: expected list, got {}", other.to_sexpr_string())),
+            other => Err(format!(
+                "car-atom: expected list, got {}",
+                other.to_sexpr_string()
+            )),
         }
     });
 
@@ -410,7 +438,10 @@ pub fn register_builtins(table: &FnTable) {
         match &args[0] {
             Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
             Atom::Expr(_) => Err("car: empty list".into()),
-            other => Err(format!("car: expected list, got {}", other.to_sexpr_string())),
+            other => Err(format!(
+                "car: expected list, got {}",
+                other.to_sexpr_string()
+            )),
         }
     });
 
@@ -422,7 +453,10 @@ pub fn register_builtins(table: &FnTable) {
                 Ok(NDet::single(Atom::Expr(items[1..].to_vec())))
             }
             Atom::Expr(_) => Err("cdr-atom: empty list".into()),
-            other => Err(format!("cdr-atom: expected list, got {}", other.to_sexpr_string())),
+            other => Err(format!(
+                "cdr-atom: expected list, got {}",
+                other.to_sexpr_string()
+            )),
         }
     });
 
@@ -434,7 +468,10 @@ pub fn register_builtins(table: &FnTable) {
                 Ok(NDet::single(Atom::Expr(items[1..].to_vec())))
             }
             Atom::Expr(_) => Err("cdr: empty list".into()),
-            other => Err(format!("cdr: expected list, got {}", other.to_sexpr_string())),
+            other => Err(format!(
+                "cdr: expected list, got {}",
+                other.to_sexpr_string()
+            )),
         }
     });
 
@@ -444,14 +481,25 @@ pub fn register_builtins(table: &FnTable) {
         let idx = match &args[1] {
             Atom::Num(n) => usize::try_from(*n)
                 .map_err(|_| format!("index-atom: index must be non-negative, got {}", n))?,
-            other => return Err(format!("index-atom: index must be a number, got {}", other.to_sexpr_string())),
+            other => {
+                return Err(format!(
+                    "index-atom: index must be a number, got {}",
+                    other.to_sexpr_string()
+                ));
+            }
         };
         match &args[0] {
-            Atom::Expr(items) => items.get(idx)
-                .cloned()
-                .map(NDet::single)
-                .ok_or_else(|| format!("index-atom: index {} out of bounds (len {})", idx, items.len())),
-            other => Err(format!("index-atom: expected list, got {}", other.to_sexpr_string())),
+            Atom::Expr(items) => items.get(idx).cloned().map(NDet::single).ok_or_else(|| {
+                format!(
+                    "index-atom: index {} out of bounds (len {})",
+                    idx,
+                    items.len()
+                )
+            }),
+            other => Err(format!(
+                "index-atom: expected list, got {}",
+                other.to_sexpr_string()
+            )),
         }
     });
 
@@ -467,7 +515,11 @@ pub fn register_builtins(table: &FnTable) {
         let mut map_ab = std::collections::HashMap::new();
         let mut map_ba = std::collections::HashMap::new();
         let eq = alpha_equiv(&args[0], &args[1], &mut map_ab, &mut map_ba);
-        Ok(NDet::single(if eq { Atom::sym("True") } else { Atom::sym("False") }))
+        Ok(NDet::single(if eq {
+            Atom::sym("True")
+        } else {
+            Atom::sym("False")
+        }))
     });
 
     // first-from-pair: (first-from-pair (A B)) → A
@@ -476,7 +528,10 @@ pub fn register_builtins(table: &FnTable) {
         match &args[0] {
             Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
             Atom::Expr(_) => Err("first-from-pair: empty list".into()),
-            other => Err(format!("first-from-pair: expected list, got {}", other.to_sexpr_string())),
+            other => Err(format!(
+                "first-from-pair: expected list, got {}",
+                other.to_sexpr_string()
+            )),
         }
     });
 
@@ -486,7 +541,10 @@ pub fn register_builtins(table: &FnTable) {
         match &args[0] {
             Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
             Atom::Expr(_) => Err("first: empty list".into()),
-            other => Err(format!("first: expected list, got {}", other.to_sexpr_string())),
+            other => Err(format!(
+                "first: expected list, got {}",
+                other.to_sexpr_string()
+            )),
         }
     });
 
@@ -496,7 +554,10 @@ pub fn register_builtins(table: &FnTable) {
         match &args[0] {
             Atom::Expr(items) if items.len() >= 2 => Ok(NDet::single(items[1].clone())),
             Atom::Expr(_) => Err("second-from-pair: list too short".into()),
-            other => Err(format!("second-from-pair: expected list, got {}", other.to_sexpr_string())),
+            other => Err(format!(
+                "second-from-pair: expected list, got {}",
+                other.to_sexpr_string()
+            )),
         }
     });
 
@@ -506,7 +567,10 @@ pub fn register_builtins(table: &FnTable) {
         match &args[0] {
             Atom::Expr(items) if items.len() >= 2 => Ok(NDet::single(items[1].clone())),
             Atom::Expr(_) => Err("second: list too short".into()),
-            other => Err(format!("second: expected list, got {}", other.to_sexpr_string())),
+            other => Err(format!(
+                "second: expected list, got {}",
+                other.to_sexpr_string()
+            )),
         }
     });
 
@@ -514,9 +578,14 @@ pub fn register_builtins(table: &FnTable) {
     table.insert_native("last", 1, |args, _| {
         expect_n_args(args, 1, "last")?;
         match &args[0] {
-            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[items.len() - 1].clone())),
+            Atom::Expr(items) if !items.is_empty() => {
+                Ok(NDet::single(items[items.len() - 1].clone()))
+            }
             Atom::Expr(_) => Err("last: empty list".into()),
-            other => Err(format!("last: expected list, got {}", other.to_sexpr_string())),
+            other => Err(format!(
+                "last: expected list, got {}",
+                other.to_sexpr_string()
+            )),
         }
     });
 
@@ -530,7 +599,10 @@ pub fn register_builtins(table: &FnTable) {
                 Ok(NDet::single(Atom::Expr(vec![head, rest])))
             }
             Atom::Expr(_) => Err("decons: empty list".into()),
-            other => Err(format!("decons: expected list, got {}", other.to_sexpr_string())),
+            other => Err(format!(
+                "decons: expected list, got {}",
+                other.to_sexpr_string()
+            )),
         }
     });
 
@@ -543,7 +615,10 @@ pub fn register_builtins(table: &FnTable) {
                 rev.reverse();
                 Ok(NDet::single(Atom::Expr(rev)))
             }
-            other => Err(format!("reverse: expected list, got {}", other.to_sexpr_string())),
+            other => Err(format!(
+                "reverse: expected list, got {}",
+                other.to_sexpr_string()
+            )),
         }
     });
 
@@ -554,7 +629,11 @@ pub fn register_builtins(table: &FnTable) {
             Atom::Expr(items) => items.iter().any(|x| *x == args[0]),
             other => *other == args[0],
         };
-        Ok(NDet::single(if found { Atom::sym("True") } else { Atom::sym("False") }))
+        Ok(NDet::single(if found {
+            Atom::sym("True")
+        } else {
+            Atom::sym("False")
+        }))
     });
 
     // exclude-item: (exclude-item elem list) → list without elem
@@ -562,7 +641,8 @@ pub fn register_builtins(table: &FnTable) {
         expect_n_args(args, 2, "exclude-item")?;
         match &args[1] {
             Atom::Expr(items) => {
-                let filtered: Vec<Atom> = items.iter().filter(|x| **x != args[0]).cloned().collect();
+                let filtered: Vec<Atom> =
+                    items.iter().filter(|x| **x != args[0]).cloned().collect();
                 Ok(NDet::single(Atom::Expr(filtered)))
             }
             other => {
@@ -701,14 +781,17 @@ pub fn register_builtins(table: &FnTable) {
                 Atom::Sym(s) => s.clone(),
                 _ => return Err("foldl: first arg must be a symbol (function name)".into()),
             };
-            let func_ref = table.get(&fname, 2)
+            let func_ref = table
+                .get(&fname, 2)
                 .ok_or_else(|| format!("foldl: function {} with arity 2 not found", fname))?;
             let func_ptr = match &func_ref.kind {
                 FunctionKind::Native { func } => func.clone(),
             };
             drop(func_ref);
             let mut result = func_ptr(&[acc, item.clone()], table)?;
-            acc = result.next().ok_or_else(|| "foldl: function produced no results".to_string())?;
+            acc = result
+                .next()
+                .ok_or_else(|| "foldl: function produced no results".to_string())?;
         }
         Ok(NDet::single(acc))
     });
@@ -730,7 +813,9 @@ pub fn register_builtins(table: &FnTable) {
             if let FunctionKind::Native { func: func_ptr } = &func.kind {
                 for item in &items {
                     let mut result = func_ptr(&[acc, item.clone()], table)?;
-                    acc = result.next().ok_or_else(|| "foldl-atom: function produced no results".to_string())?;
+                    acc = result
+                        .next()
+                        .ok_or_else(|| "foldl-atom: function produced no results".to_string())?;
                 }
                 return Ok(NDet::single(acc));
             }
@@ -743,12 +828,12 @@ pub fn register_builtins(table: &FnTable) {
                 crate::parser::atom_to_expr(item).map_err(|e| format!("foldl-atom: {}", e))?,
             ]);
             let mut result = crate::eval_parts::core::eval(&call, &crate::env::Env::new(), table)?;
-            acc = result.next().ok_or_else(|| "foldl-atom: fold function call produced no results".to_string())?;
+            acc = result
+                .next()
+                .ok_or_else(|| "foldl-atom: fold function call produced no results".to_string())?;
         }
         Ok(NDet::single(acc))
     });
-
-
 
     // decons-atom: (decons-atom list) → (first rest) — split list into head and tail, alias for decons
     table.insert_native("decons-atom", 1, |args, _| {
@@ -760,7 +845,10 @@ pub fn register_builtins(table: &FnTable) {
                 Ok(NDet::single(Atom::Expr(vec![head, rest])))
             }
             Atom::Expr(_) => Err("decons-atom: empty list".into()),
-            other => Err(format!("decons-atom: expected list, got {}", other.to_sexpr_string())),
+            other => Err(format!(
+                "decons-atom: expected list, got {}",
+                other.to_sexpr_string()
+            )),
         }
     });
 
@@ -818,14 +906,20 @@ pub fn register_builtins(table: &FnTable) {
         };
         let mut results = Vec::with_capacity(items.len());
         for item in &items {
-            let func_ref = table.get(&fname, 1)
+            let func_ref = table
+                .get(&fname, 1)
                 .ok_or_else(|| format!("maplist: function {} with arity 1 not found", fname))?;
             let func_ptr = match &func_ref.kind {
                 FunctionKind::Native { func } => func.clone(),
             };
             drop(func_ref);
             let mut result = func_ptr(&[item.clone()], table)?;
-            let val = result.next().ok_or_else(|| format!("maplist: function produced no results for item {}", item.to_sexpr_string()))?;
+            let val = result.next().ok_or_else(|| {
+                format!(
+                    "maplist: function produced no results for item {}",
+                    item.to_sexpr_string()
+                )
+            })?;
             results.push(val);
         }
         Ok(NDet::single(Atom::Expr(results)))
@@ -844,7 +938,8 @@ pub fn register_builtins(table: &FnTable) {
         };
         let mut results = Vec::with_capacity(items.len());
         for item in &items {
-            let func_ref = table.get(&fname, 1)
+            let func_ref = table
+                .get(&fname, 1)
                 .ok_or_else(|| format!("filter-atom: function {} with arity 1 not found", fname))?;
             let func_ptr = match &func_ref.kind {
                 FunctionKind::Native { func } => func.clone(),
@@ -864,20 +959,32 @@ pub fn register_builtins(table: &FnTable) {
     table.insert_native("is-var", 1, |args, _| {
         expect_n_args(args, 1, "is-var")?;
         let is_var = matches!(&args[0], Atom::Sym(s) if s.starts_with('$'));
-        Ok(NDet::single(if is_var { Atom::sym("True") } else { Atom::sym("False") }))
+        Ok(NDet::single(if is_var {
+            Atom::sym("True")
+        } else {
+            Atom::sym("False")
+        }))
     });
 
     // is-expr: (is-expr x) → True/False — whether x is a list/expression
     table.insert_native("is-expr", 1, |args, _| {
         expect_n_args(args, 1, "is-expr")?;
-        Ok(NDet::single(if matches!(&args[0], Atom::Expr(_)) { Atom::sym("True") } else { Atom::sym("False") }))
+        Ok(NDet::single(if matches!(&args[0], Atom::Expr(_)) {
+            Atom::sym("True")
+        } else {
+            Atom::sym("False")
+        }))
     });
 
     // is-space: (is-space x) → True/False — whether x is a space reference (&...)
     table.insert_native("is-space", 1, |args, _| {
         expect_n_args(args, 1, "is-space")?;
         let is_space = matches!(&args[0], Atom::Sym(s) if s.starts_with('&'));
-        Ok(NDet::single(if is_space { Atom::sym("True") } else { Atom::sym("False") }))
+        Ok(NDet::single(if is_space {
+            Atom::sym("True")
+        } else {
+            Atom::sym("False")
+        }))
     });
 
     // concat: (concat a b) → concatenation of string syms or lists
@@ -943,32 +1050,63 @@ pub fn register_builtins(table: &FnTable) {
     // already marked by their macros. Inline insert_native pure functions
     // are marked here.
     let pure_list: &[(&str, u8)] = &[
-        ("!=", 2), ("isnan-math", 1), ("isinf-math", 1),
-        ("min-atom", 1), ("max-atom", 1),
-        ("size-atom", 1), ("length", 1), ("append", 2),
-        ("msort", 1), ("sort", 1),
-        ("==", 2), ("=", 2), ("=?", 2),
-        ("test", 2), ("repr", 1),
-        ("cons-atom", 2), ("cons", 2),
-        ("car-atom", 1), ("car", 1),
-        ("cdr-atom", 1), ("cdr", 1),
-        ("index-atom", 2), ("id", 1), ("=alpha", 2),
-        ("first-from-pair", 1), ("first", 1),
-        ("second-from-pair", 1), ("second", 1),
-        ("last", 1), ("decons", 1),
-        ("reverse", 1), ("is-member", 2),
-        ("exclude-item", 2), ("unique-atom", 1),
-        ("union-atom", 2), ("intersection-atom", 2),
+        ("!=", 2),
+        ("isnan-math", 1),
+        ("isinf-math", 1),
+        ("min-atom", 1),
+        ("max-atom", 1),
+        ("size-atom", 1),
+        ("length", 1),
+        ("append", 2),
+        ("msort", 1),
+        ("sort", 1),
+        ("==", 2),
+        ("=", 2),
+        ("=?", 2),
+        ("test", 2),
+        ("repr", 1),
+        ("cons-atom", 2),
+        ("cons", 2),
+        ("car-atom", 1),
+        ("car", 1),
+        ("cdr-atom", 1),
+        ("cdr", 1),
+        ("index-atom", 2),
+        ("id", 1),
+        ("=alpha", 2),
+        ("first-from-pair", 1),
+        ("first", 1),
+        ("second-from-pair", 1),
+        ("second", 1),
+        ("last", 1),
+        ("decons", 1),
+        ("reverse", 1),
+        ("is-member", 2),
+        ("exclude-item", 2),
+        ("unique-atom", 1),
+        ("union-atom", 2),
+        ("intersection-atom", 2),
         ("subtraction-atom", 2),
-        ("sort-atom", 1), ("sort-math", 1),
+        ("sort-atom", 1),
+        ("sort-math", 1),
         ("same", 2),
-        ("decons-atom", 1), ("list_to_set", 1),
+        ("decons-atom", 1),
+        ("list_to_set", 1),
         ("alpha-unique-atom", 1),
-        ("is-var", 1), ("is-expr", 1), ("is-space", 1),
-        ("concat", 2), ("atom_concat", 2), ("atom_chars", 1),
-        ("term_hash", 1), ("sread", 1),
+        ("is-var", 1),
+        ("is-expr", 1),
+        ("is-space", 1),
+        ("concat", 2),
+        ("atom_concat", 2),
+        ("atom_chars", 1),
+        ("term_hash", 1),
+        ("sread", 1),
         // Boolean functions (user-defined clauses, pure)
-        ("or", 2), ("and", 2), ("not", 1), ("xor", 2), ("implies", 2),
+        ("or", 2),
+        ("and", 2),
+        ("not", 1),
+        ("xor", 2),
+        ("implies", 2),
     ];
     for &(name, arity) in pure_list {
         table.mark_pure(name, arity);
@@ -1001,7 +1139,10 @@ fn alpha_equiv(
         (Atom::Num(a), Atom::Num(b)) => a == b,
         (Atom::Expr(as_), Atom::Expr(bs)) => {
             as_.len() == bs.len()
-                && as_.iter().zip(bs.iter()).all(|(x, y)| alpha_equiv(x, y, map_ab, map_ba))
+                && as_
+                    .iter()
+                    .zip(bs.iter())
+                    .all(|(x, y)| alpha_equiv(x, y, map_ab, map_ba))
         }
         _ => false,
     }
@@ -1013,7 +1154,6 @@ fn expect_n_args(args: &[Atom], n: usize, name: &str) -> Result<(), String> {
     }
     Ok(())
 }
-
 
 /// Parse a single MeTTa atom from a string.
 /// Handles symbols, numbers, and s-expressions.
