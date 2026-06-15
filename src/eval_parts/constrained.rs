@@ -12,7 +12,6 @@
 ///
 /// For native functions and non-call expressions the behaviour is identical
 /// to `eval` — each result is wrapped with an empty `Env`.
-
 use crate::atom::Atom;
 use crate::env::Env;
 use crate::eval_parts::core::eval;
@@ -77,10 +76,7 @@ pub(crate) fn eval_constrained(
                             {
                                 let full = prepend_env(mb.clone(), &c.env);
                                 for (a, bb) in eval_constrained(&c.body, &full, funcs)? {
-                                    let acc = prepend_env(
-                                        bb,
-                                        &prepend_env(mb.clone(), &arg_binds),
-                                    );
+                                    let acc = prepend_env(bb, &prepend_env(mb.clone(), &arg_binds));
                                     r.push((a, acc));
                                 }
                             }
@@ -277,9 +273,7 @@ pub(crate) fn eval_args_threaded(
 }
 
 /// Build the cartesian product of per-argument result streams, accumulating bindings.
-pub(crate) fn constrained_cartesian(
-    streams: Vec<Vec<(Atom, Env)>>,
-) -> Vec<(Vec<Atom>, Env)> {
+pub(crate) fn constrained_cartesian(streams: Vec<Vec<(Atom, Env)>>) -> Vec<(Vec<Atom>, Env)> {
     if streams.is_empty() {
         return vec![(vec![], Env::new())];
     }

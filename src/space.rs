@@ -5,11 +5,10 @@
 ///
 /// Single implementation:
 /// - `MorkSpace` — wraps MORK's `PathMap` trie (the single source of truth).
-
 use crate::atom::Atom;
 use crate::parser::Expr;
 
-use pathmap::zipper::{ZipperMoving, ZipperIteration, ZipperAbsolutePath};
+use pathmap::zipper::{ZipperAbsolutePath, ZipperIteration, ZipperMoving};
 
 /// A pattern for matching against atoms in a space.
 ///
@@ -37,12 +36,11 @@ impl Pattern {
         match self {
             Pattern::Any | Pattern::Var(_) => None,
             Pattern::Exact(a) => Some(a.clone()),
-            Pattern::Expr(pats) => {
-                pats.iter()
-                    .map(|p| p.as_ground_atom())
-                    .collect::<Option<Vec<_>>>()
-                    .map(Atom::Expr)
-            }
+            Pattern::Expr(pats) => pats
+                .iter()
+                .map(|p| p.as_ground_atom())
+                .collect::<Option<Vec<_>>>()
+                .map(Atom::Expr),
         }
     }
 
@@ -53,9 +51,7 @@ impl Pattern {
             Expr::Symbol(s) if s.starts_with('$') => Pattern::Var(s.clone()),
             Expr::Symbol(s) => Pattern::Exact(Atom::sym(s)),
             Expr::Number(n) => Pattern::Exact(Atom::Num(*n)),
-            Expr::List(items) => {
-                Pattern::Expr(items.iter().map(Self::from_expr).collect())
-            }
+            Expr::List(items) => Pattern::Expr(items.iter().map(Self::from_expr).collect()),
         }
     }
 
@@ -135,7 +131,9 @@ impl MorkSpace {
         }
     }
 
-    pub fn new_box() -> Box<dyn Space + Send + Sync> { Box::new(Self::new()) }
+    pub fn new_box() -> Box<dyn Space + Send + Sync> {
+        Box::new(Self::new())
+    }
 
     /// Byte-encode an s-expression into `buf` via the kernel parser.
     /// Returns the encoded length. Symbols are stored literally (no interning
@@ -186,7 +184,10 @@ impl Space for MorkSpace {
                 Err(_) => return vec![],
             };
             return if inner.btm.get_val_at(&buf[..len]).is_some() {
-                vec![MatchResult { atom, bindings: vec![] }]
+                vec![MatchResult {
+                    atom,
+                    bindings: vec![],
+                }]
             } else {
                 vec![]
             };
@@ -247,7 +248,9 @@ impl Space for MorkSpace {
         out
     }
 
-    fn description(&self) -> &str { "MorkSpace (PathMap trie, single source of truth)" }
+    fn description(&self) -> &str {
+        "MorkSpace (PathMap trie, single source of truth)"
+    }
 }
 
 /// Render a `Pattern` as a MORK query s-expression: variables/wildcards become
@@ -282,7 +285,12 @@ fn decode_expr_bytes(bytes: &[u8]) -> Option<Atom> {
 }
 
 fn varname(i: u8) -> Atom {
-    Atom::sym(mork_expr::Expr::VARNAMES.get(i as usize).copied().unwrap_or("$z"))
+    Atom::sym(
+        mork_expr::Expr::VARNAMES
+            .get(i as usize)
+            .copied()
+            .unwrap_or("$z"),
+    )
 }
 
 /// A literal symbol token → `Num` if it is an integer literal, else `Sym`.
@@ -298,7 +306,7 @@ fn symbol_to_atom(s: &str) -> Atom {
 }
 
 fn decode_one(b: &[u8], pos: &mut usize, var_count: &mut u8) -> Option<Atom> {
-    use mork_expr::{byte_item, Tag, read_arity_at, arity_byte_count_at};
+    use mork_expr::{Tag, arity_byte_count_at, byte_item, read_arity_at};
     if *pos >= b.len() {
         return None;
     }
@@ -388,7 +396,10 @@ fn unify(
     if let Atom::Sym(s) = atom {
         if s.starts_with('$') && !matches!(pattern, Pattern::Any | Pattern::Var(_)) {
             let pat_atom = pattern_to_atom(pattern);
-            if let Some((_, bound)) = stored_bindings.iter().find(|(n, _)| n.as_str() == s.as_ref()) {
+            if let Some((_, bound)) = stored_bindings
+                .iter()
+                .find(|(n, _)| n.as_str() == s.as_ref())
+            {
                 return bound == &pat_atom;
             }
             stored_bindings.push((s.to_string(), pat_atom));
@@ -429,9 +440,12 @@ fn substitute_stored(atom: &Atom, bindings: &[(String, Atom)]) -> Atom {
             .find(|(name, _)| name.as_str() == s.as_ref())
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| atom.clone()),
-        Atom::Expr(items) => {
-            Atom::Expr(items.iter().map(|a| substitute_stored(a, bindings)).collect())
-        }
+        Atom::Expr(items) => Atom::Expr(
+            items
+                .iter()
+                .map(|a| substitute_stored(a, bindings))
+                .collect(),
+        ),
         _ => atom.clone(),
     }
 }
@@ -454,7 +468,10 @@ fn atoms_equal(a: &Atom, b: &Atom) -> bool {
         (Atom::Num(a), Atom::Num(b)) => a == b,
         (Atom::Expr(a_items), Atom::Expr(b_items)) => {
             a_items.len() == b_items.len()
-                && a_items.iter().zip(b_items.iter()).all(|(x, y)| atoms_equal(x, y))
+                && a_items
+                    .iter()
+                    .zip(b_items.iter())
+                    .all(|(x, y)| atoms_equal(x, y))
         }
         _ => false,
     }
@@ -514,14 +531,15 @@ fn parse_value(chars: &[char], pos: &mut usize) -> Result<Atom, String> {
                 *pos += 1;
             }
             let num_str: String = chars[start..*pos].iter().collect();
-            let n: i128 = num_str.parse().map_err(|_| format!("invalid number: {}", num_str))?;
+            let n: i128 = num_str
+                .parse()
+                .map_err(|_| format!("invalid number: {}", num_str))?;
             Ok(Atom::Num(n))
         }
         c if c.is_alphanumeric() || "$!?<>=+-*/_".contains(c) => {
             let start = *pos;
             while *pos < chars.len()
-                && (chars[*pos].is_alphanumeric()
-                    || "$!?<>=+-*/_".contains(chars[*pos]))
+                && (chars[*pos].is_alphanumeric() || "$!?<>=+-*/_".contains(chars[*pos]))
             {
                 *pos += 1;
             }
@@ -545,8 +563,20 @@ mod tests {
     #[test]
     fn test_mork_space_add_match() {
         let space = MorkSpace::new();
-        space.add_atom(&Atom::expr(vec![Atom::sym("friend"), Atom::sym("sam"), Atom::sym("tim")])).unwrap();
-        space.add_atom(&Atom::expr(vec![Atom::sym("friend"), Atom::sym("sam"), Atom::sym("joe")])).unwrap();
+        space
+            .add_atom(&Atom::expr(vec![
+                Atom::sym("friend"),
+                Atom::sym("sam"),
+                Atom::sym("tim"),
+            ]))
+            .unwrap();
+        space
+            .add_atom(&Atom::expr(vec![
+                Atom::sym("friend"),
+                Atom::sym("sam"),
+                Atom::sym("joe"),
+            ]))
+            .unwrap();
 
         let pat = Pattern::Expr(vec![
             Pattern::Exact(Atom::sym("friend")),

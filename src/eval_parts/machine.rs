@@ -379,7 +379,7 @@ impl MachineState {
                 }
             }
 
-            if unify(term, atom).is_some() {
+            if unify(term, atom).is_some() && !is_definition_head_shadow(atom, &atoms_snapshot) {
                 total_matches += 1;
             }
         }
@@ -531,13 +531,6 @@ impl MachineState {
         })
     }
 
-    /// AddAtom rule: add atom to k
-    /// Spec Section 3.3, page 11; Section 6.3 cost model
-    /// Cost: c = #(atom) per spec (AddAtom1 rule shows #(t))
-    ///
-    /// Cost precondition (Spec Section 6.3, AddAtom1): ((e' + c') - #(t)) > 0
-    /// where e' is remaining budget, c' is unspecified overhead (0 here), #(t) is atom cost
-    /// Simplifies to: budget - #(atom) > 0, or budget > #(atom)
     pub fn apply_add_atom(
         &mut self,
         atom: Atom,
@@ -545,7 +538,6 @@ impl MachineState {
     ) -> Result<Option<i64>, String> {
         let cost = calculate_cost(&atom);
 
-        // Budget precondition check per spec Section 6.3 AddAtom1
         if let Some(c) = cost {
             if let Some(budget) = self.cost_budget {
                 if (budget - c) <= 0 {
@@ -557,24 +549,18 @@ impl MachineState {
             }
         }
 
-        funcs.space.write().unwrap().add_atom(&atom)?;
+        install_space_atom(&atom, funcs)?;
+
         if let Some(c) = cost {
             if let Some(budget) = self.cost_budget.as_mut() {
                 *budget -= c;
+                self.log_effort_object("AddAtom", c, Some(atom.clone()));
             }
-            // Log effort object per spec Section 6.3: eos' = {(h(p) c)} ++ cos'
-            self.log_effort_object("AddAtom", c, Some(atom.clone()));
         }
+
         Ok(cost)
     }
 
-    /// RemAtom rule: remove atom from k
-    /// Spec Section 3.3, page 11; Section 6.3 cost model
-    /// Cost: c = #(atom) per spec (RemAtom1 rule shows #(t))
-    ///
-    /// Cost precondition (Spec Section 6.3, RemAtom1): ((e - #(t)) > 0)
-    /// where e is budget, #(t) is atom cost
-    /// Simplifies to: budget > #(atom)
     pub fn apply_remove_atom(
         &mut self,
         atom: Atom,
@@ -582,7 +568,6 @@ impl MachineState {
     ) -> Result<Option<i64>, String> {
         let cost = calculate_cost(&atom);
 
-        // Budget precondition check per spec Section 6.3 RemAtom1
         if let Some(c) = cost {
             if let Some(budget) = self.cost_budget {
                 if (budget - c) <= 0 {
@@ -594,14 +579,15 @@ impl MachineState {
             }
         }
 
-        funcs.space.write().unwrap().remove_atom(&atom)?;
+        remove_space_atom(&atom, funcs)?;
+
         if let Some(c) = cost {
             if let Some(budget) = self.cost_budget.as_mut() {
                 *budget -= c;
+                self.log_effort_object("RemAtom", c, Some(atom.clone()));
             }
-            // Log effort object per spec Section 6.3: eos' = {(h(p) c)} ++ cos'
-            self.log_effort_object("RemAtom", c, Some(atom.clone()));
         }
+
         Ok(cost)
     }
 
@@ -670,18 +656,10 @@ impl MachineState {
         !self.input.is_empty() || !self.workspace.is_empty()
     }
 
-    /// RemAtom2 rule: process queued removal with deferred cost
-    /// Spec Section 3.3, RemAtom2 variant (rho-calculus Section 7.3)
-    /// Cost deferred until execution: when atom actually removed, cost charged
-    ///
-    /// Cost precondition (Spec Section 6.3, RemAtom2): ((e - #(t)) > 0)
-    /// where e is budget at execution time, #(t) is queued atom cost
-    /// Simplifies to: budget > #(t)
     pub fn apply_rematom2(&mut self, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
         if let Some(atom) = self.deferred_removals.pop_front() {
             let cost = calculate_cost(&atom);
 
-            // Budget precondition check per spec Section 6.3 RemAtom2
             if let Some(c) = cost {
                 if let Some(budget) = self.cost_budget {
                     if (budget - c) <= 0 {
@@ -693,32 +671,25 @@ impl MachineState {
                 }
             }
 
-            funcs.space.write().unwrap().remove_atom(&atom)?;
+            remove_space_atom(&atom, funcs)?;
+
             if let Some(c) = cost {
                 if let Some(budget) = self.cost_budget.as_mut() {
                     *budget -= c;
+                    self.log_effort_object("RemAtom2", c, Some(atom.clone()));
                 }
-                // Log effort object per spec Section 6.3: eos' = {(h(p) c)} ++ cos'
-                self.log_effort_object("RemAtom2", c, Some(atom.clone()));
             }
+
             Ok(cost)
         } else {
             Ok(None)
         }
     }
 
-    /// AddAtom2 rule: process queued addition with deferred cost
-    /// Spec Section 3.3, AddAtom2 variant (complementary to RemAtom2)
-    /// Cost deferred until execution: when atom actually added, cost charged
-    ///
-    /// Cost precondition (Spec Section 6.3, AddAtom2): ((e' + c') - #(t)) > 0
-    /// where e' is remaining budget, c' is overhead (0 here), #(t) is atom cost
-    /// Simplifies to: budget > #(atom)
     pub fn apply_addatom2(&mut self, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
         if let Some(atom) = self.deferred_additions.pop_front() {
             let cost = calculate_cost(&atom);
 
-            // Budget precondition check per spec Section 6.3 AddAtom2
             if let Some(c) = cost {
                 if let Some(budget) = self.cost_budget {
                     if (budget - c) <= 0 {
@@ -730,14 +701,15 @@ impl MachineState {
                 }
             }
 
-            funcs.space.write().unwrap().add_atom(&atom)?;
+            install_space_atom(&atom, funcs)?;
+
             if let Some(c) = cost {
                 if let Some(budget) = self.cost_budget.as_mut() {
                     *budget -= c;
+                    self.log_effort_object("AddAtom2", c, Some(atom.clone()));
                 }
-                // Log effort object per spec Section 6.3: eos' = {(h(p) c)} ++ cos'
-                self.log_effort_object("AddAtom2", c, Some(atom.clone()));
             }
+
             Ok(cost)
         } else {
             Ok(None)
@@ -885,29 +857,106 @@ fn deref(atom: &Atom, subst: &HashMap<String, Atom>) -> Atom {
     }
 }
 
-/// Register a transformed function definition for callable lookup
-///
-/// When Transform rewrites a (= head body) atom, the result should be
-/// registered as a callable function so future Query/Chain steps can use it.
-/// This enables code evolution: the system transforms its own definitions at runtime.
+fn definition_parts(atom: &Atom) -> Option<(&Atom, &Atom)> {
+    match atom {
+        Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("=") => {
+            Some((&items[1], &items[2]))
+        }
+        _ => None,
+    }
+}
+
+fn cache_definition_atom(atom: &Atom, funcs: &crate::func::FnTable) -> Result<(), String> {
+    let expr = crate::parser::atom_to_expr(atom)?;
+    let (name, clause) = crate::compile::compile_definition(&expr)?;
+    funcs.cache_fn(&name, clause.patterns.len() as u8, clause);
+    Ok(())
+}
+
+fn uncache_definition_atom(atom: &Atom, funcs: &crate::func::FnTable) -> Result<(), String> {
+    let expr = crate::parser::atom_to_expr(atom)?;
+    let (name, clause) = crate::compile::compile_definition(&expr)?;
+    funcs.uncache_fn(&name, clause.patterns.len() as u8);
+    Ok(())
+}
+
+fn maybe_cache_definition_atom(atom: &Atom, funcs: &crate::func::FnTable) {
+    if definition_parts(atom).is_some() {
+        let _ = cache_definition_atom(atom, funcs);
+    }
+}
+
+fn maybe_uncache_definition_atom(atom: &Atom, funcs: &crate::func::FnTable) {
+    if definition_parts(atom).is_some() {
+        let _ = uncache_definition_atom(atom, funcs);
+    }
+}
+
+fn add_definition_head_shadow(atom: &Atom, funcs: &crate::func::FnTable) -> Result<(), String> {
+    if let Some((head, _)) = definition_parts(atom) {
+        funcs.space.write().unwrap().add_atom(head)?;
+    }
+    Ok(())
+}
+
+fn remove_definition_head_shadow(atom: &Atom, funcs: &crate::func::FnTable) -> Result<(), String> {
+    let Some((head, _)) = definition_parts(atom) else {
+        return Ok(());
+    };
+
+    let keep_shadow = {
+        let space = funcs.space.read().unwrap();
+        space.get_atoms().iter().any(|existing| match existing {
+            Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("=") => {
+                items.get(1) == Some(head)
+            }
+            _ => false,
+        })
+    };
+
+    if !keep_shadow {
+        let _ = funcs.space.write().unwrap().remove_atom(head)?;
+    }
+    Ok(())
+}
+
+fn install_space_atom(atom: &Atom, funcs: &crate::func::FnTable) -> Result<(), String> {
+    funcs.space.write().unwrap().add_atom(atom)?;
+    add_definition_head_shadow(atom, funcs)?;
+    maybe_cache_definition_atom(atom, funcs);
+    Ok(())
+}
+
+fn remove_space_atom(atom: &Atom, funcs: &crate::func::FnTable) -> Result<(), String> {
+    let removed = funcs.space.write().unwrap().remove_atom(atom)?;
+    if removed {
+        remove_definition_head_shadow(atom, funcs)?;
+        maybe_uncache_definition_atom(atom, funcs);
+    }
+    Ok(())
+}
+
+fn is_definition_head_shadow(atom: &Atom, atoms: &[Atom]) -> bool {
+    atoms.iter().any(|candidate| match candidate {
+        Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("=") => {
+            items.get(1) == Some(atom)
+        }
+        _ => false,
+    })
+}
+
 fn register_function_definition(
     head: &Atom,
     body: &Atom,
     funcs: &crate::func::FnTable,
 ) -> Result<(), String> {
-    // Reconstruct `(= head body)`, compile it to a clause, and install it in the
-    // dispatch cache so the freshly-evolved rule is immediately callable by the
-    // live evaluator. This is the self-evolution closure: Transform rewrites a
-    // definition and the result becomes executable code.
     match head {
         Atom::Sym(_) | Atom::Expr(_) => {}
         _ => return Err("Transform head must be a symbol or expression".to_string()),
     }
+
     let def = Atom::Expr(vec![Atom::sym("="), head.clone(), body.clone()]);
-    let expr = crate::parser::atom_to_expr(&def)?;
-    let (name, clause) = crate::compile::compile_definition(&expr)?;
-    funcs.cache_fn(&name, clause.patterns.len() as u8, clause);
-    Ok(())
+    cache_definition_atom(&def, funcs)
 }
 
 /// Occurs check: does variable v occur in term?

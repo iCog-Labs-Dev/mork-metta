@@ -5,7 +5,6 @@
 ///
 /// Reads a `.metta` file, registers function definitions, evaluates runnable
 /// `!(...)` expressions, and prints results.
-
 use mork_metta::Runtime;
 
 fn main() {

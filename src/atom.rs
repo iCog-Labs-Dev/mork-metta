@@ -1,3 +1,5 @@
+use crate::env::Env;
+use crate::parser::Expr;
 /// Core value type for the MeTTa evaluator.
 ///
 /// Every value in MeTTa is an Atom. Atoms are either:
@@ -18,8 +20,6 @@
 /// - Empty symbol `Sym("")` represents MeTTa's `Empty` / false / unit value.
 /// - `Closure` equality compares params, body, and captured env structurally.
 use std::sync::Arc;
-use crate::env::Env;
-use crate::parser::Expr;
 
 /// Heap-allocated closure fields — boxed so `Atom` stays 32 bytes.
 #[derive(Clone, Debug, PartialEq)]
@@ -131,7 +131,10 @@ impl Atom {
     pub fn as_expr(&self) -> Result<&[Atom], String> {
         match self {
             Atom::Expr(items) => Ok(items.as_slice()),
-            other => Err(format!("expected expression, got {}", other.to_sexpr_string())),
+            other => Err(format!(
+                "expected expression, got {}",
+                other.to_sexpr_string()
+            )),
         }
     }
 
@@ -144,12 +147,7 @@ impl Atom {
     pub fn is_truthy(&self) -> bool {
         match self {
             Atom::Num(0) => false,
-            Atom::Sym(s)
-                if s.is_empty()
-                    || s.as_ref().eq_ignore_ascii_case("false") =>
-            {
-                false
-            }
+            Atom::Sym(s) if s.is_empty() || s.as_ref().eq_ignore_ascii_case("false") => false,
             _ => true,
         }
     }

@@ -13,7 +13,6 @@
 ///
 /// The prior HashMap-based implementation caused fib(30) to take >30s due to
 /// 2.7 million HashMap clones. The linked-list approach completes in ~0.3s.
-
 use crate::atom::Atom;
 use std::sync::Arc;
 
@@ -52,7 +51,11 @@ impl Env {
         loop {
             match current {
                 Env::Empty => return None,
-                Env::Cons { name: n, value, next } => {
+                Env::Cons {
+                    name: n,
+                    value,
+                    next,
+                } => {
                     if &**n == name {
                         return Some(value.clone());
                     }

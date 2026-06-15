@@ -11,34 +11,33 @@
 /// - Builtins are registered at construction time and re-registered on reify.
 /// - `load_form` stores definitions in the space AND registers them as functions
 ///   (two-phase: data + compiled cache).
-
 pub mod atom;
-pub mod trace;
 pub mod compile;
 pub mod env;
 pub mod eval_parts;
+pub mod trace;
 /// Re-export for backward compatibility with tests that import `crate::eval`.
 pub mod eval {
     pub use crate::eval_parts::*;
 }
-pub mod func;
 pub mod builtins;
+pub mod func;
 pub mod parser;
-pub mod space;
 #[cfg(feature = "plugins")]
 pub mod plugin;
+pub mod space;
 
 // Re-export machine state functions for Phase 1 testing
-pub use eval_parts::{MachineState, unify, apply_substitution, calculate_cost};
+pub use eval_parts::{MachineState, apply_substitution, calculate_cost, unify};
 
 use crate::atom::Atom;
+use crate::builtins::register_builtins;
 use crate::compile::compile_definition;
 use crate::env::Env;
 use crate::eval_parts::{eval, eval_scope};
-use crate::func::FnTable;
 use crate::func::Clause;
-use crate::builtins::register_builtins;
-use crate::parser::{expr_to_atom, parse_forms, Expr, TopForm};
+use crate::func::FnTable;
+use crate::parser::{Expr, TopForm, expr_to_atom, parse_forms};
 use crate::space::{Pattern, Space};
 
 /// The MeTTa runtime: owns the function table (which owns the atom space).
@@ -91,7 +90,8 @@ impl Runtime {
                         }
                     }
                     // Populate fn_cache for fast concurrent dispatch
-                    self.funcs.cache_fn(&name, clause.patterns.len() as u8, clause);
+                    self.funcs
+                        .cache_fn(&name, clause.patterns.len() as u8, clause);
                 }
                 Ok(None)
             }

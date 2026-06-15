@@ -1,3 +1,6 @@
+use super::constrained::eval_constrained;
+use super::core::{apply_closure, eval};
+use super::pattern::{prepend_env, try_match_one};
 /// Special form evaluators.
 ///
 /// Each function in this module evaluates one MeTTa special form:
@@ -11,14 +14,10 @@
 /// Every `eval_*` function shares the same basic signature:
 /// `fn eval_NAME(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String>`
 /// Some simpler forms (quote, repr, lambda) only need `(args, env)`.
-
 use crate::atom::{Atom, ClosureData};
 use crate::env::Env;
 use crate::func::{FnTable, FunctionKind, NDet};
-use crate::parser::{atom_to_expr, Expr};
-use super::constrained::eval_constrained;
-use super::core::{apply_closure, eval};
-use super::pattern::{prepend_env, try_match_one};
+use crate::parser::{Expr, atom_to_expr};
 use crate::trace;
 use std::sync::Arc;
 
@@ -29,10 +28,7 @@ use std::sync::Arc;
 /// Evaluate `(if cond then else)`.
 pub(crate) fn eval_if(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(format!(
-            "if: expected 2 or 3 args, got {}",
-            args.len()
-        ));
+        return Err(format!("if: expected 2 or 3 args, got {}", args.len()));
     }
     // Use constraint-aware evaluation for the condition so free-variable bindings
     // (e.g. $x→True from clause matching) are threaded into the template.
@@ -83,19 +79,15 @@ pub(crate) fn eval_progn(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
                     let val = items[2].clone();
                     let body = &items[3];
                     let mut new_progn_args = vec![body.clone()];
-                    new_progn_args.extend_from_slice(&args[i+1..]);
+                    new_progn_args.extend_from_slice(&args[i + 1..]);
                     let new_progn = Expr::List(
                         vec![Expr::Symbol("progn".to_string())]
                             .into_iter()
                             .chain(new_progn_args)
-                            .collect()
+                            .collect(),
                     );
-                    let new_let = Expr::List(vec![
-                        Expr::Symbol("let".to_string()),
-                        pat,
-                        val,
-                        new_progn,
-                    ]);
+                    let new_let =
+                        Expr::List(vec![Expr::Symbol("let".to_string()), pat, val, new_progn]);
                     last = Some(super::core::eval(&new_let, env, funcs)?);
                     break; // The rest of the forms are now in the `let` body
                 }
@@ -104,18 +96,15 @@ pub(crate) fn eval_progn(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
                     let bindings = items[1].clone();
                     let body = &items[2];
                     let mut new_progn_args = vec![body.clone()];
-                    new_progn_args.extend_from_slice(&args[i+1..]);
+                    new_progn_args.extend_from_slice(&args[i + 1..]);
                     let new_progn = Expr::List(
                         vec![Expr::Symbol("progn".to_string())]
                             .into_iter()
                             .chain(new_progn_args)
-                            .collect()
+                            .collect(),
                     );
-                    let new_let = Expr::List(vec![
-                        Expr::Symbol("let*".to_string()),
-                        bindings,
-                        new_progn,
-                    ]);
+                    let new_let =
+                        Expr::List(vec![Expr::Symbol("let*".to_string()), bindings, new_progn]);
                     last = Some(super::core::eval(&new_let, env, funcs)?);
                     break;
                 }
@@ -129,12 +118,12 @@ pub(crate) fn eval_progn(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
                         if s.starts_with('$') {
                             let result_var = items[3].clone();
                             let mut new_progn_args = vec![];
-                            new_progn_args.extend_from_slice(&args[i+1..]);
+                            new_progn_args.extend_from_slice(&args[i + 1..]);
                             let new_progn = Expr::List(
                                 vec![Expr::Symbol("progn".to_string())]
                                     .into_iter()
                                     .chain(new_progn_args)
-                                    .collect()
+                                    .collect(),
                             );
                             let new_let = Expr::List(vec![
                                 Expr::Symbol("let".to_string()),
@@ -183,7 +172,8 @@ pub(crate) fn eval_let(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet
         .into_iter()
         .filter_map(|v| {
             // Fresh match env prevents outer variable capture
-            let match_env = super::pattern::try_match_one(pattern, &v, &Env::new(), funcs).ok()??;
+            let match_env =
+                super::pattern::try_match_one(pattern, &v, &Env::new(), funcs).ok()??;
             let new_env = super::pattern::prepend_env(match_env, env);
             // REASON: body eval failure in nondet stream is skipped,
             // not propagated — matches PeTTa's backtracking semantics.
@@ -211,11 +201,7 @@ pub(crate) fn eval_let_star(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
     }
     let bindings = match &args[0] {
         Expr::List(items) => items,
-        _ => {
-            return Err(
-                "let*: first arg must be a list of (pattern val) pairs".into(),
-            )
-        }
+        _ => return Err("let*: first arg must be a list of (pattern val) pairs".into()),
     };
     let mut current_env = env.clone();
     for pair in bindings {
@@ -230,14 +216,15 @@ pub(crate) fn eval_let_star(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
                 // Fresh match env prevents outer variable capture
                 let match_env = super::pattern::try_match_one(pattern, &val, &Env::new(), funcs)?
                     .ok_or_else(|| {
-                        format!("let*: pattern does not match value: {} vs {}",
-                            pattern.to_string(), val.to_sexpr_string())
-                    })?;
+                    format!(
+                        "let*: pattern does not match value: {} vs {}",
+                        pattern.to_string(),
+                        val.to_sexpr_string()
+                    )
+                })?;
                 current_env = super::pattern::prepend_env(match_env, &current_env);
             }
-            _ => {
-                return Err("let*: each binding must be a list (pattern val)".into())
-            }
+            _ => return Err("let*: each binding must be a list (pattern val)".into()),
         }
     }
     super::core::eval(&args[1], &current_env, funcs)
@@ -264,7 +251,11 @@ pub(crate) fn eval_within(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<N
                 return Err("within: expression produced no results".into());
             }
             if vals.len() > 1 {
-                Atom::Expr(std::iter::once(Atom::sym("within")).chain(vals.into_iter()).collect())
+                Atom::Expr(
+                    std::iter::once(Atom::sym("within"))
+                        .chain(vals.into_iter())
+                        .collect(),
+                )
             } else {
                 Atom::Expr(vec![Atom::sym("within"), vals.into_iter().next().unwrap()])
             }
@@ -303,9 +294,7 @@ pub(crate) fn eval_repr(args: &[Expr], _env: &Env) -> Result<NDet, String> {
 /// Unbound `$vars` are left as `Atom::Sym("$name")`.
 pub(crate) fn subst_and_atomize(expr: &Expr, env: &Env) -> Atom {
     match expr {
-        Expr::Symbol(s) if s.starts_with('$') => {
-            env.get(s).unwrap_or_else(|| Atom::sym(s))
-        }
+        Expr::Symbol(s) if s.starts_with('$') => env.get(s).unwrap_or_else(|| Atom::sym(s)),
         Expr::List(items) => Atom::Expr(items.iter().map(|e| subst_and_atomize(e, env)).collect()),
         Expr::Number(n) => Atom::Num(*n),
         Expr::Symbol(s) => Atom::sym(s),
@@ -329,9 +318,7 @@ pub(crate) fn subst_expr_vars(expr: &Expr, env: &Env) -> Expr {
                 expr.clone()
             }
         }
-        Expr::List(items) => {
-            Expr::List(items.iter().map(|e| subst_expr_vars(e, env)).collect())
-        }
+        Expr::List(items) => Expr::List(items.iter().map(|e| subst_expr_vars(e, env)).collect()),
         _ => expr.clone(),
     }
 }
@@ -345,7 +332,8 @@ pub(crate) fn subst_expr_vars(expr: &Expr, env: &Env) -> Expr {
 pub(crate) fn eval_lambda(args: &[Expr], env: &Env) -> Result<NDet, String> {
     if args.len() != 2 {
         return Err(format!(
-            "|->: expected (params body), got {} args", args.len()
+            "|->: expected (params body), got {} args",
+            args.len()
         ));
     }
     let params = match &args[0] {
@@ -390,14 +378,21 @@ pub(crate) fn eval_forall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<N
                 let call = Expr::List(vec![Expr::Symbol(fname.to_string()), arg_sym.clone()]);
                 super::core::eval(&call, &call_env, funcs)?.collect()
             }
-            Atom::Closure(c) => {
-                super::core::apply_closure(&c.params, &c.body, &c.env, &[arg_sym.clone()], &call_env, funcs)?
-                    .collect()
+            Atom::Closure(c) => super::core::apply_closure(
+                &c.params,
+                &c.body,
+                &c.env,
+                &[arg_sym.clone()],
+                &call_env,
+                funcs,
+            )?
+            .collect(),
+            other => {
+                return Err(format!(
+                    "forall: check must be a function or closure, got {}",
+                    other.to_sexpr_string()
+                ));
             }
-            other => return Err(format!(
-                "forall: check must be a function or closure, got {}",
-                other.to_sexpr_string()
-            )),
         };
         if results.is_empty() || !results.iter().all(|a| a.is_truthy()) {
             return Ok(NDet::single(Atom::sym("false")));
@@ -476,9 +471,9 @@ pub(crate) fn eval_superpose(args: &[Expr], env: &Env, funcs: &FnTable) -> Resul
     }
     // Non-list: evaluate, then unpack if Expr value
     let mut results = super::core::eval(arg, env, funcs)?;
-    let val = results.next().ok_or_else(|| {
-        "superpose: argument produced no results".to_string()
-    })?;
+    let val = results
+        .next()
+        .ok_or_else(|| "superpose: argument produced no results".to_string())?;
     match val {
         Atom::Expr(elements) => Ok(NDet::stream(elements.into_iter())),
         other => Ok(NDet::single(other)),
@@ -542,18 +537,18 @@ pub(crate) fn eval_foldall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<
     };
     // Evaluate init value (first result)
     let mut init_results = super::core::eval(&args[2], env, funcs)?;
-    let init = init_results.next().ok_or_else(|| {
-        "foldall: init expression produced no results".to_string()
-    })?;
+    let init = init_results
+        .next()
+        .ok_or_else(|| "foldall: init expression produced no results".to_string())?;
     // Fold: accum = agg(accum, next) for each gen value
     let accum = gen_values.into_iter().try_fold(init, |acc, val| {
         let acc_expr = crate::parser::atom_to_expr(&acc)?;
         let val_expr = crate::parser::atom_to_expr(&val)?;
         let call = Expr::List(vec![agg_func.clone(), acc_expr, val_expr]);
         let mut results = super::core::eval(&call, env, funcs)?;
-        results.next().ok_or_else(|| {
-            "foldall: aggregate function produced no results".to_string()
-        })
+        results
+            .next()
+            .ok_or_else(|| "foldall: aggregate function produced no results".to_string())
     })?;
     Ok(NDet::single(accum))
 }
@@ -568,12 +563,19 @@ pub(crate) fn eval_foldall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<
 /// Currently only handles the single-free-variable case with literal (number
 /// or symbol) patterns. Nested patterns or multiple free variables are not
 /// supported and return an error.
-pub(crate) fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<Vec<Atom>, String> {
+pub(crate) fn generate_free_var_values(
+    expr: &Expr,
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<Vec<Atom>, String> {
     let items = match expr {
         Expr::List(items) if !items.is_empty() => items,
-        _ => return Err(format!(
-            "generator: expected a function call, got {}", expr.to_string()
-        )),
+        _ => {
+            return Err(format!(
+                "generator: expected a function call, got {}",
+                expr.to_string()
+            ));
+        }
     };
     let op = &items[0];
     let arity = items.len() - 1;
@@ -588,7 +590,8 @@ pub(crate) fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) 
         let (params, body, capture_env) = (&c.params, &c.body, &c.env);
         let mut closure_env = capture_env.clone();
         for (param, arg_expr) in params.iter().zip(items[1..].iter()) {
-            let is_free = matches!(arg_expr, Expr::Symbol(s) if s.starts_with('$') && env.get(s).is_none());
+            let is_free =
+                matches!(arg_expr, Expr::Symbol(s) if s.starts_with('$') && env.get(s).is_none());
             if !is_free {
                 if let Ok(mut evaled) = super::core::eval(arg_expr, env, funcs) {
                     if let Some(val) = evaled.next() {
@@ -607,9 +610,12 @@ pub(crate) fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) 
     }
     let fname = match &op_atom {
         Atom::Sym(s) => s.clone(),
-        _ => return Err(format!(
-            "generator: expected function name, got {}", op_atom.to_sexpr_string()
-        )),
+        _ => {
+            return Err(format!(
+                "generator: expected function name, got {}",
+                op_atom.to_sexpr_string()
+            ));
+        }
     };
     // SAFETY: arity = items.len() - 1; items is non-empty (guarded above), so arity < 256.
     if let Some(func_ref) = funcs.get(&fname, arity as u8) {
@@ -622,7 +628,9 @@ pub(crate) fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) 
                 match super::core::eval(arg_expr, env, funcs) {
                     Ok(nd) => {
                         let vals: Vec<Atom> = nd.collect();
-                        if vals.is_empty() { return Ok(vec![]); }
+                        if vals.is_empty() {
+                            return Ok(vec![]);
+                        }
                         arg_options.push(vals);
                     }
                     Err(_) => {
@@ -636,7 +644,9 @@ pub(crate) fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) 
             let mut results = Vec::new();
             let mut indices = vec![0usize; arg_options.len()];
             loop {
-                let args_slice: Vec<Atom> = indices.iter().enumerate()
+                let args_slice: Vec<Atom> = indices
+                    .iter()
+                    .enumerate()
                     .map(|(i, &idx)| arg_options[i][idx].clone())
                     .collect();
                 if let Ok(mut nd) = f(&args_slice, funcs) {
@@ -653,21 +663,29 @@ pub(crate) fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) 
                         break;
                     }
                     indices[i] = 0;
-                    if i == 0 { return Ok(results); }
+                    if i == 0 {
+                        return Ok(results);
+                    }
                 }
             }
         }
         return Err("generator: unexpected native dispatch failure".into());
     }
     // Cached dispatch for user-defined functions
-    let clauses: Vec<crate::func::Clause> = match funcs.fn_cache.read().unwrap()
-        .get(fname.as_ref()).and_then(|inner| inner.get(&(arity as u8)))
+    let clauses: Vec<crate::func::Clause> = match funcs
+        .fn_cache
+        .read()
+        .unwrap()
+        .get(fname.as_ref())
+        .and_then(|inner| inner.get(&(arity as u8)))
     {
         Some(c) => c.clone(),
-        None => return Err(format!(
-            "generator: {}: no matching definitions in fn_cache",
-            fname
-        )),
+        None => {
+            return Err(format!(
+                "generator: {}: no matching definitions in fn_cache",
+                fname
+            ));
+        }
     };
     let mut results = Vec::new();
     for clause in &clauses {
@@ -677,10 +695,7 @@ pub(crate) fn generate_free_var_values(expr: &Expr, env: &Env, funcs: &FnTable) 
         }
     }
     if results.is_empty() {
-        return Err(format!(
-            "generator: {}: no matching definitions",
-            fname
-        ));
+        return Err(format!("generator: {}: no matching definitions", fname));
     }
     Ok(results)
 }
@@ -704,20 +719,22 @@ pub(crate) fn eval_map_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
         ));
     }
     let mut list_results = super::core::eval(&args[0], env, funcs)?;
-    let list_atom = list_results.next().ok_or_else(|| {
-        "map-atom: list expression produced no results".to_string()
-    })?;
+    let list_atom = list_results
+        .next()
+        .ok_or_else(|| "map-atom: list expression produced no results".to_string())?;
     let mut func_results = super::core::eval(&args[1], env, funcs)?;
-    let func_atom = func_results.next().ok_or_else(|| {
-        "map-atom: func expression produced no results".to_string()
-    })?;
+    let func_atom = func_results
+        .next()
+        .ok_or_else(|| "map-atom: func expression produced no results".to_string())?;
     // Move elements out — list_atom not needed after this.
     let elements = match list_atom {
         Atom::Expr(items) => items,
-        other => return Err(format!(
-            "map-atom: expected a list (Expr), got {}",
-            other.to_sexpr_string()
-        )),
+        other => {
+            return Err(format!(
+                "map-atom: expected a list (Expr), got {}",
+                other.to_sexpr_string()
+            ));
+        }
     };
     let mut results = Vec::with_capacity(elements.len());
     for elem in &elements {
@@ -727,18 +744,30 @@ pub(crate) fn eval_map_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
                 let elem_expr = crate::parser::atom_to_expr(elem)?;
                 let call_expr = Expr::List(vec![Expr::Symbol(fname.to_string()), elem_expr]);
                 let mut r = super::core::eval(&call_expr, env, funcs)?;
-                r.next().ok_or_else(|| format!(
-                    "map-atom: {} returned no result for {}",
-                    fname, elem.to_sexpr_string()
-                ))?
+                r.next().ok_or_else(|| {
+                    format!(
+                        "map-atom: {} returned no result for {}",
+                        fname,
+                        elem.to_sexpr_string()
+                    )
+                })?
             }
             Atom::Closure(c) => {
                 let elem_expr = crate::parser::atom_to_expr(elem)?;
-                let mut r = super::core::apply_closure(&c.params, &c.body, &c.env, &[elem_expr], env, funcs)?;
-                r.next().ok_or_else(|| format!(
-                    "map-atom: closure returned no result for {}",
-                    elem.to_sexpr_string()
-                ))?
+                let mut r = super::core::apply_closure(
+                    &c.params,
+                    &c.body,
+                    &c.env,
+                    &[elem_expr],
+                    env,
+                    funcs,
+                )?;
+                r.next().ok_or_else(|| {
+                    format!(
+                        "map-atom: closure returned no result for {}",
+                        elem.to_sexpr_string()
+                    )
+                })?
             }
             // reduce case 3: unknown func → [Func, H] as data
             _ => Atom::Expr(vec![func_atom.clone(), elem.clone()]),
@@ -788,17 +817,20 @@ pub(crate) fn eval_chain(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
         // Var must be a $variable
         let var_name = match var {
             Expr::Symbol(s) if s.starts_with('$') => s.clone(),
-            _ => return Err(format!(
-                "chain: arg {} must be a $variable, got {}",
-                i * 2 + 1, var.to_string()
-            )),
+            _ => {
+                return Err(format!(
+                    "chain: arg {} must be a $variable, got {}",
+                    i * 2 + 1,
+                    var.to_string()
+                ));
+            }
         };
 
         // Evaluate expression, take first result
         let mut results = super::core::eval(expr, &current_env, funcs)?;
-        let val = results.next().ok_or_else(|| {
-            format!("chain: expression {} produced no results", i * 2)
-        })?;
+        let val = results
+            .next()
+            .ok_or_else(|| format!("chain: expression {} produced no results", i * 2))?;
 
         current_env = current_env.extend(&var_name, val);
     }
@@ -824,14 +856,21 @@ pub(crate) fn eval_chain(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
 /// Returns error if no clause matches the value.
 /// Try one (value, clauses) combination for case: find first matching clause
 /// and evaluate its body. Returns the body results or an error.
-pub(crate) fn try_case_value(val: &Atom, clauses: &[Expr], env: &Env, funcs: &FnTable) -> Result<Vec<Atom>, String> {
+pub(crate) fn try_case_value(
+    val: &Atom,
+    clauses: &[Expr],
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<Vec<Atom>, String> {
     for clause in clauses {
         let (pattern, body) = match clause {
             Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
-            _ => return Err(format!(
-                "case: each clause must be (pattern body), got {}",
-                clause.to_string()
-            )),
+            _ => {
+                return Err(format!(
+                    "case: each clause must be (pattern body), got {}",
+                    clause.to_string()
+                ));
+            }
         };
         if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
             continue;
@@ -845,7 +884,8 @@ pub(crate) fn try_case_value(val: &Atom, clauses: &[Expr], env: &Env, funcs: &Fn
         }
     }
     Err(format!(
-        "case: no clause matched value {}", val.to_sexpr_string()
+        "case: no clause matched value {}",
+        val.to_sexpr_string()
     ))
 }
 
@@ -896,4 +936,3 @@ pub(crate) fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDe
     }
     Ok(NDet::stream(out.into_iter()))
 }
-

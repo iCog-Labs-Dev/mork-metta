@@ -2,7 +2,6 @@
 ///
 /// The compiler does minimal work — it extracts the function name and stores
 /// the raw pattern expressions and body for the evaluator to dispatch on.
-
 use crate::func::Clause;
 use crate::parser::Expr;
 

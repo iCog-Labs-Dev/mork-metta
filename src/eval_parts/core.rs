@@ -171,6 +171,48 @@ fn eval_transaction(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, S
     }
 }
 
+fn eval_assert(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "assert: expected (assert goal), got {} args",
+            args.len()
+        ));
+    }
+
+    let goal = &args[0];
+    let mut results = eval(goal, env, funcs)?;
+    if results.any(|atom| atom.is_truthy()) {
+        Ok(NDet::single(Atom::sym("true")))
+    } else {
+        Err(format!("Assertion failed: {}", goal.to_string()))
+    }
+}
+
+fn definition_arg_atom(expr: &Expr, env: &Env) -> Option<Atom> {
+    match expr {
+        Expr::List(items)
+            if items.len() == 3
+                && matches!(&items[0], Expr::Symbol(s) if s == "=")
+                && matches!(&items[1], Expr::List(_)) =>
+        {
+            Some(crate::eval_parts::special::subst_and_atomize(expr, env))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn eval_user_call_arg(
+    expr: &Expr,
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<Vec<Atom>, String> {
+    if let Some(atom) = definition_arg_atom(expr, env) {
+        Ok(vec![atom])
+    } else {
+        Ok(eval(expr, env, funcs)?.collect())
+    }
+}
+
 /// Top-level entry point: evaluate an expression.
 ///
 /// Dispatches to the active evaluation engine (see [`crate::eval_parts::cek`]):
@@ -250,6 +292,10 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     "eval" => {
                         trace!("→ special: eval");
                         return eval_eval(args, env, funcs);
+                    }
+                    "assert" => {
+                        trace!("→ special: assert");
+                        return eval_assert(args, env, funcs);
                     }
                     "add-atom" => {
                         trace!("→ special: add-atom");
@@ -567,8 +613,7 @@ fn try_eval_from_space_fallback(
 
     let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(args.len());
     for arg in args {
-        let mut results = eval(arg, env, funcs)?;
-        let vals: Vec<Atom> = results.by_ref().collect();
+        let vals = eval_user_call_arg(arg, env, funcs)?;
         if vals.is_empty() {
             return Ok(None);
         }
@@ -655,8 +700,7 @@ fn try_eval_from_space(
     // Evaluate each argument to collect all result alternatives.
     let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(args.len());
     for arg in args {
-        let mut results = eval(arg, env, funcs)?;
-        let vals: Vec<Atom> = results.by_ref().collect();
+        let vals = eval_user_call_arg(arg, env, funcs)?;
         if vals.is_empty() {
             return Ok(None);
         }

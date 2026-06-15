@@ -27,7 +27,6 @@
 /// `metta_plugin_call` receives args as a sexpr string (space-separated atoms)
 /// and returns the result as a sexpr string, or null on error.
 /// `metta_plugin_free_string` frees a result allocated by `call`.
-
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,7 +89,10 @@ fn compile_rs_to_so(src_path: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("failed to run rustc: {}", e))?;
 
     if !status.success() {
-        return Err(format!("rustc compilation failed for {}", src_path.display()));
+        return Err(format!(
+            "rustc compilation failed for {}",
+            src_path.display()
+        ));
     }
 
     Ok(so_path)
@@ -112,9 +114,7 @@ unsafe fn load_and_register_plugin(so_path: &Path, table: &FnTable) -> Result<()
         .map_err(|e| format!("loading plugin {}: {}", so_path.display(), e))?;
 
     // Resolve required symbols
-    let info_fn: libloading::Symbol<
-        unsafe extern "C" fn() -> *const std::ffi::c_char,
-    > = lib
+    let info_fn: libloading::Symbol<unsafe extern "C" fn() -> *const std::ffi::c_char> = lib
         .get(b"metta_plugin_info")
         .map_err(|e| format!("plugin missing metta_plugin_info: {}", e))?;
 
@@ -127,15 +127,15 @@ unsafe fn load_and_register_plugin(so_path: &Path, table: &FnTable) -> Result<()
         .get(b"metta_plugin_call")
         .map_err(|e| format!("plugin missing metta_plugin_call: {}", e))?;
 
-    let free_fn: libloading::Symbol<
-        unsafe extern "C" fn(*mut std::ffi::c_char),
-    > = lib
+    let free_fn: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_char)> = lib
         .get(b"metta_plugin_free_string")
         .map_err(|e| format!("plugin missing metta_plugin_free_string: {}", e))?;
 
     // Copy raw function pointers — they're valid as long as `lib` stays loaded.
-    let call_ptr: unsafe extern "C" fn(*const std::ffi::c_char, *const std::ffi::c_char)
-        -> *mut std::ffi::c_char = *call_fn;
+    let call_ptr: unsafe extern "C" fn(
+        *const std::ffi::c_char,
+        *const std::ffi::c_char,
+    ) -> *mut std::ffi::c_char = *call_fn;
     let free_ptr: unsafe extern "C" fn(*mut std::ffi::c_char) = *free_fn;
 
     // Read plugin info string
@@ -184,8 +184,7 @@ unsafe fn load_and_register_plugin(so_path: &Path, table: &FnTable) -> Result<()
                 let name_cstr = CString::new(func_name.as_str())
                     .map_err(|e| format!("name contains null: {}", e))?;
 
-                let result_ptr =
-                    unsafe { call_ptr(name_cstr.as_ptr(), args_cstr.as_ptr()) };
+                let result_ptr = unsafe { call_ptr(name_cstr.as_ptr(), args_cstr.as_ptr()) };
 
                 if result_ptr.is_null() {
                     return Err(format!("plugin error calling '{}'", func_name));

@@ -30,24 +30,36 @@
 mod depth {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static DEPTH: AtomicUsize = AtomicUsize::new(0);
-    pub fn get() -> usize { DEPTH.load(Ordering::Relaxed) }
-    pub fn inc() { DEPTH.fetch_add(1, Ordering::Relaxed); }
-    pub fn dec() { DEPTH.fetch_sub(1, Ordering::Relaxed); }
+    pub fn get() -> usize {
+        DEPTH.load(Ordering::Relaxed)
+    }
+    pub fn inc() {
+        DEPTH.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn dec() {
+        DEPTH.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 // ===== Internal functions referenced by macros =====
 
 #[cfg(feature = "trace")]
 #[doc(hidden)]
-pub fn __depth() -> usize { depth::get() }
+pub fn __depth() -> usize {
+    depth::get()
+}
 
 #[cfg(feature = "trace")]
 #[doc(hidden)]
-pub fn __inc() { depth::inc() }
+pub fn __inc() {
+    depth::inc()
+}
 
 #[cfg(feature = "trace")]
 #[doc(hidden)]
-pub fn __dec() { depth::dec() }
+pub fn __dec() {
+    depth::dec()
+}
 
 /// Maximum trace depth. Trace lines deeper than this are suppressed.
 /// Override with `TRACE_DEPTH=N` env var (parsed at first access).

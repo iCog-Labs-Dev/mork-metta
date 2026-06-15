@@ -16,7 +16,6 @@
 /// - Comments begin with `;` and extend to end of line.
 /// - Integer tokens are prefixed or unprefixed ASCII digits.
 /// - Symbols can contain any non-whitespace, non-paren characters.
-
 use crate::atom::Atom;
 
 /// A top-level form in a MeTTa file.
@@ -134,12 +133,7 @@ pub fn parse_forms(input: &str) -> Result<Vec<TopForm>, String> {
         // Must start with '('
         match chars.next() {
             Some('(') => {}
-            Some(c) => {
-                return Err(format!(
-                    "expected '(' at start of form, found '{}'",
-                    c
-                ))
-            }
+            Some(c) => return Err(format!("expected '(' at start of form, found '{}'", c)),
             None => return Err("unexpected end of input".into()),
         }
 
@@ -158,18 +152,14 @@ pub fn parse_forms(input: &str) -> Result<Vec<TopForm>, String> {
 
 /// Parse a single S-expression from a character stream.
 /// Assumes the opening '(' has already been consumed.
-fn parse_sexpr_body(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<Expr, String> {
+fn parse_sexpr_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<Expr, String> {
     let mut items = Vec::new();
 
     loop {
         skip_whitespace_and_comments(chars);
 
         match chars.peek() {
-            None => {
-                return Err("unexpected end of input inside S-expression".into())
-            }
+            None => return Err("unexpected end of input inside S-expression".into()),
             Some(&')') => {
                 chars.next(); // consume ')'
                 return Ok(Expr::List(items));

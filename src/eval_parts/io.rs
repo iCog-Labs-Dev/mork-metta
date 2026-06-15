@@ -8,12 +8,11 @@
 /// `load_metta_file` uses a streaming form-by-form parser — only one
 /// balanced expression is held in memory at a time, so billion-line
 /// data files are safe.
-
 use crate::atom::Atom;
 use crate::env::Env;
 use crate::eval_parts::core::eval;
 use crate::func::{FnTable, NDet};
-use crate::parser::{parse_forms, Expr, TopForm};
+use crate::parser::{Expr, TopForm, parse_forms};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -36,24 +35,27 @@ pub(crate) fn eval_import(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<N
     }
     // Evaluate space reference
     let mut space_results = eval(&args[0], env, funcs)?;
-    let _space_ref = space_results.next().ok_or_else(|| {
-        "import!: space expression produced no results".to_string()
-    })?;
+    let _space_ref = space_results
+        .next()
+        .ok_or_else(|| "import!: space expression produced no results".to_string())?;
     // Extract path string
     let path_str = match &args[1] {
         Expr::Symbol(s) => s.clone(),
         Expr::Number(_) => return Err("import!: file path must be a symbol, not a number".into()),
-        Expr::List(_)   => return Err("import!: file path must be a symbol, not a list".into()),
+        Expr::List(_) => return Err("import!: file path must be a symbol, not a list".into()),
     };
     // Resolve path: CWD first, then relative to the importing file's directory.
     let import_dir = funcs.import_dir.lock().unwrap().clone();
-    let resolved = resolve_import_path(&path_str, &import_dir)
-        .ok_or_else(|| format!(
+    let resolved = resolve_import_path(&path_str, &import_dir).ok_or_else(|| {
+        format!(
             "import!: cannot find '{}' (searched CWD and '{}')",
-            path_str, import_dir.display()
-        ))?;
+            path_str,
+            import_dir.display()
+        )
+    })?;
     // Push the imported file's directory so nested imports resolve relative to it.
-    let new_dir = resolved.parent()
+    let new_dir = resolved
+        .parent()
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
     let prev_dir = std::mem::replace(&mut *funcs.import_dir.lock().unwrap(), new_dir);
@@ -79,14 +81,17 @@ pub(crate) fn eval_import_rs(args: &[Expr], env: &Env, funcs: &FnTable) -> Resul
         ));
     }
     let mut results = eval(&args[0], env, funcs)?;
-    let name_atom = results.next().ok_or_else(|| {
-        "import-rs!: name expression produced no results".to_string()
-    })?;
+    let name_atom = results
+        .next()
+        .ok_or_else(|| "import-rs!: name expression produced no results".to_string())?;
     let name = match &name_atom {
         Atom::Sym(s) => s.as_ref().to_string(),
-        other => return Err(format!(
-            "import-rs!: name must be a symbol, got {}", other.to_sexpr_string()
-        )),
+        other => {
+            return Err(format!(
+                "import-rs!: name must be a symbol, got {}",
+                other.to_sexpr_string()
+            ));
+        }
     };
 
     // Search for the plugin file
@@ -147,7 +152,10 @@ fn resolve_import_path(path_str: &str, import_dir: &Path) -> Option<PathBuf> {
         .chain(std::iter::once(import_dir.to_path_buf()))
         .chain(parent_cwd);
     for base in bases {
-        for candidate in [base.join(path_str), base.join(format!("{}.metta", path_str))] {
+        for candidate in [
+            base.join(path_str),
+            base.join(format!("{}.metta", path_str)),
+        ] {
             if candidate.exists() {
                 return Some(candidate);
             }
@@ -161,11 +169,7 @@ fn resolve_import_path(path_str: &str, import_dir: &Path) -> Option<PathBuf> {
 ///
 /// Returns the first result of the last runnable form, or `None` if the file
 /// ends with a definition (matching the semantics of `load_form`).
-pub fn load_metta_file(
-    path: &Path,
-    env: &Env,
-    funcs: &FnTable,
-) -> Result<Vec<Atom>, String> {
+pub fn load_metta_file(path: &Path, env: &Env, funcs: &FnTable) -> Result<Vec<Atom>, String> {
     use std::io::{BufRead, BufReader};
     let file = std::fs::File::open(path)
         .map_err(|e| format!("cannot open '{}': {}", path.display(), e))?;
@@ -174,19 +178,30 @@ pub fn load_metta_file(
     let mut saw_bang = false;
     let mut results: Vec<Atom> = Vec::new();
     for (line_no, line_result) in BufReader::new(file).lines().enumerate() {
-        let line = line_result
-            .map_err(|e| format!("read error at line {} in '{}': {}", line_no + 1, path.display(), e))?;
+        let line = line_result.map_err(|e| {
+            format!(
+                "read error at line {} in '{}': {}",
+                line_no + 1,
+                path.display(),
+                e
+            )
+        })?;
         for ch in line.chars() {
             match ch {
                 ';' => break,
                 '!' if depth == 0 => saw_bang = true,
-                '(' => { depth += 1; form_buf.push(ch); }
+                '(' => {
+                    depth += 1;
+                    form_buf.push(ch);
+                }
                 ')' if depth > 0 => {
                     depth -= 1;
                     form_buf.push(ch);
                     if depth == 0 {
                         if let Some(result) = process_form(&form_buf, saw_bang, env, funcs)
-                            .map_err(|e| format!("{} (in '{}' near line {})", e, path.display(), line_no + 1))?
+                            .map_err(|e| {
+                                format!("{} (in '{}' near line {})", e, path.display(), line_no + 1)
+                            })?
                         {
                             results.push(result);
                         }
@@ -194,7 +209,13 @@ pub fn load_metta_file(
                         saw_bang = false;
                     }
                 }
-                ')' => return Err(format!("unmatched ')' in '{}' at line {}", path.display(), line_no + 1)),
+                ')' => {
+                    return Err(format!(
+                        "unmatched ')' in '{}' at line {}",
+                        path.display(),
+                        line_no + 1
+                    ));
+                }
                 _ if depth > 0 => form_buf.push(ch),
                 _ => {}
             }
@@ -228,11 +249,19 @@ fn process_form(
 }
 
 /// Process a single top-level form: store+compile definitions, eval runnables.
-pub(crate) fn process_top_form(form: TopForm, env: &Env, funcs: &FnTable) -> Result<Option<Atom>, String> {
+pub(crate) fn process_top_form(
+    form: TopForm,
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<Option<Atom>, String> {
     match form {
         TopForm::Definition(expr) => {
             let atom = crate::parser::expr_to_atom(&expr);
-            funcs.space.write().unwrap().add_atom(&atom)
+            funcs
+                .space
+                .write()
+                .unwrap()
+                .add_atom(&atom)
                 .map_err(|e| format!("add_atom: {}", e))?;
             if let Ok((name, clause)) = crate::compile::compile_definition(&expr) {
                 // Also store the BARE HEAD atom so `match` can find premise atoms
@@ -263,18 +292,25 @@ pub(crate) fn eval_readln(_args: &[Expr], _env: &Env, _funcs: &FnTable) -> Resul
     use std::io::{self, Write};
     let mut input = String::new();
     io::stdout().flush().map_err(|e| e.to_string())?;
-    io::stdin().read_line(&mut input).map_err(|e| e.to_string())?;
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| e.to_string())?;
     let wrapped = format!("({})", input);
     match crate::parser::parse_forms(&wrapped) {
         Ok(forms) => {
-            if let Some(crate::parser::TopForm::Definition(crate::parser::Expr::List(mut items))) = forms.into_iter().next() {
+            if let Some(crate::parser::TopForm::Definition(crate::parser::Expr::List(mut items))) =
+                forms.into_iter().next()
+            {
                 if items.len() == 1 {
                     Ok(NDet::single(crate::parser::expr_to_atom(&items.remove(0))))
                 } else if items.is_empty() {
                     Ok(NDet::single(crate::atom::Atom::Expr(vec![])))
                 } else {
                     Ok(NDet::single(crate::atom::Atom::Expr(
-                        items.into_iter().map(|e| crate::parser::expr_to_atom(&e)).collect()
+                        items
+                            .into_iter()
+                            .map(|e| crate::parser::expr_to_atom(&e))
+                            .collect(),
                     )))
                 }
             } else {
@@ -292,9 +328,9 @@ pub(crate) fn eval_println(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<
     let mut parts = Vec::new();
     for arg in args {
         let mut results = eval(arg, env, funcs)?;
-        let val = results.next().ok_or_else(|| {
-            format!("println!: argument produced no results: {:?}", arg)
-        })?;
+        let val = results
+            .next()
+            .ok_or_else(|| format!("println!: argument produced no results: {:?}", arg))?;
         if let Atom::Expr(items) = &val {
             let s: Vec<String> = items.iter().map(|a| a.to_sexpr_string()).collect();
             parts.push(s.join(" "));

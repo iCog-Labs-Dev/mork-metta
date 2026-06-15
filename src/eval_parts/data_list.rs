@@ -107,10 +107,10 @@ fn is_pure_expr_inner(expr: &Expr, funcs: &FnTable, assume_pure: Option<&str>) -
                     // Control forms: pure iff every subexpression is pure
                     "if" | "progn" | "let" | "let*" | "chain" | "collapse" => args_pure(),
                     // Effectful or opaque special forms
-                    "eval" | "call" | "reduce" | "transform" | "add-atom" | "remove-atom"
-                    | "match" | "with_mutex" | "transaction" | "import!" | "readln!"
-                    | "println!" | "case" | "foldall" | "map-atom" | "forall" | "within"
-                    | "py-call" | "import-rs!" => false,
+                    "eval" | "call" | "reduce" | "assert" | "transform" | "add-atom"
+                    | "remove-atom" | "match" | "with_mutex" | "transaction" | "import!"
+                    | "readln!" | "println!" | "case" | "foldall" | "map-atom" | "forall"
+                    | "within" | "py-call" | "import-rs!" => false,
                     // Function call: callee must be pure (or the function being
                     // defined, assumed pure) AND every argument must be pure —
                     // a pure callee does not launder impure args.

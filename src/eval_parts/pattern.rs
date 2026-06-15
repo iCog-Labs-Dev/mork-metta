@@ -10,13 +10,12 @@
 /// match attempt, so outer bindings in the calling environment never
 /// interfere with variable capture during recursive calls. The returned
 /// environment is then merged with the caller's via [`prepend_env`].
-
 use crate::atom::Atom;
 use crate::env::Env;
 use crate::eval_parts::core::eval;
 use crate::func::{Clause, FnTable};
-use std::sync::Arc;
 use crate::parser::Expr;
+use std::sync::Arc;
 
 /// Try to match argument atoms against a clause's patterns.
 ///
@@ -66,7 +65,7 @@ pub(crate) fn prepend_env(match_env: Env, base: &Env) -> Env {
                 value,
                 next: Arc::new(prepend_env(inner, base)),
             }
-        },
+        }
     }
 }
 
@@ -140,30 +139,30 @@ pub(crate) fn try_match_one(
                     if items.len() != elems.len() {
                         return Ok(None);
                     }
-                let mut current = env.clone();
-                for (pat, arg) in items.iter().zip(elems.iter()) {
-                    match try_match_one(pat, arg, &current, funcs)? {
-                        Some(new_env) => current = new_env,
-                        None => return Ok(None),
+                    let mut current = env.clone();
+                    for (pat, arg) in items.iter().zip(elems.iter()) {
+                        match try_match_one(pat, arg, &current, funcs)? {
+                            Some(new_env) => current = new_env,
+                            None => return Ok(None),
+                        }
+                    }
+                    Ok(Some(current))
+                }
+                // Free variable: evaluate the List pattern as code (computation
+                // in pattern, e.g. `(if (== $x 2) 43 44)`) and bind the result.
+                Atom::Sym(s) if s.starts_with('$') => {
+                    let expr = Expr::List(items.clone());
+                    match eval(&expr, env, funcs) {
+                        Ok(mut results) => match results.next() {
+                            Some(val) => Ok(Some(env.extend(s, val))),
+                            None => Ok(None),
+                        },
+                        Err(_) => Ok(None),
                     }
                 }
-                Ok(Some(current))
+                _ => Ok(None),
             }
-            // Free variable: evaluate the List pattern as code (computation
-            // in pattern, e.g. `(if (== $x 2) 43 44)`) and bind the result.
-            Atom::Sym(s) if s.starts_with('$') => {
-                let expr = Expr::List(items.clone());
-                match eval(&expr, env, funcs) {
-                    Ok(mut results) => match results.next() {
-                        Some(val) => Ok(Some(env.extend(s, val))),
-                        None => Ok(None),
-                    },
-                    Err(_) => Ok(None),
-                }
-            }
-            _ => Ok(None),
         }
-},
     }
 }
 

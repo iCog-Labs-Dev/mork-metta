@@ -516,7 +516,7 @@ fn dispatch(
             // Function call or data list.
             match op {
                 Expr::Symbol(s) if !s.starts_with('$') => {
-                    dispatch_call(s, &items[1..], items, env, funcs, work)
+                    dispatch_call(s, &items[1..], items, env, funcs, work, vals)
                 }
                 Expr::Symbol(s) => {
                     // $var-headed call: resolve the variable, then dispatch.
@@ -551,6 +551,7 @@ fn dispatch_call(
     env: &Env,
     funcs: &FnTable,
     work: &mut Vec<Task>,
+    vals: &mut Vec<ResultSet>,
 ) -> Result<(), String> {
     let arity = args.len() as u8;
 
@@ -576,6 +577,29 @@ fn dispatch_call(
                 env: env.clone(),
                 all_items: Arc::clone(&all_items_arc),
             };
+            if matches!(
+                &frame,
+                Frame::Call {
+                    head: Head::User { .. },
+                    ..
+                }
+            ) && args.iter().any(|arg| {
+                matches!(
+                    arg,
+                    Expr::List(items)
+                        if items.len() == 3
+                            && matches!(&items[0], Expr::Symbol(s) if s == "=")
+                            && matches!(&items[1], Expr::List(_))
+                )
+            }) {
+                for arg in args {
+                    vals.push(plain(crate::eval_parts::core::eval_user_call_arg(
+                        arg, env, funcs,
+                    )?));
+                }
+                work.push(Task::Apply(frame));
+                return Ok(());
+            }
             let parallel = crate::eval_parts::data_list::worth_parallel(args)
                 && args
                     .iter()
@@ -1015,7 +1039,7 @@ fn dispatch_resolved_head(
             // like (add-atom ...).
             if funcs.get(name, arity).is_some() || lookup_user_clauses(name, arity, funcs).is_some()
             {
-                dispatch_call(name, args, all_items, env, funcs, work)
+                dispatch_call(name, args, all_items, env, funcs, work, vals)
             } else {
                 work.push(Task::Apply(Frame::DataListWithHead {
                     head: head.clone(),
@@ -1512,6 +1536,7 @@ pub(crate) fn is_special_form(s: &str) -> bool {
             | "call"
             | "reduce"
             | "eval"
+            | "assert"
             | "transform"
             | "add-atom"
             | "remove-atom"
