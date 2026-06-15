@@ -58,6 +58,16 @@ fn f64_to_atom(f: f64) -> Atom {
     }
 }
 
+/// Convert an f64 to a float-like Atom, preserving the decimal part for exact values.
+fn f64_to_float_atom(f: f64) -> Atom {
+    let rendered = if f.fract() == 0.0 && f.is_finite() {
+        format!("{:.1}", f)
+    } else {
+        f.to_string()
+    };
+    Atom::sym(&rendered)
+}
+
 macro_rules! num_binary {
     ($table:ident, $name:expr, $int_op:expr, $float_op:expr) => {
         $table.insert_native($name, 2, |args, _| {
@@ -99,12 +109,33 @@ macro_rules! math_unary {
     };
 }
 
+macro_rules! math_unary_float {
+    ($table:ident, $name:expr, $op:expr) => {
+        $table.insert_native($name, 1, |args, _| {
+            let x = atom_as_f64(&args[0], $name)?;
+            Ok(NDet::single(f64_to_float_atom($op(x))))
+        });
+        $table.mark_pure($name, 1);
+    };
+}
+
 macro_rules! math_binary {
     ($table:ident, $name:expr, $op:expr) => {
         $table.insert_native($name, 2, |args, _| {
             let a = atom_as_f64(&args[0], $name)?;
             let b = atom_as_f64(&args[1], $name)?;
             Ok(NDet::single(f64_to_atom($op(a, b))))
+        });
+        $table.mark_pure($name, 2);
+    };
+}
+
+macro_rules! math_binary_float {
+    ($table:ident, $name:expr, $op:expr) => {
+        $table.insert_native($name, 2, |args, _| {
+            let a = atom_as_f64(&args[0], $name)?;
+            let b = atom_as_f64(&args[1], $name)?;
+            Ok(NDet::single(f64_to_float_atom($op(a, b))))
         });
         $table.mark_pure($name, 2);
     };
@@ -159,23 +190,23 @@ pub fn register_builtins(table: &FnTable) {
     bool_clause!(table, "implies", ["False", "False"], "True");
 
     // Float unary math — (fn-math x)
-    math_unary!(table, "sqrt-math", |x: f64| x.sqrt());
+    math_unary_float!(table, "sqrt-math", |x: f64| x.sqrt());
     math_unary!(table, "abs-math", |x: f64| x.abs());
     math_unary!(table, "trunc-math", |x: f64| x.trunc());
     math_unary!(table, "ceil-math", |x: f64| x.ceil());
     math_unary!(table, "floor-math", |x: f64| x.floor());
     math_unary!(table, "round-math", |x: f64| x.round());
-    math_unary!(table, "sin-math", |x: f64| x.sin());
-    math_unary!(table, "asin-math", |x: f64| x.asin());
-    math_unary!(table, "cos-math", |x: f64| x.cos());
-    math_unary!(table, "acos-math", |x: f64| x.acos());
-    math_unary!(table, "tan-math", |x: f64| x.tan());
-    math_unary!(table, "atan-math", |x: f64| x.atan());
-    math_unary!(table, "exp", |x: f64| x.exp());
+    math_unary_float!(table, "sin-math", |x: f64| x.sin());
+    math_unary_float!(table, "asin-math", |x: f64| x.asin());
+    math_unary_float!(table, "cos-math", |x: f64| x.cos());
+    math_unary_float!(table, "acos-math", |x: f64| x.acos());
+    math_unary_float!(table, "tan-math", |x: f64| x.tan());
+    math_unary_float!(table, "atan-math", |x: f64| x.atan());
+    math_unary_float!(table, "exp", |x: f64| x.exp());
 
     // Float binary math
     math_binary!(table, "pow-math", |a: f64, b: f64| a.powf(b));
-    math_binary!(table, "log-math", |a: f64, b: f64| a.log(b));
+    math_binary_float!(table, "log-math", |a: f64, b: f64| b.log(a));
     math_binary!(table, "min", |a: f64, b: f64| a.min(b));
     math_binary!(table, "max", |a: f64, b: f64| a.max(b));
 
