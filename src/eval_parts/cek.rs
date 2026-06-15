@@ -1516,6 +1516,8 @@ pub(crate) fn is_special_form(s: &str) -> bool {
             | "add-atom"
             | "remove-atom"
             | "match"
+            | "with_mutex"
+            | "transaction"
             | "import!"
             | "readln!"
             | "println!"

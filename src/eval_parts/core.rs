@@ -39,7 +39,137 @@ use crate::eval_parts::special::{
 use crate::func::{FnTable, Function, FunctionKind, NDet};
 use crate::parser::Expr;
 use crate::{trace, trace_enter, trace_exit};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+
+static NAMED_MUTEXES: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct TransactionSnapshot {
+    self_atoms: Vec<Atom>,
+    named_space_atoms: HashMap<String, Vec<Atom>>,
+    state: HashMap<String, Atom>,
+    fn_cache: HashMap<String, HashMap<u8, Vec<crate::func::Clause>>>,
+    fn_purity: HashMap<String, HashMap<u8, bool>>,
+}
+
+fn snapshot_transaction_state(funcs: &FnTable) -> TransactionSnapshot {
+    let self_atoms = funcs.space.read().unwrap().get_atoms();
+    let named_space_atoms = funcs
+        .named_spaces
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(name, space)| (name.clone(), space.get_atoms()))
+        .collect();
+    let state = funcs.state.lock().unwrap().clone();
+    let fn_cache = funcs.fn_cache.read().unwrap().clone();
+    let fn_purity = funcs.fn_purity.read().unwrap().clone();
+
+    TransactionSnapshot {
+        self_atoms,
+        named_space_atoms,
+        state,
+        fn_cache,
+        fn_purity,
+    }
+}
+
+fn restore_transaction_state(snapshot: TransactionSnapshot, funcs: &FnTable) -> Result<(), String> {
+    let TransactionSnapshot {
+        self_atoms,
+        named_space_atoms,
+        state,
+        fn_cache,
+        fn_purity,
+    } = snapshot;
+
+    let restored_self: Box<dyn crate::space::Space + Send + Sync> =
+        Box::new(crate::space::MorkSpace::new());
+    for atom in &self_atoms {
+        restored_self.add_atom(atom)?;
+    }
+    *funcs.space.write().unwrap() = restored_self;
+
+    let mut restored_named_spaces = HashMap::new();
+    for (name, atoms) in named_space_atoms {
+        let restored_space: Box<dyn crate::space::Space + Send + Sync> =
+            Box::new(crate::space::MorkSpace::new());
+        for atom in &atoms {
+            restored_space.add_atom(atom)?;
+        }
+        restored_named_spaces.insert(name, restored_space);
+    }
+    *funcs.named_spaces.lock().unwrap() = restored_named_spaces;
+
+    *funcs.state.lock().unwrap() = state;
+    *funcs.fn_cache.write().unwrap() = fn_cache;
+    *funcs.fn_purity.write().unwrap() = fn_purity;
+    Ok(())
+}
+
+fn eval_with_mutex(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "with_mutex: expected (name body), got {} args",
+            args.len()
+        ));
+    }
+
+    let mut name_results = eval(&args[0], env, funcs)?;
+    let mutex_atom = name_results
+        .next()
+        .ok_or_else(|| "with_mutex: mutex expression produced no results".to_string())?;
+    let mutex_name = match mutex_atom {
+        Atom::Sym(name) => name.to_string(),
+        other => {
+            return Err(format!(
+                "with_mutex: mutex name must be a symbol, got {}",
+                other.to_sexpr_string()
+            ));
+        }
+    };
+
+    let mutex = {
+        let mut mutexes = NAMED_MUTEXES.lock().unwrap();
+        mutexes
+            .entry(mutex_name)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+
+    let _guard = mutex.lock().unwrap();
+    let results: Vec<Atom> = eval(&args[1], env, funcs)?.collect();
+    Ok(NDet::stream(results.into_iter()))
+}
+
+fn eval_transaction(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "transaction: expected (transaction body), got {} args",
+            args.len()
+        ));
+    }
+
+    let snapshot = snapshot_transaction_state(funcs);
+    match eval(&args[0], env, funcs) {
+        Ok(ndet) => {
+            let results: Vec<Atom> = ndet.collect();
+            if results.is_empty() {
+                restore_transaction_state(snapshot, funcs)
+                    .map_err(|e| format!("transaction: rollback failed: {}", e))?;
+                Ok(NDet::stream(std::iter::empty()))
+            } else {
+                Ok(NDet::stream(results.into_iter()))
+            }
+        }
+        Err(err) => {
+            restore_transaction_state(snapshot, funcs)
+                .map_err(|e| format!("transaction: rollback failed: {}", e))?;
+            Err(format!("transaction: {}", err))
+        }
+    }
+}
 
 /// Top-level entry point: evaluate an expression.
 ///
@@ -128,6 +258,14 @@ pub fn eval(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
                     "transform" => {
                         trace!("→ special: transform");
                         return eval_transform(args, env, funcs);
+                    }
+                    "with_mutex" => {
+                        trace!("→ special: with_mutex");
+                        return eval_with_mutex(args, env, funcs);
+                    }
+                    "transaction" => {
+                        trace!("→ special: transaction");
+                        return eval_transaction(args, env, funcs);
                     }
                     "remove-atom" => {
                         trace!("→ special: remove-atom");
