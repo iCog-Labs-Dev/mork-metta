@@ -33,15 +33,15 @@
 //! the harness infrastructure is established. Later phases replace the body with
 //! the real step loop.
 
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 
 use crate::atom::{Atom, ClosureData};
 use crate::env::Env;
 use crate::eval_parts::constrained::{cartesian_product, eval_constrained};
 use crate::eval_parts::special::{generate_free_var_values, subst_and_atomize};
 use crate::func::{FnTable, FunctionKind, NDet};
-use crate::parser::{atom_to_expr, Expr};
+use crate::parser::{Expr, atom_to_expr};
 
 /// A fully-reduced non-deterministic result multiset, with the bindings each
 /// result carries (free-variable solutions threaded by `if`/`forall`, etc.).
@@ -168,6 +168,13 @@ enum Task {
     Eval { expr: Arc<Expr>, env: Env },
     /// A continuation: pop its child result-sets from the value stack and combine.
     Apply(Frame),
+    /// Evaluate N independent (pure) sub-expressions in parallel via rayon,
+    /// then combine. The sub-results are pushed to `vals` in task order before
+    /// the continuation frame fires.
+    ParEval {
+        tasks: Vec<(Arc<Expr>, Env)>,
+        frame: Box<Frame>,
+    },
 }
 
 /// Resolved call head, decided at dispatch time (before args are evaluated).
@@ -195,6 +202,11 @@ enum Frame {
     /// Evaluate a list as data: cartesian over the N element result-sets,
     /// each combo wrapped in one `Atom::Expr`.
     DataList { n: usize },
+    /// Data list with a pre-evaluated head atom (from compound-head dispatch).
+    /// Only the N tail items are evaluated as tasks; the head value is already
+    /// known. Mirrors `eval_data_list_with_head` to prevent double-evaluating
+    /// the head expression.
+    DataListWithHead { head: Atom, n_tail: usize },
     /// Concatenate N child result-sets in order (multi-clause / multi-combo
     /// body results).
     Gather { n: usize },
@@ -211,29 +223,62 @@ enum Frame {
     SuperposeUnpack,
     /// `let`: value result-set evaluated; match the pattern per value and push
     /// the body as a task for each match (body recursion stays iterative).
-    LetMatch { pattern: Expr, body: Arc<Expr>, env: Env },
+    LetMatch {
+        pattern: Expr,
+        body: Arc<Expr>,
+        env: Env,
+    },
 }
 
 /// Run the step loop to completion, returning the final result-set. `budget`, if
 /// `Some`, is debited by user-function reductions (spec Query/Chain cost);
-/// reduction halts once it is exhausted.
+/// reduction halts once it is exhausted. Internally converted to `AtomicI64` so
+/// that parallel sub-evaluations (`Task::ParEval`) share the budget safely.
 fn run_rs(
     root: Arc<Expr>,
     root_env: Env,
     funcs: &FnTable,
     budget: &mut Option<i64>,
 ) -> Result<ResultSet, String> {
-    let mut work: Vec<Task> = vec![Task::Eval { expr: root, env: root_env }];
+    let atomic_budget = Arc::new(match budget {
+        Some(b) => AtomicI64::new(*b),
+        None => AtomicI64::new(-1),
+    });
+
+    let mut work: Vec<Task> = vec![Task::Eval {
+        expr: root,
+        env: root_env,
+    }];
     let mut vals: Vec<ResultSet> = Vec::new();
 
     while let Some(task) = work.pop() {
         match task {
             Task::Eval { expr, env } => dispatch(&expr, &env, funcs, &mut work, &mut vals)?,
-            Task::Apply(frame) => combine(frame, funcs, &mut work, &mut vals, budget)?,
+            Task::Apply(frame) => combine(frame, funcs, &mut work, &mut vals, &atomic_budget)?,
+            Task::ParEval { tasks, frame } => {
+                let results = eval_par(&tasks, funcs, &atomic_budget)?;
+                for rs in results {
+                    vals.push(rs);
+                }
+                work.push(Task::Apply(*frame));
+            }
         }
     }
 
-    debug_assert_eq!(vals.len(), 1, "machine ended with {} result-sets", vals.len());
+    // Sync the atomic budget back to the caller's `&mut Option<i64>`.
+    if let Some(b) = budget {
+        let remaining = atomic_budget.load(Ordering::Acquire);
+        if remaining >= 0 {
+            *b = remaining;
+        }
+    }
+
+    debug_assert_eq!(
+        vals.len(),
+        1,
+        "machine ended with {} result-sets",
+        vals.len()
+    );
     Ok(vals.pop().unwrap_or_default())
 }
 
@@ -291,7 +336,10 @@ fn dispatch(
                     }
                     "|->" => {
                         if args.len() != 2 {
-                            return Err(format!("|->: expected (params body), got {} args", args.len()));
+                            return Err(format!(
+                                "|->: expected (params body), got {} args",
+                                args.len()
+                            ));
                         }
                         let params = match &args[0] {
                             Expr::List(items) => items.clone(),
@@ -312,7 +360,9 @@ fn dispatch(
 
                     // --- forms with one sub-eval + a combine frame ---
                     "within" => return push_unary(args, env, work, Frame::WithinWrap, "within"),
-                    "collapse" => return push_unary(args, env, work, Frame::CollapseGather, "collapse"),
+                    "collapse" => {
+                        return push_unary(args, env, work, Frame::CollapseGather, "collapse");
+                    }
                     "once" => return push_unary(args, env, work, Frame::OnceCut, "once"),
 
                     // --- pass-through (result is the sub-expr's result) ---
@@ -320,7 +370,10 @@ fn dispatch(
                         if args.len() != 1 {
                             return Err(format!("{}: expected 1 arg, got {}", s, args.len()));
                         }
-                        work.push(Task::Eval { expr: Arc::new(args[0].clone()), env: env.clone() });
+                        work.push(Task::Eval {
+                            expr: Arc::new(args[0].clone()),
+                            env: env.clone(),
+                        });
                         return Ok(());
                     }
                     "eval" => {
@@ -329,13 +382,17 @@ fn dispatch(
                         }
                         let (target, tenv) = match &args[0] {
                             Expr::Symbol(v) if v.starts_with('$') => {
-                                let val = env.get(v)
+                                let val = env
+                                    .get(v)
                                     .ok_or_else(|| format!("eval: unbound variable {}", v))?;
                                 (atom_to_expr(&val)?, env.clone())
                             }
                             other => (other.clone(), env.clone()),
                         };
-                        work.push(Task::Eval { expr: Arc::new(target), env: tenv });
+                        work.push(Task::Eval {
+                            expr: Arc::new(target),
+                            env: tenv,
+                        });
                         return Ok(());
                     }
 
@@ -349,13 +406,19 @@ fn dispatch(
                             Expr::List(elems) => {
                                 work.push(Task::Apply(Frame::Gather { n: elems.len() }));
                                 for e in elems.iter().rev() {
-                                    work.push(Task::Eval { expr: Arc::new(e.clone()), env: env.clone() });
+                                    work.push(Task::Eval {
+                                        expr: Arc::new(e.clone()),
+                                        env: env.clone(),
+                                    });
                                 }
                             }
                             // Non-list: eval, then unpack first Expr result.
                             other => {
                                 work.push(Task::Apply(Frame::SuperposeUnpack));
-                                work.push(Task::Eval { expr: Arc::new(other.clone()), env: env.clone() });
+                                work.push(Task::Eval {
+                                    expr: Arc::new(other.clone()),
+                                    env: env.clone(),
+                                });
                             }
                         }
                         return Ok(());
@@ -364,14 +427,20 @@ fn dispatch(
                     // --- let: body eval stays a task (iterative) ---
                     "let" => {
                         if args.len() != 3 {
-                            return Err(format!("let: expected (pattern value body), got {} args", args.len()));
+                            return Err(format!(
+                                "let: expected (pattern value body), got {} args",
+                                args.len()
+                            ));
                         }
                         work.push(Task::Apply(Frame::LetMatch {
                             pattern: args[0].clone(),
                             body: Arc::new(args[2].clone()),
                             env: env.clone(),
                         }));
-                        work.push(Task::Eval { expr: Arc::new(args[1].clone()), env: env.clone() });
+                        work.push(Task::Eval {
+                            expr: Arc::new(args[1].clone()),
+                            env: env.clone(),
+                        });
                         return Ok(());
                     }
 
@@ -379,18 +448,27 @@ fn dispatch(
                     "let*" => {
                         // args[0] = ((pat val)...) bindings, args[1] = body.
                         let body_env = cek_let_star_env(args, env, funcs)?;
-                        work.push(Task::Eval { expr: Arc::new(args[1].clone()), env: body_env });
+                        work.push(Task::Eval {
+                            expr: Arc::new(args[1].clone()),
+                            env: body_env,
+                        });
                         return Ok(());
                     }
 
                     // --- chain: thread (expr $var) pairs eagerly, final is a task ---
                     "chain" => {
                         if args.len() == 1 {
-                            work.push(Task::Eval { expr: Arc::new(args[0].clone()), env: env.clone() });
+                            work.push(Task::Eval {
+                                expr: Arc::new(args[0].clone()),
+                                env: env.clone(),
+                            });
                             return Ok(());
                         }
                         let (final_expr, final_env) = cek_chain_env(args, env, funcs)?;
-                        work.push(Task::Eval { expr: final_expr, env: final_env });
+                        work.push(Task::Eval {
+                            expr: final_expr,
+                            env: final_env,
+                        });
                         return Ok(());
                     }
 
@@ -450,7 +528,8 @@ fn dispatch(
                     // Compound-headed call: evaluate the operator (first result),
                     // then dispatch on the resulting atom.
                     let op_rs = eval_sub(op, env, funcs)?;
-                    match op_rs.into_iter().next().map(|(a, _)| a) {
+                    let first = op_rs.into_iter().next().map(|(a, _)| a);
+                    match first {
                         Some(head) => {
                             dispatch_resolved_head(head, &items[1..], items, env, funcs, work, vals)
                         }
@@ -467,7 +546,9 @@ fn dispatch(
 }
 
 /// Resolve a plain-symbol-headed list to a call (native or user-fn) or a data
-/// list, pushing the appropriate frame + argument `Eval` tasks.
+/// list, pushing the appropriate frame + argument `Eval` tasks. When args are
+/// pure and compound, pushes a single `ParEval` task instead of sequential
+/// `Eval` tasks, enabling fork-join parallelism via rayon.
 fn dispatch_call(
     name: &str,
     args: &[Expr],
@@ -483,7 +564,10 @@ fn dispatch_call(
             FunctionKind::Native { func: f } => Some(Head::Native(Arc::clone(f))),
         }
     } else if let Some(clauses) = lookup_user_clauses(name, arity, funcs) {
-        Some(Head::User { name: name.to_string(), clauses })
+        Some(Head::User {
+            name: name.to_string(),
+            clauses,
+        })
     } else {
         None
     };
@@ -492,22 +576,60 @@ fn dispatch_call(
 
     match head {
         Some(head) => {
-            work.push(Task::Apply(Frame::Call {
+            let frame = Frame::Call {
                 head,
                 arity: args.len(),
                 env: env.clone(),
                 all_items: Arc::clone(&all_items_arc),
-            }));
-            // Evaluate args; reverse so arg 0 pops first.
-            for arg in args.iter().rev() {
-                work.push(Task::Eval { expr: Arc::new(arg.clone()), env: env.clone() });
+            };
+            // Pure, compound args can be evaluated in parallel via rayon.
+            let par = crate::eval_parts::data_list::worth_parallel(args)
+                && args
+                    .iter()
+                    .all(|a| crate::eval_parts::data_list::is_pure_expr(a, funcs));
+            if par {
+                let tasks: Vec<(Arc<Expr>, Env)> = args
+                    .iter()
+                    .map(|a| (Arc::new(a.clone()), env.clone()))
+                    .collect();
+                work.push(Task::ParEval {
+                    tasks,
+                    frame: Box::new(frame),
+                });
+            } else {
+                work.push(Task::Apply(frame));
+                for arg in args.iter().rev() {
+                    work.push(Task::Eval {
+                        expr: Arc::new(arg.clone()),
+                        env: env.clone(),
+                    });
+                }
             }
         }
         None => {
             // Data list: evaluate every item (head included), then combine.
-            work.push(Task::Apply(Frame::DataList { n: all_items.len() }));
-            for item in all_items.iter().rev() {
-                work.push(Task::Eval { expr: Arc::new(item.clone()), env: env.clone() });
+            let n = all_items.len();
+            let par = crate::eval_parts::data_list::worth_parallel(all_items)
+                && all_items
+                    .iter()
+                    .all(|a| crate::eval_parts::data_list::is_pure_expr(a, funcs));
+            if par {
+                let tasks: Vec<(Arc<Expr>, Env)> = all_items
+                    .iter()
+                    .map(|a| (Arc::new(a.clone()), env.clone()))
+                    .collect();
+                work.push(Task::ParEval {
+                    tasks,
+                    frame: Box::new(Frame::DataList { n }),
+                });
+            } else {
+                work.push(Task::Apply(Frame::DataList { n }));
+                for item in all_items.iter().rev() {
+                    work.push(Task::Eval {
+                        expr: Arc::new(item.clone()),
+                        env: env.clone(),
+                    });
+                }
             }
         }
     }
@@ -549,9 +671,15 @@ fn dispatch_if(
         return Ok(());
     }
 
-    work.push(Task::Apply(Frame::IfGather { had_bindings, n: branches.len() }));
+    work.push(Task::Apply(Frame::IfGather {
+        had_bindings,
+        n: branches.len(),
+    }));
     for (branch, branch_env) in branches.into_iter().rev() {
-        work.push(Task::Eval { expr: branch, env: branch_env });
+        work.push(Task::Eval {
+            expr: branch,
+            env: branch_env,
+        });
     }
     Ok(())
 }
@@ -563,7 +691,7 @@ fn combine(
     funcs: &FnTable,
     work: &mut Vec<Task>,
     vals: &mut Vec<ResultSet>,
-    budget: &mut Option<i64>,
+    budget: &AtomicI64,
 ) -> Result<(), String> {
     match frame {
         Frame::Gather { n } => {
@@ -620,7 +748,9 @@ fn combine(
                 return Err("within: expression produced no results".into());
             }
             let wrapped = Atom::Expr(
-                std::iter::once(Atom::sym("within")).chain(atoms.into_iter()).collect(),
+                std::iter::once(Atom::sym("within"))
+                    .chain(atoms.into_iter())
+                    .collect(),
             );
             vals.push(plain(vec![wrapped]));
             Ok(())
@@ -643,13 +773,37 @@ fn combine(
 
         Frame::SuperposeUnpack => {
             let rs = pop_n(vals, 1).pop().unwrap();
-            let first = rs.into_iter().next().map(|(a, _)| a).ok_or_else(|| {
-                "superpose: argument produced no results".to_string()
-            })?;
+            let first = rs
+                .into_iter()
+                .next()
+                .map(|(a, _)| a)
+                .ok_or_else(|| "superpose: argument produced no results".to_string())?;
             match first {
                 Atom::Expr(elements) => vals.push(plain(elements)),
                 other => vals.push(plain(vec![other])),
             }
+            Ok(())
+        }
+
+        Frame::DataListWithHead { head, n_tail } => {
+            let tail_rs = pop_n(vals, n_tail);
+            let tail_atoms: Vec<Vec<Atom>> = tail_rs.iter().map(atoms_of).collect();
+            // Any empty tail element collapses the whole list (non-det zero).
+            if tail_atoms.iter().any(|e| e.is_empty()) {
+                vals.push(Vec::new());
+                return Ok(());
+            }
+            let combos = cartesian_product(&tail_atoms);
+            let lists: Vec<Atom> = combos
+                .into_iter()
+                .map(|tail_vals| {
+                    let mut atoms = Vec::with_capacity(tail_vals.len() + 1);
+                    atoms.push(head.clone());
+                    atoms.extend(tail_vals);
+                    Atom::Expr(atoms)
+                })
+                .collect();
+            vals.push(plain(lists));
             Ok(())
         }
 
@@ -667,7 +821,12 @@ fn combine(
             Ok(())
         }
 
-        Frame::Call { head, arity, env, all_items } => {
+        Frame::Call {
+            head,
+            arity,
+            env,
+            all_items,
+        } => {
             let arg_sets = pop_n(vals, arity);
             let arg_options: Vec<Vec<Atom>> = arg_sets.iter().map(atoms_of).collect();
 
@@ -702,7 +861,7 @@ fn combine(
                         return data_list_fallback(&all_items, &env, funcs, vals);
                     }
                     let combos = cartesian_product(&arg_options);
-                    let mut bodies: Vec<(Arc<Expr>, Env)> = Vec::new();
+                    let mut bodies: Vec<(Arc<Expr>, Env, i64)> = Vec::new();
                     for combo in &combos {
                         for (patterns, body) in &clauses {
                             // Top-level `(= ...)` functions do not capture caller
@@ -712,35 +871,44 @@ fn combine(
                             // the binding chain from growing O(recursion depth)
                             // (which would otherwise overflow the stack when the
                             // deep Arc<Env> chain is dropped).
-                            if let Some(body_env) = match_clause(patterns, combo, &Env::Empty, funcs) {
-                                bodies.push((Arc::new(body.clone()), body_env));
+                            if let Some((body_env, subst_cost)) =
+                                match_clause(patterns, combo, &Env::Empty, funcs)
+                            {
+                                bodies.push((Arc::new(body.clone()), body_env, subst_cost));
                             }
                         }
                     }
                     if bodies.is_empty() {
                         return Err(format!("no matching clause for ({})", name));
                     }
-                    // Spec Query/Chain cost: c = Σ #(uᵢσᵢ) over the instantiated
-                    // bodies. Debit the budget; halt this reduction (emit nothing)
-                    // if it would be exhausted (precondition (e - c) > 0).
-                    if let Some(b) = budget {
+                    // Spec Query/Chain cost: c = Σ #(σᵢ) + Σ #(uᵢσᵢ) over the
+                    // matched clauses. Debit the budget; halt this reduction
+                    // (emit nothing) if it would be exhausted
+                    // (precondition (e - c) > 0).
+                    // With atomic budget: -1 = unbounded, otherwise remaining.
+                    let remaining = budget.load(Ordering::Acquire);
+                    if remaining >= 0 {
                         let c: i64 = bodies
                             .iter()
-                            .filter_map(|(body, _)| {
-                                crate::eval_parts::machine::calculate_cost(
-                                    &crate::parser::expr_to_atom(body),
-                                )
+                            .map(|(body, body_env, subst_cost)| {
+                                let instantiated_body = subst_and_atomize(body.as_ref(), body_env);
+                                *subst_cost
+                                    + crate::eval_parts::machine::calculate_cost(&instantiated_body)
+                                        .unwrap_or(0)
                             })
                             .sum();
-                        if *b - c <= 0 {
+                        if remaining < c {
                             vals.push(Vec::new());
                             return Ok(());
                         }
-                        *b -= c;
+                        budget.fetch_sub(c, Ordering::AcqRel);
                     }
                     work.push(Task::Apply(Frame::Gather { n: bodies.len() }));
-                    for (body, body_env) in bodies.into_iter().rev() {
-                        work.push(Task::Eval { expr: body, env: body_env });
+                    for (body, body_env, _) in bodies.into_iter().rev() {
+                        work.push(Task::Eval {
+                            expr: body,
+                            env: body_env,
+                        });
                     }
                     Ok(())
                 }
@@ -766,7 +934,10 @@ fn push_unary(
         return Err(format!("{}: expected 1 arg, got {}", name, args.len()));
     }
     work.push(Task::Apply(frame));
-    work.push(Task::Eval { expr: Arc::new(args[0].clone()), env: env.clone() });
+    work.push(Task::Eval {
+        expr: Arc::new(args[0].clone()),
+        env: env.clone(),
+    });
     Ok(())
 }
 
@@ -795,11 +966,56 @@ fn eval_sub(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<ResultSet, String
     run_rs(Arc::new(expr.clone()), env.clone(), funcs, &mut budget)
 }
 
+/// Evaluate a batch of independent (pure) sub-expressions in parallel via
+/// rayon, each with its own step loop sharing an atomic budget. Returns
+/// result-sets in task order.
+fn eval_par(
+    tasks: &[(Arc<Expr>, Env)],
+    funcs: &FnTable,
+    budget: &Arc<AtomicI64>,
+) -> Result<Vec<ResultSet>, String> {
+    use rayon::prelude::*;
+    tasks
+        .par_iter()
+        .map(|(expr, env)| {
+            let mut local_work = vec![Task::Eval {
+                expr: expr.clone(),
+                env: env.clone(),
+            }];
+            let mut local_vals: Vec<ResultSet> = Vec::new();
+            while let Some(task) = local_work.pop() {
+                match task {
+                    Task::Eval { expr, env } => {
+                        dispatch(&expr, &env, funcs, &mut local_work, &mut local_vals)?
+                    }
+                    Task::Apply(frame) => {
+                        combine(frame, funcs, &mut local_work, &mut local_vals, budget)?
+                    }
+                    // Nested ParEval is supported: the inner parallel tasks
+                    // share the same atomic budget and run on rayon's thread
+                    // pool, which handles nesting via work-stealing.
+                    Task::ParEval { tasks, frame } => {
+                        let rs = eval_par(&tasks, funcs, budget)?;
+                        for r in rs {
+                            local_vals.push(r);
+                        }
+                        local_work.push(Task::Apply(*frame));
+                    }
+                }
+            }
+            Ok(local_vals.pop().unwrap_or_default())
+        })
+        .collect()
+}
+
 /// Push a data-list evaluation: evaluate every item, then combine via cartesian.
 fn dispatch_data_list(items: &[Expr], env: &Env, work: &mut Vec<Task>) {
     work.push(Task::Apply(Frame::DataList { n: items.len() }));
     for item in items.iter().rev() {
-        work.push(Task::Eval { expr: Arc::new(item.clone()), env: env.clone() });
+        work.push(Task::Eval {
+            expr: Arc::new(item.clone()),
+            env: env.clone(),
+        });
     }
 }
 
@@ -815,8 +1031,32 @@ fn dispatch_resolved_head(
     work: &mut Vec<Task>,
     vals: &mut Vec<ResultSet>,
 ) -> Result<(), String> {
-    match head {
-        Atom::Sym(name) => dispatch_call(&name, args, all_items, env, funcs, work),
+    match &head {
+        Atom::Sym(name) => {
+            let arity = args.len() as u8;
+            // Only dispatch as a function call if the symbol is actually a known
+            // function at this arity. Otherwise the whole list is data, and the
+            // head has already been evaluated (extracted from the compound-head
+            // path). Pushing DataListWithHead prevents double-evaluating the
+            // head expression — which would break side-effectful expressions
+            // like (add-atom ...).
+            if funcs.get(name, arity).is_some() || lookup_user_clauses(name, arity, funcs).is_some()
+            {
+                dispatch_call(name, args, all_items, env, funcs, work)
+            } else {
+                work.push(Task::Apply(Frame::DataListWithHead {
+                    head: head.clone(),
+                    n_tail: args.len(),
+                }));
+                for arg in args.iter().rev() {
+                    work.push(Task::Eval {
+                        expr: Arc::new(arg.clone()),
+                        env: env.clone(),
+                    });
+                }
+                Ok(())
+            }
+        }
         Atom::Closure(c) => {
             let rs = cek_apply_closure(&c.params, &c.body, &c.env, args, env, funcs)?;
             vals.push(rs);
@@ -906,7 +1146,10 @@ fn cek_apply_closure(
 /// environment in which the body should be evaluated.
 fn cek_let_star_env(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<Env, String> {
     if args.len() != 2 {
-        return Err(format!("let*: expected ((bindings) body), got {} args", args.len()));
+        return Err(format!(
+            "let*: expected ((bindings) body), got {} args",
+            args.len()
+        ));
     }
     let bindings = match &args[0] {
         Expr::List(items) => items,
@@ -921,9 +1164,12 @@ fn cek_let_star_env(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<Env, St
                     .into_iter()
                     .next()
                     .map(|(a, _)| a)
-                    .ok_or_else(|| format!("let*: binding {} produced no value", pattern.to_string()))?;
-                let m = crate::eval_parts::pattern::try_match_one(pattern, &val, &Env::new(), funcs)?
                     .ok_or_else(|| {
+                        format!("let*: binding {} produced no value", pattern.to_string())
+                    })?;
+                let m =
+                    crate::eval_parts::pattern::try_match_one(pattern, &val, &Env::new(), funcs)?
+                        .ok_or_else(|| {
                         format!(
                             "let*: pattern does not match value: {} vs {}",
                             pattern.to_string(),
@@ -959,7 +1205,7 @@ fn cek_chain_env(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<(Arc<Expr>
                     "chain: arg {} must be a $variable, got {}",
                     i * 2 + 1,
                     var.to_string()
-                ))
+                ));
             }
         };
         let val = eval_sub(expr, &cur, funcs)?
@@ -993,15 +1239,26 @@ fn cek_progn(
                     let mut rest = vec![items[3].clone()];
                     rest.extend_from_slice(&args[i + 1..]);
                     let new_progn = Expr::List(std::iter::once(sym("progn")).chain(rest).collect());
-                    let new_let = Expr::List(vec![sym("let"), items[1].clone(), items[2].clone(), new_progn]);
-                    work.push(Task::Eval { expr: Arc::new(new_let), env: env.clone() });
+                    let new_let = Expr::List(vec![
+                        sym("let"),
+                        items[1].clone(),
+                        items[2].clone(),
+                        new_progn,
+                    ]);
+                    work.push(Task::Eval {
+                        expr: Arc::new(new_let),
+                        env: env.clone(),
+                    });
                     return Ok(());
                 } else if items.len() == 3 && items[0] == sym("let*") {
                     let mut rest = vec![items[2].clone()];
                     rest.extend_from_slice(&args[i + 1..]);
                     let new_progn = Expr::List(std::iter::once(sym("progn")).chain(rest).collect());
                     let new_let = Expr::List(vec![sym("let*"), items[1].clone(), new_progn]);
-                    work.push(Task::Eval { expr: Arc::new(new_let), env: env.clone() });
+                    work.push(Task::Eval {
+                        expr: Arc::new(new_let),
+                        env: env.clone(),
+                    });
                     return Ok(());
                 } else if items.len() == 4 && items[0] == sym("match") {
                     if let Expr::Symbol(s) = &items[3] {
@@ -1009,9 +1266,16 @@ fn cek_progn(
                             let rest: Vec<Expr> = args[i + 1..].to_vec();
                             let new_progn =
                                 Expr::List(std::iter::once(sym("progn")).chain(rest).collect());
-                            let new_let =
-                                Expr::List(vec![sym("let"), items[3].clone(), arg.clone(), new_progn]);
-                            work.push(Task::Eval { expr: Arc::new(new_let), env: env.clone() });
+                            let new_let = Expr::List(vec![
+                                sym("let"),
+                                items[3].clone(),
+                                arg.clone(),
+                                new_progn,
+                            ]);
+                            work.push(Task::Eval {
+                                expr: Arc::new(new_let),
+                                env: env.clone(),
+                            });
                             return Ok(());
                         }
                     }
@@ -1019,7 +1283,10 @@ fn cek_progn(
             }
         }
         if i == len - 1 {
-            work.push(Task::Eval { expr: Arc::new(arg.clone()), env: env.clone() });
+            work.push(Task::Eval {
+                expr: Arc::new(arg.clone()),
+                env: env.clone(),
+            });
             return Ok(());
         }
         // Intermediate form: evaluate for effect, discard.
@@ -1038,7 +1305,10 @@ fn cek_case(
     vals: &mut Vec<ResultSet>,
 ) -> Result<(), String> {
     if args.len() != 2 {
-        return Err(format!("case: expected (expr (clauses...)), got {} args", args.len()));
+        return Err(format!(
+            "case: expected (expr (clauses...)), got {} args",
+            args.len()
+        ));
     }
     let clauses = match &args[1] {
         Expr::List(items) => items,
@@ -1051,7 +1321,10 @@ fn cek_case(
         for clause in clauses {
             if let Expr::List(items) = clause {
                 if items.len() == 2 && matches!(&items[0], Expr::Symbol(s) if s == "Empty") {
-                    work.push(Task::Eval { expr: Arc::new(items[1].clone()), env: env.clone() });
+                    work.push(Task::Eval {
+                        expr: Arc::new(items[1].clone()),
+                        env: env.clone(),
+                    });
                     return Ok(());
                 }
             }
@@ -1083,7 +1356,12 @@ fn match_case_clause(
     for clause in clauses {
         let (pattern, body) = match clause {
             Expr::List(items) if items.len() == 2 => (&items[0], &items[1]),
-            _ => return Err(format!("case: each clause must be (pattern body), got {}", clause.to_string())),
+            _ => {
+                return Err(format!(
+                    "case: each clause must be (pattern body), got {}",
+                    clause.to_string()
+                ));
+            }
         };
         if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
             continue;
@@ -1091,17 +1369,28 @@ fn match_case_clause(
         if matches!(pattern, Expr::Symbol(s) if s == "$else") {
             return Ok((body.clone(), env.clone()));
         }
-        if let Some(m) = crate::eval_parts::pattern::try_match_one(pattern, val, &Env::new(), funcs)? {
-            return Ok((body.clone(), crate::eval_parts::pattern::prepend_env(m, env)));
+        if let Some(m) =
+            crate::eval_parts::pattern::try_match_one(pattern, val, &Env::new(), funcs)?
+        {
+            return Ok((
+                body.clone(),
+                crate::eval_parts::pattern::prepend_env(m, env),
+            ));
         }
     }
-    Err(format!("case: no clause matched value {}", val.to_sexpr_string()))
+    Err(format!(
+        "case: no clause matched value {}",
+        val.to_sexpr_string()
+    ))
 }
 
 /// `foldall` (mirrors `eval_foldall`) via isolated sub-evaluation.
 fn cek_foldall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ResultSet, String> {
     if args.len() != 3 {
-        return Err(format!("foldall: expected (agg-func gen-expr init), got {} args", args.len()));
+        return Err(format!(
+            "foldall: expected (agg-func gen-expr init), got {} args",
+            args.len()
+        ));
     }
     let agg_func = &args[0];
     let gen_values: Vec<Atom> = match eval_sub(&args[1], env, funcs) {
@@ -1129,7 +1418,10 @@ fn cek_foldall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ResultSet, S
 /// `map-atom` (mirrors `eval_map_atom`) via isolated sub-evaluation.
 fn cek_map_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ResultSet, String> {
     if args.len() != 2 {
-        return Err(format!("map-atom: expected (list func), got {} args", args.len()));
+        return Err(format!(
+            "map-atom: expected (list func), got {} args",
+            args.len()
+        ));
     }
     let list_atom = eval_sub(&args[0], env, funcs)?
         .into_iter()
@@ -1143,7 +1435,12 @@ fn cek_map_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ResultSet, 
         .ok_or_else(|| "map-atom: func expression produced no results".to_string())?;
     let elements = match list_atom {
         Atom::Expr(items) => items,
-        other => return Err(format!("map-atom: expected a list (Expr), got {}", other.to_sexpr_string())),
+        other => {
+            return Err(format!(
+                "map-atom: expected a list (Expr), got {}",
+                other.to_sexpr_string()
+            ));
+        }
     };
     let mut results = Vec::with_capacity(elements.len());
     for elem in &elements {
@@ -1154,13 +1451,31 @@ fn cek_map_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ResultSet, 
                     .into_iter()
                     .next()
                     .map(|(a, _)| a)
-                    .ok_or_else(|| format!("map-atom: {} returned no result for {}", fname, elem.to_sexpr_string()))?
+                    .ok_or_else(|| {
+                        format!(
+                            "map-atom: {} returned no result for {}",
+                            fname,
+                            elem.to_sexpr_string()
+                        )
+                    })?
             }
-            Atom::Closure(c) => cek_apply_closure(&c.params, &c.body, &c.env, &[atom_to_expr(elem)?], env, funcs)?
-                .into_iter()
-                .next()
-                .map(|(a, _)| a)
-                .ok_or_else(|| format!("map-atom: closure returned no result for {}", elem.to_sexpr_string()))?,
+            Atom::Closure(c) => cek_apply_closure(
+                &c.params,
+                &c.body,
+                &c.env,
+                &[atom_to_expr(elem)?],
+                env,
+                funcs,
+            )?
+            .into_iter()
+            .next()
+            .map(|(a, _)| a)
+            .ok_or_else(|| {
+                format!(
+                    "map-atom: closure returned no result for {}",
+                    elem.to_sexpr_string()
+                )
+            })?,
             _ => Atom::Expr(vec![func_atom.clone(), elem.clone()]),
         };
         results.push(result);
@@ -1203,7 +1518,7 @@ fn cek_forall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ResultSet, St
                 return Err(format!(
                     "forall: check must be a function or closure, got {}",
                     other.to_sexpr_string()
-                ))
+                ));
             }
         };
         if results.is_empty() || !results.iter().all(|a| a.is_truthy()) {
@@ -1217,22 +1532,57 @@ fn cek_forall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ResultSet, St
 pub(crate) fn is_special_form(s: &str) -> bool {
     matches!(
         s,
-        "if" | "progn" | "let" | "let*" | "quote" | "call" | "reduce" | "eval"
-            | "add-atom" | "remove-atom" | "match" | "import!" | "readln!" | "println!"
-            | "superpose" | "collapse" | "chain" | "case" | "foldall" | "map-atom"
-            | "|->" | "forall" | "repr" | "within" | "empty" | "once" | "py-call"
+        "if" | "progn"
+            | "let"
+            | "let*"
+            | "quote"
+            | "call"
+            | "reduce"
+            | "eval"
+            | "add-atom"
+            | "remove-atom"
+            | "match"
+            | "import!"
+            | "readln!"
+            | "println!"
+            | "superpose"
+            | "collapse"
+            | "chain"
+            | "case"
+            | "foldall"
+            | "map-atom"
+            | "|->"
+            | "forall"
+            | "repr"
+            | "within"
+            | "empty"
+            | "once"
+            | "py-call"
             | "import-rs!"
     )
 }
 
-/// Match a clause's patterns against a concrete argument combo, returning the
-/// body environment (`prepend_env(unif, env)`) on success.
+/// Sum the costs of all bindings in a unification environment.
+fn env_binding_cost(env: &Env) -> i64 {
+    let mut total = 0;
+    let mut current = env;
+    loop {
+        match current {
+            Env::Empty => return total,
+            Env::Cons { value, next, .. } => {
+                total += crate::eval_parts::machine::calculate_cost(value).unwrap_or(0);
+                current = next.as_ref();
+            }
+        }
+    }
+}
+
 fn match_clause(
     patterns: &[Expr],
     args: &[Atom],
     env: &Env,
     funcs: &FnTable,
-) -> Option<Env> {
+) -> Option<(Env, i64)> {
     let mut unif = Env::new();
     for (pat, arg) in patterns.iter().zip(args.iter()) {
         match crate::eval_parts::pattern::try_match_one(pat, arg, &unif, funcs) {
@@ -1240,17 +1590,17 @@ fn match_clause(
             _ => return None,
         }
     }
-    Some(crate::eval_parts::pattern::prepend_env(unif, env))
+    let subst_cost = env_binding_cost(&unif);
+    Some((
+        crate::eval_parts::pattern::prepend_env(unif, env),
+        subst_cost,
+    ))
 }
 
 /// Look up the `(patterns, body)` clauses for `name/arity`: from the function
 /// cache first, falling back to a direct space query. Returns `None` when no
 /// definition exists at all (caller then treats the list as data).
-fn lookup_user_clauses(
-    name: &str,
-    arity: u8,
-    funcs: &FnTable,
-) -> Option<Vec<(Vec<Expr>, Expr)>> {
+fn lookup_user_clauses(name: &str, arity: u8, funcs: &FnTable) -> Option<Vec<(Vec<Expr>, Expr)>> {
     if let Some(inner) = funcs.fn_cache.read().unwrap().get(name) {
         if let Some(clauses) = inner.get(&arity) {
             return Some(
@@ -1263,6 +1613,7 @@ fn lookup_user_clauses(
     }
 
     // Cache miss: query the space for `(= (name _ ...) _)` definitions.
+    eprintln!("CACHE MISS: name={}, arity={}", name, arity);
     let mut head_patterns: Vec<crate::space::Pattern> =
         vec![crate::space::Pattern::Exact(Atom::sym(name))];
     for _ in 0..arity {
@@ -1287,9 +1638,8 @@ fn lookup_user_clauses(
                         let patterns: Vec<Expr> = head_items[1..]
                             .iter()
                             .map(|a| {
-                                atom_to_expr(a).unwrap_or_else(|_| {
-                                    Expr::Symbol(a.to_sexpr_string())
-                                })
+                                atom_to_expr(a)
+                                    .unwrap_or_else(|_| Expr::Symbol(a.to_sexpr_string()))
                             })
                             .collect();
                         let body = atom_to_expr(&parts[2])

@@ -17,11 +17,11 @@
 //   AddAtom:   ε → k  (add atom to k)
 //   RemAtom:   ε → k  (remove atom from k)
 
+use super::core::eval_in_context;
 use crate::atom::Atom;
 use crate::env::Env;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::collections::{VecDeque, HashMap};
-use super::core::eval_in_context;
 
 // ========================================================================
 // State Machine: The 4-Register Formalization
@@ -100,7 +100,6 @@ pub struct MachineState {
     ///   - h(p) cryptographic signing deferred (basic implementation)
     ///   - updated after EVERY transition per spec Section 6.3
     pub eos_register: Vec<EffortObject>,
-
 }
 
 /// Transition types from Meta-MeTTa spec (Section 3.3)
@@ -209,15 +208,18 @@ impl MachineState {
     ///
     /// Cost precondition (Spec Section 6.3): ((e' + c) - c) > 0
     /// Simplifies to: remaining budget e' > 0 (must have tokens to execute)
-    pub fn apply_query(&mut self, env: &Env, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
-
-
+    pub fn apply_query(
+        &mut self,
+        env: &Env,
+        funcs: &crate::func::FnTable,
+    ) -> Result<Option<i64>, String> {
         let term = match self.input.pop_front() {
             Some(t) => t,
             None => return Ok(None),
         };
 
-        let (results, subst_cost, result_cost, _) = self.query_knowledge_with_cost(&term, env, funcs)?;
+        let (results, subst_cost, result_cost, _) =
+            self.query_knowledge_with_cost(&term, env, funcs)?;
 
         // Cost per spec Section 6.3: c = Σi#(σi) + Σi#(uiσi)
         let total_cost = subst_cost + result_cost;
@@ -243,7 +245,11 @@ impl MachineState {
         if total_cost > 0 {
             self.log_effort_object("Query", total_cost, Some(term.clone()));
         }
-        Ok(if total_cost > 0 { Some(total_cost) } else { None })
+        Ok(if total_cost > 0 {
+            Some(total_cost)
+        } else {
+            None
+        })
     }
 
     /// Chain rule: match term in w against (= ...) in k → put results in w
@@ -261,13 +267,18 @@ impl MachineState {
     ///
     /// Cost precondition (Spec Section 6.3): ((e' + c) - c) > 0
     /// Simplifies to: remaining budget e' > 0 (must have tokens to execute)
-    pub fn apply_chain(&mut self, env: &Env, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
+    pub fn apply_chain(
+        &mut self,
+        env: &Env,
+        funcs: &crate::func::FnTable,
+    ) -> Result<Option<i64>, String> {
         let term = match self.workspace.pop_front() {
             Some(t) => t,
             None => return Ok(None),
         };
 
-        let (results, subst_cost, result_cost, _) = self.query_knowledge_with_cost(&term, env, funcs)?;
+        let (results, subst_cost, result_cost, _) =
+            self.query_knowledge_with_cost(&term, env, funcs)?;
 
         // Cost per spec Section 6.3: c = Σi#(σi) + Σi#(uiσi)
         let total_cost = subst_cost + result_cost;
@@ -291,7 +302,11 @@ impl MachineState {
         if total_cost > 0 {
             self.log_effort_object("Chain", total_cost, Some(term.clone()));
         }
-        Ok(if total_cost > 0 { Some(total_cost) } else { None })
+        Ok(if total_cost > 0 {
+            Some(total_cost)
+        } else {
+            None
+        })
     }
 
     /// Helper: query_knowledge_with_cost(term)
@@ -329,10 +344,14 @@ impl MachineState {
         let mut matched_defs: usize = 0;
 
         for atom in &atoms_snapshot {
-            let is_def = matches!(atom, Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("="));
+            let is_def =
+                matches!(atom, Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("="));
 
             if is_def {
-                let items = match &atom { Atom::Expr(items) => items, _ => unreachable!() };
+                let items = match &atom {
+                    Atom::Expr(items) => items,
+                    _ => unreachable!(),
+                };
                 let head = &items[1];
                 let body = &items[2];
 
@@ -412,7 +431,11 @@ impl MachineState {
     ///
     /// Cost precondition (Spec Section 6.3): ((e' + c) - c) > 0
     /// Simplifies to: remaining budget e' > 0 (must have tokens to execute)
-    pub fn apply_transform(&mut self, _env: &Env, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
+    pub fn apply_transform(
+        &mut self,
+        _env: &Env,
+        funcs: &crate::func::FnTable,
+    ) -> Result<Option<i64>, String> {
         // Extract (transform pattern replacement) from input
         let term = match self.input.pop_front() {
             Some(t) => t,
@@ -424,9 +447,15 @@ impl MachineState {
             Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("transform") => {
                 (items[1].clone(), items[2].clone())
             }
-            Atom::Expr(items) if items.len() < 3 && matches!(items.get(0), Some(a) if a == &Atom::sym("transform")) => {
+            Atom::Expr(items)
+                if items.len() < 3
+                    && matches!(items.get(0), Some(a) if a == &Atom::sym("transform")) =>
+            {
                 // Malformed: (transform) or (transform pattern) without replacement
-                return Err(format!("Transform requires 2 arguments: (transform pattern replacement), got {}", items.len() - 1));
+                return Err(format!(
+                    "Transform requires 2 arguments: (transform pattern replacement), got {}",
+                    items.len() - 1
+                ));
             }
             _ => {
                 // Not a transform builtin; silently skip
@@ -495,7 +524,11 @@ impl MachineState {
         if total_cost > 0 {
             self.log_effort_object("Transform", total_cost, Some(pattern.clone()));
         }
-        Ok(if total_cost > 0 { Some(total_cost) } else { None })
+        Ok(if total_cost > 0 {
+            Some(total_cost)
+        } else {
+            None
+        })
     }
 
     /// AddAtom rule: add atom to k
@@ -505,7 +538,11 @@ impl MachineState {
     /// Cost precondition (Spec Section 6.3, AddAtom1): ((e' + c') - #(t)) > 0
     /// where e' is remaining budget, c' is unspecified overhead (0 here), #(t) is atom cost
     /// Simplifies to: budget - #(atom) > 0, or budget > #(atom)
-    pub fn apply_add_atom(&mut self, atom: Atom, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
+    pub fn apply_add_atom(
+        &mut self,
+        atom: Atom,
+        funcs: &crate::func::FnTable,
+    ) -> Result<Option<i64>, String> {
         let cost = calculate_cost(&atom);
 
         // Budget precondition check per spec Section 6.3 AddAtom1
@@ -538,7 +575,11 @@ impl MachineState {
     /// Cost precondition (Spec Section 6.3, RemAtom1): ((e - #(t)) > 0)
     /// where e is budget, #(t) is atom cost
     /// Simplifies to: budget > #(atom)
-    pub fn apply_remove_atom(&mut self, atom: Atom, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
+    pub fn apply_remove_atom(
+        &mut self,
+        atom: Atom,
+        funcs: &crate::func::FnTable,
+    ) -> Result<Option<i64>, String> {
         let cost = calculate_cost(&atom);
 
         // Budget precondition check per spec Section 6.3 RemAtom1
@@ -564,40 +605,31 @@ impl MachineState {
         Ok(cost)
     }
 
-    /// Output rule: move result from w to o
-    /// Spec Section 3.3, page 12; Section 6.3 cost model
-    /// Cost: c = #(u) where u is the term being output (per OUTPUT rule spec)
-    ///
-    /// Cost precondition (Spec Section 6.3, Output): (e - #(u)) > 0
-    /// where e is budget, #(u) is output term cost (the transition label)
-    /// Simplified check: budget > #(u) (strictly greater per (e - #(u)) > 0)
     pub fn apply_output(&mut self, funcs: &crate::func::FnTable) -> Result<Option<i64>, String> {
         if let Some(term) = self.workspace.pop_front() {
-            // insensitive(u, k) precondition per spec Section 3.3:
-            // term must not match any (= ...) definition head in k.
-            // If it does, it should be Chain'd, not Output'd.
-            //
-            // Only checked when a cost budget is in force (Section 6.3).
-            // Unbounded mode skips the scan to avoid a full-space lock+walk
-            // per term — a multiplicative overhead (O(N·|k|)) on every result.
-            if self.cost_budget.is_some() {
-                let space = funcs.space.read().unwrap();
-                let atoms = space.get_atoms();
-                let matches_def: bool = atoms.iter().any(|atom| {
-                    matches!(atom, Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("=")
-                        && unify(&term, &items[1]).is_some())
-                });
-                drop(space);
-                if matches_def {
-                    self.workspace.push_front(term);
-                    return Ok(None);
-                }
+            // Check the Section 3.3 precondition on every path: output terms must
+            // be insensitive to the current knowledge base, or they should Chain.
+            let space = funcs.space.read().unwrap();
+            let atoms = space.get_atoms();
+            let matches_def: bool = atoms.iter().any(|atom| {
+                matches!(
+                    atom,
+                    Atom::Expr(items)
+                        if items.len() == 3
+                            && items[0] == Atom::sym("=")
+                            && unify(&term, &items[1]).is_some()
+                )
+            });
+            drop(space);
+            if matches_def {
+                self.workspace.push_front(term);
+                return Ok(None);
             }
 
             let cost = calculate_cost(&term);
 
-            // Budget precondition check per spec Section 6.3 Output
-            // Spec: (e - #(u)) > 0 — budget must be strictly greater than cost
+            // Cost precondition per spec Section 6.3 Output:
+            // (e - #(u)) > 0 — budget must be strictly greater than cost.
             if let Some(c) = cost {
                 if let Some(budget) = self.cost_budget {
                     if (budget - c) <= 0 {
@@ -613,11 +645,13 @@ impl MachineState {
             if let Some(c) = cost {
                 if let Some(budget) = self.cost_budget.as_mut() {
                     *budget -= c;
+                    // Log effort object per spec Section 6.3: eos' = {(h(p) c)} ++ cos'
+                    self.log_effort_object("Output", c, Some(term));
                 }
-                // Log effort object per spec Section 6.3: eos' = {(h(p) c)} ++ cos'
-                self.log_effort_object("Output", c, Some(term));
+                Ok(Some(c))
+            } else {
+                Ok(None)
             }
-            Ok(cost)
         } else {
             Ok(None)
         }
@@ -782,7 +816,10 @@ fn unify_with_subst(term: &Atom, pattern: &Atom, subst: &mut HashMap<String, Ato
     match (&term_deref, &pattern_deref) {
         // Variable cases (variables are Sym starting with $)
         (Atom::Sym(v1), Atom::Sym(v2))
-            if v1.starts_with('$') && v2.starts_with('$') && v1 == v2 => true,
+            if v1.starts_with('$') && v2.starts_with('$') && v1 == v2 =>
+        {
+            true
+        }
 
         // Variable unification: var binds to non-var
         (Atom::Sym(v), t) if v.starts_with('$') => {
@@ -925,7 +962,8 @@ fn apply_subst_inner(
             }
         }
         Atom::Expr(items) => {
-            let new_items = items.iter()
+            let new_items = items
+                .iter()
                 .map(|item| apply_subst_inner(item, subst, resolving))
                 .collect();
             Atom::Expr(new_items)
@@ -953,21 +991,17 @@ fn apply_subst_inner(
 /// Selection pressure: simpler code costs less, survives longer.
 pub fn calculate_cost(atom: &Atom) -> Option<i64> {
     match atom {
-        Atom::Sym(_) => Some(1),           // Symbol: cost 1
-        Atom::Num(_) => Some(1),           // Number: cost 1
+        Atom::Sym(_) => Some(1), // Symbol: cost 1
+        Atom::Num(_) => Some(1), // Number: cost 1
         Atom::Expr(items) => {
             // Composite: cost 2 per element + recursive costs
             let base_cost = (items.len() as i64) * 2;
-            let recursive_cost: i64 = items.iter()
-                .filter_map(calculate_cost)
-                .sum();
+            let recursive_cost: i64 = items.iter().filter_map(calculate_cost).sum();
             Some(base_cost + recursive_cost)
         }
-        Atom::Closure(_) => Some(5),       // Closure: cost 5
+        Atom::Closure(_) => Some(5), // Closure: cost 5
     }
 }
-
-
 
 // ========================================================================
 // Phase 6: Cost Model Completion (Section 6.3 Finish)
@@ -976,11 +1010,22 @@ pub fn calculate_cost(atom: &Atom) -> Option<i64> {
 /// Built-in operation costs per spec Section 6.3 (p. 18-19)
 /// All binary operations cost sum(#(arg1), #(arg2)) per the spec's formulas.
 /// Covers: BoolAdd1/2, BoolMult1/2, NumAdd1/2, NumMult1/2, StrAdd1/2
-pub fn get_builtin_operation_cost(op_name: &str, operand1_cost: i64, operand2_cost: i64) -> Option<i64> {
+pub fn get_builtin_operation_cost(
+    op_name: &str,
+    operand1_cost: i64,
+    operand2_cost: i64,
+) -> Option<i64> {
     let binary_ops = [
-        "BoolAdd1", "BoolAdd2", "BoolMult1", "BoolMult2",
-        "NumAdd1", "NumAdd2", "NumMult1", "NumMult2",
-        "StrAdd1", "StrAdd2",
+        "BoolAdd1",
+        "BoolAdd2",
+        "BoolMult1",
+        "BoolMult2",
+        "NumAdd1",
+        "NumAdd2",
+        "NumMult1",
+        "NumMult2",
+        "StrAdd1",
+        "StrAdd2",
     ];
     if binary_ops.contains(&op_name) {
         Some(operand1_cost + operand2_cost)
@@ -997,8 +1042,13 @@ pub fn get_builtin_operation_cost(op_name: &str, operand1_cost: i64, operand2_co
 /// Returns false if constraint violated (would match additional unintended atoms)
 /// `expected_count` is the number of matches that SHOULD be found (n for Query/Chain,
 /// 0 for Output). If total matches exceed expected_count, the constraint is violated.
-pub fn check_insensitive_constraint(pattern: &Atom, knowledge_atoms: &[Atom], expected_count: usize) -> bool {
-    let match_count = knowledge_atoms.iter()
+pub fn check_insensitive_constraint(
+    pattern: &Atom,
+    knowledge_atoms: &[Atom],
+    expected_count: usize,
+) -> bool {
+    let match_count = knowledge_atoms
+        .iter()
         .filter(|atom| unify(atom, pattern).is_some())
         .count();
 
@@ -1008,10 +1058,6 @@ pub fn check_insensitive_constraint(pattern: &Atom, knowledge_atoms: &[Atom], ex
     // Output: insensitive(u, k) → u matches NO (= ...) head → expected_count = 0.
     match_count == expected_count
 }
-
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -1054,16 +1100,8 @@ mod tests {
     #[test]
     fn test_unify_composite() {
         // unify(f(a, $X), f($Y, b)) = {$X → b, $Y → a}
-        let term = Atom::Expr(vec![
-            Atom::sym("f"),
-            Atom::sym("a"),
-            Atom::sym("$X"),
-        ]);
-        let pattern = Atom::Expr(vec![
-            Atom::sym("f"),
-            Atom::sym("$Y"),
-            Atom::sym("b"),
-        ]);
+        let term = Atom::Expr(vec![Atom::sym("f"), Atom::sym("a"), Atom::sym("$X")]);
+        let pattern = Atom::Expr(vec![Atom::sym("f"), Atom::sym("$Y"), Atom::sym("b")]);
 
         let result = unify(&term, &pattern);
         assert!(result.is_some());
@@ -1077,10 +1115,7 @@ mod tests {
     fn test_unify_occurs_check() {
         // unify($X, f($X)) = None (occurs check prevents infinite structure)
         let var = Atom::sym("$X");
-        let expr = Atom::Expr(vec![
-            Atom::sym("f"),
-            Atom::sym("$X"),
-        ]);
+        let expr = Atom::Expr(vec![Atom::sym("f"), Atom::sym("$X")]);
 
         let result = unify(&var, &expr);
         assert!(result.is_none());
@@ -1100,21 +1135,13 @@ mod tests {
     #[test]
     fn test_apply_substitution_composite() {
         // apply_substitution(f($X, $Y), {$X → a, $Y → b}) = f(a, b)
-        let expr = Atom::Expr(vec![
-            Atom::sym("f"),
-            Atom::sym("$X"),
-            Atom::sym("$Y"),
-        ]);
+        let expr = Atom::Expr(vec![Atom::sym("f"), Atom::sym("$X"), Atom::sym("$Y")]);
         let mut subst = HashMap::new();
         subst.insert("$X".to_string(), Atom::sym("a"));
         subst.insert("$Y".to_string(), Atom::sym("b"));
 
         let result = apply_substitution(&expr, &subst);
-        let expected = Atom::Expr(vec![
-            Atom::sym("f"),
-            Atom::sym("a"),
-            Atom::sym("b"),
-        ]);
+        let expected = Atom::Expr(vec![Atom::sym("f"), Atom::sym("a"), Atom::sym("b")]);
         assert_eq!(result, expected);
     }
 
@@ -1140,11 +1167,7 @@ mod tests {
 
         // f(a, b): base_cost (3*2) + recursive (1+1+1) = 6 + 3 = 9 tokens
         // where base_cost = items.len() * 2, recursive_cost = sum of element costs
-        let expr = Atom::Expr(vec![
-            Atom::sym("f"),
-            Atom::sym("a"),
-            Atom::sym("b"),
-        ]);
+        let expr = Atom::Expr(vec![Atom::sym("f"), Atom::sym("a"), Atom::sym("b")]);
         assert_eq!(calculate_cost(&expr), Some(9));
     }
 
