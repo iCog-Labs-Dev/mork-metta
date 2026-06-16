@@ -169,7 +169,12 @@ pub(crate) fn parse_sexpr_body(chars: &mut std::iter::Peekable<std::str::Chars<'
                 let sub = parse_sexpr_body(chars)?;
                 items.push(sub);
             }
-            Some(&_c) => {
+            Some(&'"') => {
+                // Quoted string literal: always a symbol, never a number
+                let token = read_token(chars);
+                items.push(Expr::Symbol(token));
+            }
+            Some(&_) => {
                 let token = read_token(chars);
                 if let Ok(n) = token.parse::<i128>() {
                     items.push(Expr::Number(n));
