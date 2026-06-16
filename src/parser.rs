@@ -152,7 +152,7 @@ pub fn parse_forms(input: &str) -> Result<Vec<TopForm>, String> {
 
 /// Parse a single S-expression from a character stream.
 /// Assumes the opening '(' has already been consumed.
-fn parse_sexpr_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<Expr, String> {
+pub(crate) fn parse_sexpr_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<Expr, String> {
     let mut items = Vec::new();
 
     loop {

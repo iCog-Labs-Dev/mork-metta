@@ -207,7 +207,7 @@ impl FnTable {
         // Self-recursion is optimistically pure, so directly recursive pure
         // functions (e.g. fib) stay parallelizable.
         let clause_pure =
-            crate::eval_parts::data_list::is_pure_expr_assuming(&clause.body, self, name);
+            is_pure_expr_assuming(&clause.body, self, name);
 
         {
             let mut cache = self.fn_cache.write().unwrap();
@@ -266,5 +266,42 @@ impl FnTable {
             .and_then(|inner| inner.get(&arity))
             .copied()
             .unwrap_or(false)
+    }
+}
+
+fn is_pure_expr_assuming(expr: &crate::parser::Expr, funcs: &FnTable, self_name: &str) -> bool {
+    is_pure_expr_inner(expr, funcs, Some(self_name))
+}
+
+fn is_pure_expr_inner(
+    expr: &crate::parser::Expr,
+    funcs: &FnTable,
+    assume_pure: Option<&str>,
+) -> bool {
+    use crate::parser::Expr;
+    match expr {
+        Expr::Number(_) | Expr::Symbol(_) => true,
+        Expr::List(items) if items.is_empty() => true,
+        Expr::List(items) => {
+            let args_pure =
+                || items[1..].iter().all(|e| is_pure_expr_inner(e, funcs, assume_pure));
+            if let Expr::Symbol(s) = &items[0] {
+                match s.as_str() {
+                    "quote" | "superpose" | "empty" | "repr" | "|->" | "once" => true,
+                    "if" | "progn" | "let" | "let*" | "chain" | "collapse" => args_pure(),
+                    "eval" | "call" | "reduce" | "assert" | "transform" | "add-atom"
+                    | "remove-atom" | "match" | "with_mutex" | "transaction" | "import!"
+                    | "readln!" | "println!" | "case" | "foldall" | "map-atom" | "forall"
+                    | "within" | "py-call" | "import-rs!" => false,
+                    _ => {
+                        let callee_pure = assume_pure == Some(s.as_str())
+                            || funcs.is_pure(s, (items.len() - 1) as u8);
+                        callee_pure && args_pure()
+                    }
+                }
+            } else {
+                false
+            }
+        }
     }
 }
