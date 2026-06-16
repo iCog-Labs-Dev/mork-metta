@@ -12,7 +12,7 @@
 /// environment is then merged with the caller's via [`prepend_env`].
 use crate::atom::Atom;
 use crate::env::Env;
-use crate::eval_parts::core::eval;
+use crate::eval_parts::core::eval_scope;
 use crate::func::{Clause, FnTable};
 use crate::parser::Expr;
 use std::sync::Arc;
@@ -152,7 +152,7 @@ pub(crate) fn try_match_one(
                 // in pattern, e.g. `(if (== $x 2) 43 44)`) and bind the result.
                 Atom::Sym(s) if s.starts_with('$') => {
                     let expr = Expr::List(items.clone());
-                    match eval(&expr, env, funcs) {
+                    match eval_scope(&expr, env, funcs) {
                         Ok(mut results) => match results.next() {
                             Some(val) => Ok(Some(env.extend(s, val))),
                             None => Ok(None),

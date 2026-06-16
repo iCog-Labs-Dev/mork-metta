@@ -10,9 +10,6 @@ use mork_metta::Runtime;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // Select the evaluation engine (recursive | cek) from METTA_EVAL.
-    mork_metta::eval_parts::cek::init_engine_from_env();
-
     let path = args
         .iter()
         .skip(1)

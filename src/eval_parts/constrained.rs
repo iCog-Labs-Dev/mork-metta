@@ -14,7 +14,7 @@
 /// to `eval` — each result is wrapped with an empty `Env`.
 use crate::atom::Atom;
 use crate::env::Env;
-use crate::eval_parts::core::eval;
+use crate::eval_parts::core::eval_scope;
 use crate::eval_parts::pattern::{match_clauses, prepend_env, try_match_clause};
 use crate::func::{FnTable, FunctionKind, NDet};
 use crate::parser::Expr;
@@ -116,7 +116,8 @@ pub(crate) fn eval_constrained(
         }
     }
     // Fallback for non-list, non-$ atoms: normal eval, empty bindings.
-    eval(expr, env, funcs).map(|ndet| ndet.map(|a| (a, Env::new())).collect())
+    // Route through eval_scope so CEK is used when active.
+    eval_scope(expr, env, funcs).map(|ndet| ndet.map(|a| (a, Env::new())).collect())
 }
 
 /// Look up `(patterns, body)` clauses for `name/arity` from the function cache,

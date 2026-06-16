@@ -108,7 +108,7 @@ fn restore_transaction_state(snapshot: TransactionSnapshot, funcs: &FnTable) -> 
     Ok(())
 }
 
-fn eval_with_mutex(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+pub(crate) fn eval_with_mutex(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 2 {
         return Err(format!(
             "with_mutex: expected (name body), got {} args",
@@ -116,7 +116,7 @@ fn eval_with_mutex(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, St
         ));
     }
 
-    let mut name_results = eval(&args[0], env, funcs)?;
+    let mut name_results = eval_scope(&args[0], env, funcs)?;
     let mutex_atom = name_results
         .next()
         .ok_or_else(|| "with_mutex: mutex expression produced no results".to_string())?;
@@ -139,11 +139,11 @@ fn eval_with_mutex(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, St
     };
 
     let _guard = mutex.lock().unwrap();
-    let results: Vec<Atom> = eval(&args[1], env, funcs)?.collect();
+    let results: Vec<Atom> = eval_scope(&args[1], env, funcs)?.collect();
     Ok(NDet::stream(results.into_iter()))
 }
 
-fn eval_transaction(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+pub(crate) fn eval_transaction(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 1 {
         return Err(format!(
             "transaction: expected (transaction body), got {} args",
@@ -152,7 +152,7 @@ fn eval_transaction(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, S
     }
 
     let snapshot = snapshot_transaction_state(funcs);
-    match eval(&args[0], env, funcs) {
+    match eval_scope(&args[0], env, funcs) {
         Ok(ndet) => {
             let results: Vec<Atom> = ndet.collect();
             if results.is_empty() {
@@ -171,7 +171,7 @@ fn eval_transaction(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, S
     }
 }
 
-fn eval_assert(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
+pub(crate) fn eval_assert(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 1 {
         return Err(format!(
             "assert: expected (assert goal), got {} args",
@@ -180,7 +180,7 @@ fn eval_assert(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String
     }
 
     let goal = &args[0];
-    let mut results = eval(goal, env, funcs)?;
+    let mut results = eval_scope(goal, env, funcs)?;
     if results.any(|atom| atom.is_truthy()) {
         Ok(NDet::single(Atom::sym("true")))
     } else {
@@ -302,12 +302,7 @@ pub(crate) fn eval_user_call_arg_slot(
 /// that want engine-switchable evaluation must go through `eval_scope`, not
 /// `eval` directly.
 pub fn eval_scope(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<NDet, String> {
-    match crate::eval_parts::cek::current_engine() {
-        crate::eval_parts::cek::Engine::Recursive => eval(expr, env, funcs),
-        crate::eval_parts::cek::Engine::Cek => {
-            crate::eval_parts::cek::run_as_ndet(expr, env, funcs)
-        }
-    }
+    crate::eval_parts::cek::run_as_ndet(expr, env, funcs)
 }
 
 /// Evaluate an expression, returning a (possibly empty) stream of results.
@@ -595,6 +590,7 @@ fn try_call_or_data(
 }
 
 /// Apply a closure to a list of argument expressions.
+/// Sub-evaluations route through eval_scope so CEK is used when active.
 pub(crate) fn apply_closure(
     params: &[Expr],
     body: &Expr,
@@ -617,7 +613,7 @@ pub(crate) fn apply_closure(
     // identical to the previous behavior.
     let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(args.len());
     for arg in args {
-        let vals: Vec<Atom> = eval(arg, env, funcs)?.collect();
+        let vals: Vec<Atom> = eval_scope(arg, env, funcs)?.collect();
         if vals.is_empty() {
             return Err("closure: argument produced no results".into());
         }
@@ -652,7 +648,7 @@ pub(crate) fn apply_closure(
             continue;
         }
         let full_env = crate::eval_parts::pattern::prepend_env(match_env, capture_env);
-        streams.push(eval(body, &full_env, funcs)?);
+        streams.push(eval_scope(body, &full_env, funcs)?);
     }
     Ok(NDet::stream(streams.into_iter().flatten()))
 }
@@ -1001,12 +997,8 @@ pub fn eval_with_state(
     // special-form behavior. Machine-native surface forms such as transform,
     // add-atom, and remove-atom are routed through transitions inside eval().
     let mut budget = cost_budget;
-    let produced: Vec<Atom> = match crate::eval_parts::cek::current_engine() {
-        crate::eval_parts::cek::Engine::Cek => {
-            crate::eval_parts::cek::run_budgeted(expr, env, funcs, &mut budget)?
-        }
-        crate::eval_parts::cek::Engine::Recursive => eval(expr, env, funcs)?.collect(),
-    };
+    let produced: Vec<Atom> =
+        crate::eval_parts::cek::run_budgeted(expr, env, funcs, &mut budget)?;
 
     let mut state = MachineState::new(budget);
     for r in produced {

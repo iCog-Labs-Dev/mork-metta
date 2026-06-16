@@ -32,6 +32,6 @@ pub mod space_ops;
 pub mod special;
 
 // Re-export public API (used by lib.rs)
-pub use core::{eval, eval_scope, eval_with_state};
+pub use core::{eval_scope, eval_with_state};
 pub use io::load_metta_file;
 pub use machine::{MachineState, apply_substitution, calculate_cost, unify};

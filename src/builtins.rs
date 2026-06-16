@@ -858,7 +858,7 @@ pub fn register_builtins(table: &FnTable) {
                 crate::parser::atom_to_expr(&acc).map_err(|e| format!("foldl-atom: {}", e))?,
                 crate::parser::atom_to_expr(item).map_err(|e| format!("foldl-atom: {}", e))?,
             ]);
-            let mut result = crate::eval_parts::core::eval(&call, &crate::env::Env::new(), table)?;
+            let mut result = crate::eval_parts::core::eval_scope(&call, &crate::env::Env::new(), table)?;
             acc = result
                 .next()
                 .ok_or_else(|| "foldl-atom: fold function call produced no results".to_string())?;

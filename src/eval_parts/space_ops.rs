@@ -11,7 +11,7 @@
 /// - `(match space pattern body)` — pattern match atoms in a space
 use crate::atom::Atom;
 use crate::env::Env;
-use crate::eval_parts::core::eval;
+use crate::eval_parts::core::eval_scope;
 use crate::eval_parts::data_list::eval_data_list;
 use crate::eval_parts::machine::{self, MachineState, Transition};
 use crate::eval_parts::pattern::prepend_env;
@@ -27,7 +27,7 @@ pub(crate) fn eval_add_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
         ));
     }
 
-    let mut space_results = eval(&args[0], env, funcs)?;
+    let mut space_results = eval_scope(&args[0], env, funcs)?;
     let space_ref = space_results
         .next()
         .ok_or_else(|| "add-atom: space expression produced no results".to_string())?;
@@ -55,7 +55,7 @@ pub(crate) fn eval_remove_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Res
         ));
     }
 
-    let mut space_results = eval(&args[0], env, funcs)?;
+    let mut space_results = eval_scope(&args[0], env, funcs)?;
     let space_ref = space_results
         .next()
         .ok_or_else(|| "remove-atom: space expression produced no results".to_string())?;
@@ -245,7 +245,7 @@ pub(crate) fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
         ));
     }
 
-    let mut space_results = eval(&args[0], env, funcs)?;
+    let mut space_results = eval_scope(&args[0], env, funcs)?;
     let space_ref = space_results
         .next()
         .ok_or_else(|| "match: space expression produced no results".to_string())?;
@@ -268,7 +268,7 @@ pub(crate) fn eval_match(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
             match_env = match_env.extend(name, val.clone());
         }
 
-        let atoms: Vec<Atom> = eval(&template, &match_env, funcs)?.collect();
+        let atoms: Vec<Atom> = eval_scope(&template, &match_env, funcs)?.collect();
         Ok(atoms
             .into_iter()
             .map(|a| subst_match_vars(&a, &mr.bindings))

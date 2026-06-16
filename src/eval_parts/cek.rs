@@ -55,18 +55,6 @@ fn plain(atoms: Vec<Atom>) -> ResultSet {
     atoms.into_iter().map(|a| (a, Env::Empty)).collect()
 }
 
-static DEBUG_LAZY_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-fn debug_lazy(msg: impl FnOnce() -> String) {
-    if std::env::var_os("MORK_DEBUG_LAZY").is_none() {
-        return;
-    }
-    let seen = DEBUG_LAZY_COUNT.fetch_add(1, Ordering::Relaxed);
-    if seen < 400 {
-        eprintln!("{}", msg());
-    }
-}
-
 /// Strip bindings from a result-set, keeping only the result atoms in order.
 fn atoms_of(rs: &ResultSet) -> Vec<Atom> {
     rs.iter().map(|(a, _)| a.clone()).collect()
@@ -76,62 +64,29 @@ fn atoms_of(rs: &ResultSet) -> Vec<Atom> {
 // Engine selection
 // ========================================================================
 
-/// Which evaluation engine `eval_scope` (and `eval_with_state`) dispatch to.
+/// The evaluation engine. Only `Cek` is supported; `Engine` is retained as a
+/// single-variant enum to minimise test-churn while the recursive engine is
+/// retired.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
-    /// The original recursive tree-walk (`core::eval`).
-    Recursive,
     /// The iterative explicit-stack CEK machine (this module).
     Cek,
 }
 
-const ENGINE_RECURSIVE: u8 = 0;
-const ENGINE_CEK: u8 = 1;
+/// No-op — retained for source compatibility.
+pub fn init_engine_from_env() {}
 
-/// Global engine selector. Global (not thread-local) on purpose: a single
-/// evaluation may fan out onto rayon workers, and every worker must agree on
-/// the engine. Defaults to the iterative `Cek` machine (explicit heap stack, no
-/// native-stack-depth dependence); override with `METTA_EVAL=recursive`.
-static ENGINE: AtomicU8 = AtomicU8::new(ENGINE_CEK);
-
-/// Initialize the engine from the `METTA_EVAL` env var (call once at startup).
-/// Unknown / unset → leaves the current default (`Cek`).
-pub fn init_engine_from_env() {
-    if let Ok(v) = std::env::var("METTA_EVAL") {
-        match v.trim().to_ascii_lowercase().as_str() {
-            "cek" => set_engine(Engine::Cek),
-            "recursive" | "rec" => set_engine(Engine::Recursive),
-            _ => {}
-        }
-    }
-}
-
-/// Read the active engine.
+/// Always returns [`Engine::Cek`].
 pub fn current_engine() -> Engine {
-    match ENGINE.load(Ordering::Relaxed) {
-        ENGINE_CEK => Engine::Cek,
-        _ => Engine::Recursive,
-    }
+    Engine::Cek
 }
 
-/// Set the active engine. Used by the differential-test harness and `main`.
-pub fn set_engine(engine: Engine) {
-    let v = match engine {
-        Engine::Recursive => ENGINE_RECURSIVE,
-        Engine::Cek => ENGINE_CEK,
-    };
-    ENGINE.store(v, Ordering::Relaxed);
-}
+/// No-op — the engine is always CEK.
+pub fn set_engine(_engine: Engine) {}
 
-/// Run `f` with `engine` active, restoring the previous engine afterwards.
-/// Not re-entrancy-safe across threads (the flag is global); intended for the
-/// single-threaded differential harness.
-pub fn with_engine<R>(engine: Engine, f: impl FnOnce() -> R) -> R {
-    let prev = current_engine();
-    set_engine(engine);
-    let r = f();
-    set_engine(prev);
-    r
+/// Run `f` directly — engine selection is immutable.
+pub fn with_engine<R>(_engine: Engine, f: impl FnOnce() -> R) -> R {
+    f()
 }
 
 // ========================================================================
@@ -409,12 +364,6 @@ fn dispatch(
                                     .ok_or_else(|| format!("eval: unbound variable {}", v))?;
                                 match &val {
                                     Atom::Closure(c) if c.params.is_empty() => {
-                                        debug_lazy(|| {
-                                            format!(
-                                                "force thunk: {}",
-                                                crate::parser::expr_to_atom(&c.body).to_sexpr_string()
-                                            )
-                                        });
                                         (c.body.clone(), c.env.clone())
                                     }
                                     _ => (atom_to_expr(&val)?, env.clone()),
@@ -536,10 +485,64 @@ fn dispatch(
                         return Ok(());
                     }
 
-                    // IO / space forms: delegate to their recursive evaluators
-                    // (no deep recursion through them; revisited in Phase 4).
-                    _ if is_special_form(s) => {
-                        let nd = crate::eval_parts::core::eval(expr, env, funcs)?;
+                    // --- IO / space / mutex forms (CEK-native dispatch) ---
+                    "assert" => {
+                        let nd = crate::eval_parts::core::eval_assert(args, env, funcs)?;
+                        vals.push(plain(nd.collect()));
+                        return Ok(());
+                    }
+                    "with_mutex" => {
+                        let nd = crate::eval_parts::core::eval_with_mutex(args, env, funcs)?;
+                        vals.push(plain(nd.collect()));
+                        return Ok(());
+                    }
+                    "transaction" => {
+                        let nd = crate::eval_parts::core::eval_transaction(args, env, funcs)?;
+                        vals.push(plain(nd.collect()));
+                        return Ok(());
+                    }
+                    "add-atom" => {
+                        let nd = crate::eval_parts::space_ops::eval_add_atom(args, env, funcs)?;
+                        vals.push(plain(nd.collect()));
+                        return Ok(());
+                    }
+                    "remove-atom" => {
+                        let nd = crate::eval_parts::space_ops::eval_remove_atom(args, env, funcs)?;
+                        vals.push(plain(nd.collect()));
+                        return Ok(());
+                    }
+                    "match" => {
+                        let nd = crate::eval_parts::space_ops::eval_match(args, env, funcs)?;
+                        vals.push(plain(nd.collect()));
+                        return Ok(());
+                    }
+                    "transform" => {
+                        let nd = crate::eval_parts::space_ops::eval_transform(args, env, funcs)?;
+                        vals.push(plain(nd.collect()));
+                        return Ok(());
+                    }
+                    "import!" => {
+                        let nd = crate::eval_parts::io::eval_import(args, env, funcs)?;
+                        vals.push(plain(nd.collect()));
+                        return Ok(());
+                    }
+                    "import-rs!" => {
+                        let nd = crate::eval_parts::io::eval_import_rs(args, env, funcs)?;
+                        vals.push(plain(nd.collect()));
+                        return Ok(());
+                    }
+                    "readln!" => {
+                        let nd = crate::eval_parts::io::eval_readln(args, env, funcs)?;
+                        vals.push(plain(nd.collect()));
+                        return Ok(());
+                    }
+                    "println!" => {
+                        let nd = crate::eval_parts::io::eval_println(args, env, funcs)?;
+                        vals.push(plain(nd.collect()));
+                        return Ok(());
+                    }
+                    "py-call" => {
+                        let nd = crate::eval_parts::python::eval_py_call(args, env, funcs)?;
                         vals.push(plain(nd.collect()));
                         return Ok(());
                     }
@@ -599,17 +602,6 @@ fn dispatch_call(
     vals: &mut Vec<ResultSet>,
 ) -> Result<(), String> {
     let arity = args.len() as u8;
-    debug_lazy(|| {
-        format!(
-            "dispatch_call {} /{} args={}",
-            name,
-            arity,
-            args.iter()
-                .map(|arg| crate::parser::expr_to_atom(arg).to_sexpr_string())
-                .collect::<Vec<_>>()
-                .join(" | ")
-        )
-    });
 
     let head = if let Some(func) = funcs.get(name, arity) {
         match &func.kind {
@@ -641,17 +633,6 @@ fn dispatch_call(
                         .iter()
                         .any(crate::eval_parts::core::user_call_arg_needs_prepass)
                 {
-                    debug_lazy(|| {
-                        format!(
-                            "user-prebind {} lazy={:?} args={}",
-                            name,
-                            lazy_mask,
-                            args.iter()
-                                .map(|arg| crate::parser::expr_to_atom(arg).to_sexpr_string())
-                                .collect::<Vec<_>>()
-                                .join(" | ")
-                        )
-                    });
                     let mut prebound_args = vec![None; args.len()];
                     let mut eager_indices = Vec::new();
                     for (idx, arg) in args.iter().enumerate() {
@@ -1782,7 +1763,6 @@ fn lookup_user_clauses(name: &str, arity: u8, funcs: &FnTable) -> Option<Vec<(Ve
     }
 
     // Cache miss: query the space for `(= (name _ ...) _)` definitions.
-    debug_lazy(|| format!("CACHE MISS: name={}, arity={}", name, arity));
     let mut head_patterns: Vec<crate::space::Pattern> =
         vec![crate::space::Pattern::Exact(Atom::sym(name))];
     for _ in 0..arity {
@@ -1835,7 +1815,7 @@ fn data_list_fallback(
     vals: &mut Vec<ResultSet>,
 ) -> Result<(), String> {
     let list = Expr::List(all_items.to_vec());
-    let nd = crate::eval_parts::core::eval(&list, env, funcs)?;
+    let nd = run_as_ndet(&list, env, funcs)?;
     vals.push(plain(nd.collect()));
     Ok(())
 }

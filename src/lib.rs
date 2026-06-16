@@ -34,7 +34,7 @@ use crate::atom::Atom;
 use crate::builtins::register_builtins;
 use crate::compile::compile_definition;
 use crate::env::Env;
-use crate::eval_parts::{eval, eval_scope};
+use crate::eval_parts::eval_scope;
 use crate::func::Clause;
 use crate::func::FnTable;
 use crate::parser::{Expr, TopForm, expr_to_atom, parse_forms};

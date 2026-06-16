@@ -10,7 +10,7 @@
 /// data files are safe.
 use crate::atom::Atom;
 use crate::env::Env;
-use crate::eval_parts::core::eval;
+use crate::eval_parts::core::eval_scope;
 use crate::func::{FnTable, NDet};
 use crate::parser::{Expr, TopForm, parse_forms};
 use std::path::Path;
@@ -34,7 +34,7 @@ pub(crate) fn eval_import(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<N
         ));
     }
     // Evaluate space reference
-    let mut space_results = eval(&args[0], env, funcs)?;
+    let mut space_results = eval_scope(&args[0], env, funcs)?;
     let _space_ref = space_results
         .next()
         .ok_or_else(|| "import!: space expression produced no results".to_string())?;
@@ -80,7 +80,7 @@ pub(crate) fn eval_import_rs(args: &[Expr], env: &Env, funcs: &FnTable) -> Resul
             args.len()
         ));
     }
-    let mut results = eval(&args[0], env, funcs)?;
+    let mut results = eval_scope(&args[0], env, funcs)?;
     let name_atom = results
         .next()
         .ok_or_else(|| "import-rs!: name expression produced no results".to_string())?;
@@ -327,7 +327,7 @@ pub(crate) fn eval_readln(_args: &[Expr], _env: &Env, _funcs: &FnTable) -> Resul
 pub(crate) fn eval_println(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     let mut parts = Vec::new();
     for arg in args {
-        let mut results = eval(arg, env, funcs)?;
+        let mut results = eval_scope(arg, env, funcs)?;
         let val = results
             .next()
             .ok_or_else(|| format!("println!: argument produced no results: {:?}", arg))?;

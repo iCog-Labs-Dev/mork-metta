@@ -1,5 +1,5 @@
 use super::constrained::eval_constrained;
-use super::core::{apply_closure, eval};
+use super::core::{apply_closure, eval_scope};
 use super::pattern::{prepend_env, try_match_one};
 /// Special form evaluators.
 ///
@@ -40,9 +40,9 @@ pub(crate) fn eval_if(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet,
         }
         if cond.is_truthy() {
             let then_env = super::pattern::prepend_env(cond_bindings, env);
-            out.extend(super::core::eval(&args[1], &then_env, funcs)?);
+            out.extend(super::core::eval_scope(&args[1], &then_env, funcs)?);
         } else if let Some(else_expr) = args.get(2) {
-            out.extend(super::core::eval(else_expr, env, funcs)?);
+            out.extend(super::core::eval_scope(else_expr, env, funcs)?);
         }
         // 2-arg form: false condition contributes nothing
     }
@@ -88,7 +88,7 @@ pub(crate) fn eval_progn(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
                     );
                     let new_let =
                         Expr::List(vec![Expr::Symbol("let".to_string()), pat, val, new_progn]);
-                    last = Some(super::core::eval(&new_let, env, funcs)?);
+                    last = Some(super::core::eval_scope(&new_let, env, funcs)?);
                     break; // The rest of the forms are now in the `let` body
                 }
             } else if items.len() == 3 && items[0] == Expr::Symbol("let*".to_string()) {
@@ -105,7 +105,7 @@ pub(crate) fn eval_progn(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
                     );
                     let new_let =
                         Expr::List(vec![Expr::Symbol("let*".to_string()), bindings, new_progn]);
-                    last = Some(super::core::eval(&new_let, env, funcs)?);
+                    last = Some(super::core::eval_scope(&new_let, env, funcs)?);
                     break;
                 }
             } else if items.len() == 4 && items[0] == Expr::Symbol("match".to_string()) {
@@ -131,7 +131,7 @@ pub(crate) fn eval_progn(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
                                 arg.clone(), // The match!
                                 new_progn,
                             ]);
-                            last = Some(super::core::eval(&new_let, env, funcs)?);
+                            last = Some(super::core::eval_scope(&new_let, env, funcs)?);
                             break;
                         }
                     }
@@ -139,7 +139,7 @@ pub(crate) fn eval_progn(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
             }
         }
 
-        last = Some(super::core::eval(arg, env, funcs)?);
+        last = Some(super::core::eval_scope(arg, env, funcs)?);
         i += 1;
     }
     last.ok_or_else(|| "progn: internal — no forms after empty check".into())
@@ -167,7 +167,7 @@ pub(crate) fn eval_let(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet
     }
     let pattern = &args[0];
     // PeTTa: translate_expr(Val, Gv, V) — always evaluate the value expression.
-    let values: Vec<Atom> = super::core::eval(&args[1], env, funcs)?.collect();
+    let values: Vec<Atom> = super::core::eval_scope(&args[1], env, funcs)?.collect();
     let streams: Vec<NDet> = values
         .into_iter()
         .filter_map(|v| {
@@ -177,7 +177,7 @@ pub(crate) fn eval_let(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet
             let new_env = super::pattern::prepend_env(match_env, env);
             // REASON: body eval failure in nondet stream is skipped,
             // not propagated — matches PeTTa's backtracking semantics.
-            match super::core::eval(&args[2], &new_env, funcs) {
+            match super::core::eval_scope(&args[2], &new_env, funcs) {
                 Ok(res) => Some(res),
                 Err(_e) => None,
             }
@@ -209,7 +209,7 @@ pub(crate) fn eval_let_star(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
             Expr::List(p) if p.len() == 2 => {
                 let pattern = &p[0];
                 // PeTTa: letstar_to_rec_let expands to nested let, which always evaluates.
-                let mut val_results = super::core::eval(&p[1], &current_env, funcs)?;
+                let mut val_results = super::core::eval_scope(&p[1], &current_env, funcs)?;
                 let val = val_results.next().ok_or_else(|| {
                     format!("let*: binding {} produced no value", pattern.to_string())
                 })?;
@@ -227,7 +227,7 @@ pub(crate) fn eval_let_star(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
             _ => return Err("let*: each binding must be a list (pattern val)".into()),
         }
     }
-    super::core::eval(&args[1], &current_env, funcs)
+    super::core::eval_scope(&args[1], &current_env, funcs)
 }
 
 // ========================================================================
@@ -244,7 +244,7 @@ pub(crate) fn eval_within(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<N
     if args.len() != 1 {
         return Err(format!("within: expected 1 arg, got {}", args.len()));
     }
-    let result_atom = match super::core::eval(&args[0], env, funcs) {
+    let result_atom = match super::core::eval_scope(&args[0], env, funcs) {
         Ok(nd) => {
             let vals: Vec<Atom> = nd.collect();
             if vals.is_empty() {
@@ -366,7 +366,7 @@ pub(crate) fn eval_forall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<N
         .into_iter()
         .map(|(a, _)| a)
         .collect();
-    let check = super::core::eval(&args[1], env, funcs)?
+    let check = super::core::eval_scope(&args[1], env, funcs)?
         .next()
         .ok_or_else(|| "forall: check produced no value".to_string())?;
 
@@ -376,7 +376,7 @@ pub(crate) fn eval_forall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<N
         let results: Vec<Atom> = match &check {
             Atom::Sym(fname) => {
                 let call = Expr::List(vec![Expr::Symbol(fname.to_string()), arg_sym.clone()]);
-                super::core::eval(&call, &call_env, funcs)?.collect()
+                super::core::eval_scope(&call, &call_env, funcs)?.collect()
             }
             Atom::Closure(c) => super::core::apply_closure(
                 &c.params,
@@ -416,7 +416,7 @@ pub(crate) fn eval_call(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDe
     if args.len() != 1 {
         return Err(format!("call: expected 1 arg, got {}", args.len()));
     }
-    super::core::eval(&args[0], env, funcs)
+    super::core::eval_scope(&args[0], env, funcs)
 }
 
 /// Evaluate `(eval expr)` — re-evaluate a raw expression as code.
@@ -440,14 +440,14 @@ pub(crate) fn eval_eval(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDe
                 .ok_or_else(|| format!("eval: unbound variable {}", s))?;
             if let Atom::Closure(c) = &val {
                 if c.params.is_empty() {
-                    return super::core::eval(&c.body, &c.env, funcs);
+                    return super::core::eval_scope(&c.body, &c.env, funcs);
                 }
             }
             let expr = crate::parser::atom_to_expr(&val)?;
-            super::core::eval(&expr, env, funcs)
+            super::core::eval_scope(&expr, env, funcs)
         }
         // Literal expression: pass directly to eval — no pre-evaluation.
-        _ => super::core::eval(&args[0], env, funcs),
+        _ => super::core::eval_scope(&args[0], env, funcs),
     }
 }
 
@@ -470,12 +470,12 @@ pub(crate) fn eval_superpose(args: &[Expr], env: &Env, funcs: &FnTable) -> Resul
     if let Expr::List(items) = arg {
         let streams: Result<Vec<NDet>, String> = items
             .iter()
-            .map(|e| super::core::eval(e, env, funcs))
+            .map(|e| super::core::eval_scope(e, env, funcs))
             .collect();
         return Ok(NDet::stream(streams?.into_iter().flatten()));
     }
     // Non-list: evaluate, then unpack if Expr value
-    let mut results = super::core::eval(arg, env, funcs)?;
+    let mut results = super::core::eval_scope(arg, env, funcs)?;
     let val = results
         .next()
         .ok_or_else(|| "superpose: argument produced no results".to_string())?;
@@ -490,7 +490,7 @@ pub(crate) fn eval_collapse(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
     if args.len() != 1 {
         return Err(format!("collapse: expected 1 arg, got {}", args.len()));
     }
-    let results: Vec<Atom> = super::core::eval(&args[0], env, funcs)?.collect();
+    let results: Vec<Atom> = super::core::eval_scope(&args[0], env, funcs)?.collect();
     Ok(NDet::single(Atom::Expr(results)))
 }
 
@@ -503,7 +503,7 @@ pub(crate) fn eval_once(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDe
     if args.len() != 1 {
         return Err(format!("once: expected 1 arg, got {}", args.len()));
     }
-    let mut stream = super::core::eval(&args[0], env, funcs)?;
+    let mut stream = super::core::eval_scope(&args[0], env, funcs)?;
     match stream.next() {
         Some(v) => Ok(NDet::single(v)),
         None => Ok(NDet::stream(std::iter::empty())),
@@ -536,12 +536,12 @@ pub(crate) fn eval_foldall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<
     let agg_func = &args[0];
     // Collect all values from generator — try normal eval first, then
     // fall back to free-variable resolution if the expression has unbound vars.
-    let gen_values: Vec<Atom> = match super::core::eval(&args[1], env, funcs) {
+    let gen_values: Vec<Atom> = match super::core::eval_scope(&args[1], env, funcs) {
         Ok(results) => results.collect(),
         Err(_) => generate_free_var_values(&args[1], env, funcs)?,
     };
     // Evaluate init value (first result)
-    let mut init_results = super::core::eval(&args[2], env, funcs)?;
+    let mut init_results = super::core::eval_scope(&args[2], env, funcs)?;
     let init = init_results
         .next()
         .ok_or_else(|| "foldall: init expression produced no results".to_string())?;
@@ -550,7 +550,7 @@ pub(crate) fn eval_foldall(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<
         let acc_expr = crate::parser::atom_to_expr(&acc)?;
         let val_expr = crate::parser::atom_to_expr(&val)?;
         let call = Expr::List(vec![agg_func.clone(), acc_expr, val_expr]);
-        let mut results = super::core::eval(&call, env, funcs)?;
+        let mut results = super::core::eval_scope(&call, env, funcs)?;
         results
             .next()
             .ok_or_else(|| "foldall: aggregate function produced no results".to_string())
@@ -585,7 +585,7 @@ pub(crate) fn generate_free_var_values(
     let op = &items[0];
     let arity = items.len() - 1;
     // Evaluate the operator to get the function name
-    let op_atom = match super::core::eval(op, env, funcs)?.next() {
+    let op_atom = match super::core::eval_scope(op, env, funcs)?.next() {
         Some(a) => a,
         None => return Err("generator: operator produced no results".into()),
     };
@@ -598,7 +598,7 @@ pub(crate) fn generate_free_var_values(
             let is_free =
                 matches!(arg_expr, Expr::Symbol(s) if s.starts_with('$') && env.get(s).is_none());
             if !is_free {
-                if let Ok(mut evaled) = super::core::eval(arg_expr, env, funcs) {
+                if let Ok(mut evaled) = super::core::eval_scope(arg_expr, env, funcs) {
                     if let Some(val) = evaled.next() {
                         if let Expr::Symbol(pname) = param {
                             closure_env = closure_env.extend(pname, val);
@@ -607,7 +607,7 @@ pub(crate) fn generate_free_var_values(
                 }
             }
         }
-        let body_results: Vec<Atom> = match super::core::eval(body, &closure_env, funcs) {
+        let body_results: Vec<Atom> = match super::core::eval_scope(body, &closure_env, funcs) {
             Ok(r) => r.collect(),
             Err(_) => generate_free_var_values(body, &closure_env, funcs)?,
         };
@@ -630,7 +630,7 @@ pub(crate) fn generate_free_var_values(
             // concrete args → one value; free-var args → recurse to get many values.
             let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(arity);
             for arg_expr in &items[1..] {
-                match super::core::eval(arg_expr, env, funcs) {
+                match super::core::eval_scope(arg_expr, env, funcs) {
                     Ok(nd) => {
                         let vals: Vec<Atom> = nd.collect();
                         if vals.is_empty() {
@@ -694,7 +694,7 @@ pub(crate) fn generate_free_var_values(
     };
     let mut results = Vec::new();
     for clause in &clauses {
-        let mut body_results = super::core::eval(&clause.body, env, funcs)?;
+        let mut body_results = super::core::eval_scope(&clause.body, env, funcs)?;
         while let Some(atom) = body_results.next() {
             results.push(atom);
         }
@@ -723,11 +723,11 @@ pub(crate) fn eval_map_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
             args.len()
         ));
     }
-    let mut list_results = super::core::eval(&args[0], env, funcs)?;
+    let mut list_results = super::core::eval_scope(&args[0], env, funcs)?;
     let list_atom = list_results
         .next()
         .ok_or_else(|| "map-atom: list expression produced no results".to_string())?;
-    let mut func_results = super::core::eval(&args[1], env, funcs)?;
+    let mut func_results = super::core::eval_scope(&args[1], env, funcs)?;
     let func_atom = func_results
         .next()
         .ok_or_else(|| "map-atom: func expression produced no results".to_string())?;
@@ -748,7 +748,7 @@ pub(crate) fn eval_map_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
             Atom::Sym(fname) => {
                 let elem_expr = crate::parser::atom_to_expr(elem)?;
                 let call_expr = Expr::List(vec![Expr::Symbol(fname.to_string()), elem_expr]);
-                let mut r = super::core::eval(&call_expr, env, funcs)?;
+                let mut r = super::core::eval_scope(&call_expr, env, funcs)?;
                 r.next().ok_or_else(|| {
                     format!(
                         "map-atom: {} returned no result for {}",
@@ -802,7 +802,7 @@ pub(crate) fn eval_map_atom(args: &[Expr], env: &Env, funcs: &FnTable) -> Result
 pub(crate) fn eval_chain(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
     if args.len() == 1 {
         // Single expression: evaluate and return directly
-        return super::core::eval(&args[0], env, funcs);
+        return super::core::eval_scope(&args[0], env, funcs);
     }
     if args.len() < 3 || args.len() % 2 == 0 {
         return Err(format!(
@@ -832,7 +832,7 @@ pub(crate) fn eval_chain(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
         };
 
         // Evaluate expression, take first result
-        let mut results = super::core::eval(expr, &current_env, funcs)?;
+        let mut results = super::core::eval_scope(expr, &current_env, funcs)?;
         let val = results
             .next()
             .ok_or_else(|| format!("chain: expression {} produced no results", i * 2))?;
@@ -841,7 +841,7 @@ pub(crate) fn eval_chain(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<ND
     }
 
     // Evaluate final expression
-    super::core::eval(&args[last_idx], &current_env, funcs)
+    super::core::eval_scope(&args[last_idx], &current_env, funcs)
 }
 
 // ========================================================================
@@ -881,11 +881,11 @@ pub(crate) fn try_case_value(
             continue;
         }
         if matches!(pattern, Expr::Symbol(s) if s == "$else") {
-            return super::core::eval(body, env, funcs).map(|r| r.collect());
+            return super::core::eval_scope(body, env, funcs).map(|r| r.collect());
         }
         if let Some(match_env) = super::pattern::try_match_one(pattern, val, &Env::new(), funcs)? {
             let new_env = super::pattern::prepend_env(match_env, env);
-            return super::core::eval(body, &new_env, funcs).map(|r| r.collect());
+            return super::core::eval_scope(body, &new_env, funcs).map(|r| r.collect());
         }
     }
     Err(format!(
@@ -910,7 +910,7 @@ pub(crate) fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDe
     };
 
     // Evaluate scrutinee lazily — peek at first value to handle empty case.
-    let mut stream = super::core::eval(&args[0], env, funcs)?;
+    let mut stream = super::core::eval_scope(&args[0], env, funcs)?;
     let first_val = stream.next();
 
     // Empty scrutinee: look for (Empty body) clause
@@ -922,7 +922,7 @@ pub(crate) fn eval_case(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDe
                     _ => continue,
                 };
                 if matches!(pattern, Expr::Symbol(s) if s == "Empty") {
-                    return super::core::eval(body, env, funcs);
+                    return super::core::eval_scope(body, env, funcs);
                 }
             }
             return Ok(NDet::stream(std::iter::empty()));

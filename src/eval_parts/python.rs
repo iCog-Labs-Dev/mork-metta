@@ -6,7 +6,7 @@
 /// Requires building with `--features python-bridge`.
 use crate::atom::Atom;
 use crate::env::Env;
-use crate::eval_parts::core::eval;
+use crate::eval_parts::core::eval_scope;
 use crate::func::{FnTable, NDet};
 use crate::parser::Expr;
 
@@ -115,7 +115,7 @@ fn eval_py_call_impl(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, 
     }
 
     // Evaluate module name arg
-    let mut mod_results = eval(&args[0], env, funcs)?;
+    let mut mod_results = eval_scope(&args[0], env, funcs)?;
     let mod_atom = mod_results
         .next()
         .ok_or_else(|| "py-call: module expression produced no results".to_string())?;
@@ -130,7 +130,7 @@ fn eval_py_call_impl(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, 
     };
 
     // Evaluate function name arg
-    let mut func_results = eval(&args[1], env, funcs)?;
+    let mut func_results = eval_scope(&args[1], env, funcs)?;
     let func_atom = func_results
         .next()
         .ok_or_else(|| "py-call: function expression produced no results".to_string())?;
@@ -147,7 +147,7 @@ fn eval_py_call_impl(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, 
     // Evaluate remaining args
     let mut py_args: Vec<Atom> = Vec::with_capacity(args.len().saturating_sub(2));
     for arg in &args[2..] {
-        let mut arg_results = eval(arg, env, funcs)?;
+        let mut arg_results = eval_scope(arg, env, funcs)?;
         let arg_atom = arg_results
             .next()
             .ok_or_else(|| format!("py-call: argument expression produced no results"))?;
