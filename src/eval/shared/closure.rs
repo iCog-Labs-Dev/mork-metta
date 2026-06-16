@@ -14,12 +14,18 @@ use super::subst::subst_and_atomize;
 /// user-function application.
 pub(crate) fn definition_arg_atom(expr: &Expr, env: &Env) -> Option<Atom> {
     match expr {
-        Expr::List(items)
-            if items.len() == 3
-                && matches!(&items[0], Expr::Symbol(symbol) if symbol == "=") =>
-        {
-            Some(subst_and_atomize(expr, env))
-        }
+        Expr::List(items) if !items.is_empty() => match &items[0] {
+            Expr::Symbol(symbol) if symbol == "=" && items.len() == 3 => {
+                Some(subst_and_atomize(expr, env))
+            }
+            // Preserve (quote ...) as data — eager evaluation would strip the
+            // quote wrapper, breaking pattern matching in user functions like
+            //   (= (unquote (quote $A)) ...)
+            Expr::Symbol(symbol) if symbol == "quote" && items.len() == 2 => {
+                Some(subst_and_atomize(expr, env))
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
