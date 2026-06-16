@@ -1,9 +1,24 @@
 //! Execution of explicit machine transitions.
 
-use super::budget::{plain, ResultSet};
+use super::budget::{calculate_cost, plain, ResultSet};
 use super::state::Transition;
 use crate::atom::Atom;
 use crate::func::FnTable;
+// Deduct structural cost of `atom` from `budget` per spec Section 6.
+// Returns Err("Budget exhausted for <op>") when insufficient.
+fn debit_budget(atom: &Atom, budget: &mut Option<i64>, op: &str) -> Result<(), String> {
+    if let Some(c) = calculate_cost(atom) {
+        if let Some(b) = budget {
+            if *b <= c {
+                return Err(format!("Budget exhausted for {}", op));
+            }
+            *b -= c;
+        }
+    }
+    Ok(())
+}
+
+
 
 /// Execute one machine transition and return its produced result set.
 pub(crate) fn apply_transition(
@@ -21,10 +36,12 @@ pub(crate) fn apply_transition(
             Ok(plain(out))
         }
         Transition::AddAtom { space_ref, atom } => {
+            debit_budget(&atom, budget, "addAtom")?;
             crate::space::mutate::add_atom(funcs, &space_ref, &atom)?;
             Ok(plain(vec![Atom::sym("true")]))
         }
         Transition::RemAtom { space_ref, atom } => {
+            debit_budget(&atom, budget, "remAtom")?;
             let removed = crate::space::mutate::remove_atom(funcs, &space_ref, &atom)?;
             Ok(plain(vec![if removed {
                 Atom::sym("true")
