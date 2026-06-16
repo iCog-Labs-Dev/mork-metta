@@ -24,13 +24,79 @@ pub struct TransactionSnapshot {
 }
 
 /// Add an atom to a resolved space.
+/// For the default space (&self), also caches user function definitions
+/// so they can be found by the fast dispatch path.
 pub fn add_atom(funcs: &FnTable, space_ref: &Atom, atom: &Atom) -> Result<(), String> {
-    funcs.with_resolved_space(space_ref, |space| space.add_atom(atom))
+    funcs.with_resolved_space(space_ref, |space| space.add_atom(atom))?;
+    if matches!(space_ref, Atom::Sym(name) if name.as_ref() == "&self") {
+        maybe_cache_definition_atom(atom, funcs);
+        // Also store bare head atom for match premise lookup
+        if let Some((head, _)) = definition_parts(atom) {
+            let _ = funcs.space.write().unwrap().add_atom(head);
+        }
+    }
+    Ok(())
 }
 
 /// Remove an atom from a resolved space.
+/// For the default space (&self), also removes cached user function definitions
+/// and bare head shadow atoms.
 pub fn remove_atom(funcs: &FnTable, space_ref: &Atom, atom: &Atom) -> Result<bool, String> {
-    funcs.with_resolved_space(space_ref, |space| space.remove_atom(atom))
+    let removed = funcs.with_resolved_space(space_ref, |space| space.remove_atom(atom))?;
+    if removed && matches!(space_ref, Atom::Sym(name) if name.as_ref() == "&self") {
+        maybe_uncache_definition_atom(atom, funcs);
+        // Only remove head shadow if no other definition with same head remains
+        if let Some((head, _)) = definition_parts(atom) {
+            let keep_shadow = {
+                let space = funcs.space.read().unwrap();
+                space.get_atoms().iter().any(|existing| match existing {
+                    Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("=") => {
+                        items.get(1) == Some(head)
+                    }
+                    _ => false,
+                })
+            };
+            if !keep_shadow {
+                let _ = funcs.space.write().unwrap().remove_atom(head);
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn definition_parts(atom: &Atom) -> Option<(&Atom, &Atom)> {
+    match atom {
+        Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("=") => {
+            Some((&items[1], &items[2]))
+        }
+        _ => None,
+    }
+}
+
+fn maybe_cache_definition_atom(atom: &Atom, funcs: &FnTable) {
+    if definition_parts(atom).is_some() {
+        let _ = cache_definition_atom(atom, funcs);
+    }
+}
+
+fn cache_definition_atom(atom: &Atom, funcs: &FnTable) -> Result<(), String> {
+    let expr = crate::parser::atom_to_expr(atom)?;
+    let (name, clause) = crate::compile::compile_definition(&expr)?;
+    funcs.cache_fn(&name, clause.patterns.len() as u8, clause);
+    Ok(())
+}
+
+fn maybe_uncache_definition_atom(atom: &Atom, funcs: &FnTable) {
+    if definition_parts(atom).is_some() {
+        let _ = uncache_definition_atom(atom, funcs);
+    }
+}
+
+fn uncache_definition_atom(atom: &Atom, funcs: &FnTable) -> Result<(), String> {
+    let expr = crate::parser::atom_to_expr(atom)?;
+    let (name, clause) = crate::compile::compile_definition(&expr)?;
+    funcs.uncache_fn(&name, clause.patterns.len() as u8);
+    Ok(())
 }
 
 /// Run a closure while holding a named mutex.
