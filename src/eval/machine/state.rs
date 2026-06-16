@@ -1,0 +1,162 @@
+//! Runtime state for machine execution.
+//!
+//! This module defines the data carried while evaluating expressions,
+//! including control state, continuation-related state, intermediate results,
+//! output, and budget bookkeeping.
+
+use crate::atom::Atom;
+use crate::env::Env;
+use crate::parser::Expr;
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+/// A direct machine transition.
+pub enum Transition {
+    /// Reduce the next query term against the current knowledge state.
+    Query,
+    /// Continue a chain-style reduction using the current workspace.
+    Chain,
+    /// Rewrite atoms matching a pattern in the default space.
+    Transform { pattern: Atom, replacement: Atom },
+    /// Add an atom to a resolved target space.
+    AddAtom { space_ref: Atom, atom: Atom },
+    /// Remove an atom from a resolved target space.
+    RemAtom { space_ref: Atom, atom: Atom },
+    /// Evaluate a body while holding a named mutex.
+    WithMutex {
+        mutex_name: String,
+        body: Arc<Expr>,
+        env: Env,
+    },
+    /// Evaluate a body against a restorable mutable-state snapshot.
+    Transaction { body: Arc<Expr>, env: Env },
+    /// Move a produced result to output.
+    Output,
+}
+
+/// Runtime state carried by the machine.
+pub struct MachineState {
+    /// Pending query input.
+    pub input: VecDeque<Atom>,
+    /// Intermediate workspace results.
+    pub workspace: VecDeque<Atom>,
+    /// Produced output results.
+    pub output: Vec<Atom>,
+    /// Remaining evaluation budget, when evaluation is bounded.
+    pub cost_budget: Option<i64>,
+    /// Deferred removals applied as part of state transitions.
+    pub deferred_removals: VecDeque<Atom>,
+    /// Deferred additions applied as part of state transitions.
+    pub deferred_additions: VecDeque<Atom>,
+    /// Effort-object records produced during cost-accounted transitions.
+    pub eos_register: Vec<String>,
+}
+
+impl MachineState {
+    /// Create an empty machine state with an optional evaluation budget.
+    pub fn new(budget: Option<i64>) -> Self {
+        Self {
+            input: VecDeque::new(),
+            workspace: VecDeque::new(),
+            output: Vec::new(),
+            cost_budget: budget,
+            deferred_removals: VecDeque::new(),
+            deferred_additions: VecDeque::new(),
+            eos_register: Vec::new(),
+        }
+    }
+
+    /// Push a term into the input register.
+    pub fn push_input(&mut self, atom: Atom) {
+        self.input.push_back(atom);
+    }
+}
+
+/// Return `true` when binding `var` to `atom` would introduce a cycle.
+fn occurs_check(var: &str, atom: &Atom, subst: &HashMap<String, Atom>) -> bool {
+    match deref(atom, subst) {
+        Atom::Sym(symbol) if symbol.starts_with('$') => symbol.as_ref() == var,
+        Atom::Expr(items) => items.iter().any(|item| occurs_check(var, item, subst)),
+        _ => false,
+    }
+}
+
+/// Follow variable bindings until a non-variable target is reached.
+fn deref(atom: &Atom, subst: &HashMap<String, Atom>) -> Atom {
+    match atom {
+        Atom::Sym(symbol) if symbol.starts_with('$') => {
+            let mut current = symbol.clone();
+            let mut seen = vec![current.clone()];
+            loop {
+                match subst.get(current.as_ref()) {
+                    Some(Atom::Sym(next)) if next.starts_with('$') => {
+                        if seen.contains(next) {
+                            return Atom::Sym(current.clone());
+                        }
+                        seen.push(next.clone());
+                        current = next.clone();
+                    }
+                    Some(target) => return target.clone(),
+                    None => return Atom::Sym(current.clone()),
+                }
+            }
+        }
+        _ => atom.clone(),
+    }
+}
+
+/// Unify two atoms using an existing substitution map.
+fn unify_with_subst(term: &Atom, pattern: &Atom, subst: &mut HashMap<String, Atom>) -> bool {
+    let term_deref = deref(term, subst);
+    let pattern_deref = deref(pattern, subst);
+
+    match (&term_deref, &pattern_deref) {
+        (Atom::Sym(left), Atom::Sym(right))
+            if left.starts_with('$') && right.starts_with('$') && left == right =>
+        {
+            true
+        }
+        (Atom::Sym(var), other) if var.starts_with('$') => {
+            if occurs_check(var, other, subst) {
+                false
+            } else {
+                subst.insert(var.to_string(), other.clone());
+                true
+            }
+        }
+        (other, Atom::Sym(var)) if var.starts_with('$') => {
+            if occurs_check(var, other, subst) {
+                false
+            } else {
+                subst.insert(var.to_string(), other.clone());
+                true
+            }
+        }
+        (Atom::Sym(left), Atom::Sym(right)) => left == right,
+        (Atom::Num(left), Atom::Num(right)) => left == right,
+        (Atom::Expr(left_items), Atom::Expr(right_items)) => {
+            if right_items.len() == 3 && right_items[0] == Atom::sym("=") {
+                return unify_with_subst(&term_deref, &right_items[1], subst);
+            }
+            if left_items.len() != right_items.len() {
+                return false;
+            }
+            left_items
+                .iter()
+                .zip(right_items.iter())
+                .all(|(left, right)| unify_with_subst(left, right, subst))
+        }
+        _ => false,
+    }
+}
+
+/// Unify two atoms and return the produced substitution on success.
+pub fn unify(term: &Atom, pattern: &Atom) -> Option<HashMap<String, Atom>> {
+    let mut subst = HashMap::new();
+    if unify_with_subst(term, pattern, &mut subst) {
+        Some(subst)
+    } else {
+        None
+    }
+}

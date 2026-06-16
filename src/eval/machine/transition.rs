@@ -1,0 +1,61 @@
+//! Execution of explicit machine transitions.
+
+use super::budget::{plain, ResultSet};
+use super::state::Transition;
+use crate::atom::Atom;
+use crate::func::FnTable;
+
+/// Execute one machine transition and return its produced result set.
+pub(crate) fn apply_transition(
+    transition: Transition,
+    funcs: &FnTable,
+    budget: &mut Option<i64>,
+) -> Result<ResultSet, String> {
+    match transition {
+        Transition::Query | Transition::Chain | Transition::Output => Ok(Vec::new()),
+        Transition::Transform {
+            pattern,
+            replacement,
+        } => {
+            let out = crate::space::query::transform_matches(funcs, &pattern, &replacement)?;
+            Ok(plain(out))
+        }
+        Transition::AddAtom { space_ref, atom } => {
+            crate::space::mutate::add_atom(funcs, &space_ref, &atom)?;
+            Ok(plain(vec![Atom::sym("true")]))
+        }
+        Transition::RemAtom { space_ref, atom } => {
+            let removed = crate::space::mutate::remove_atom(funcs, &space_ref, &atom)?;
+            Ok(plain(vec![if removed {
+                Atom::sym("true")
+            } else {
+                Atom::sym("")
+            }]))
+        }
+        Transition::WithMutex {
+            mutex_name,
+            body,
+            env,
+        } => crate::space::mutate::with_named_mutex(&mutex_name, || {
+            super::step::run_rs(body, env, funcs, budget)
+        }),
+        Transition::Transaction { body, env } => {
+            let snapshot = crate::space::mutate::snapshot_transaction_state(funcs);
+            match super::step::run_rs(body, env, funcs, budget) {
+                Ok(out) => {
+                    if out.is_empty() {
+                        crate::space::mutate::restore_transaction_state(snapshot, funcs)
+                            .map_err(|err| format!("transaction: rollback failed: {err}"))?;
+                    }
+                    Ok(out)
+                }
+                Err(err) => {
+                    crate::space::mutate::restore_transaction_state(snapshot, funcs).map_err(
+                        |restore_err| format!("transaction: rollback failed: {restore_err}"),
+                    )?;
+                    Err(format!("transaction: {err}"))
+                }
+            }
+        }
+    }
+}
