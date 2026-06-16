@@ -118,50 +118,24 @@ pub(crate) fn dispatch_expr(
                 let args = &items[1..];
                 match head.as_str() {
                     "cut" => {
-                        eprintln!("[CUT] start: work.len={}, vals.len={}", work.len(), vals.len());
-                        for (i, t) in work.iter().enumerate() {
-                            let desc = match t {
-                                super::task::Task::Apply(f) => match f {
-                                    Frame::Gather { n } => format!("Gather({})", n),
-                                    Frame::IfGather { n, .. } => format!("IfGather({})", n),
-                                    Frame::LetStarBind { bind_index, .. } => format!("LetStarBind({})", bind_index),
-                                    Frame::LetMatch { .. } => "LetMatch".into(),
-                                    Frame::MergeEnv { .. } => "MergeEnv".into(),
-                                    Frame::Call { .. } => "Call".into(),
-                                    _ => "Frame".into(),
-                                },
-                                super::task::Task::Eval { .. } => "Eval".into(),
-                                super::task::Task::Transition(_) => "Transition".into(),
-                            };
-                            eprintln!("[CUT]   work[{}] = {}", i, desc);
-                        }
+                        // cut returns true and prunes remaining alternative branches
+                        // from the work queue (innermost Gather/IfGather -> n=1).
                         vals.push(plain(vec![crate::atom::Atom::sym("true")]));
                         if let Some(gather_idx) = work.iter().rposition(|t| {
                             matches!(t, super::task::Task::Apply(Frame::Gather { .. } | Frame::IfGather { .. }))
                         }) {
                             let current = work.len().saturating_sub(1);
-                            eprintln!("[CUT] innermost Gather at idx={}, current={}", gather_idx, current);
                             if current > gather_idx + 1 {
-                                eprintln!("[CUT] drain {}..{}", gather_idx + 1, current);
                                 work.drain(gather_idx + 1 .. current);
                             }
                             if let Some(super::task::Task::Apply(frame)) = work.get_mut(gather_idx) {
                                 match frame {
-                                    Frame::Gather { n } => {
-                                        eprintln!("[CUT] Gather.n: {} → 1", *n);
-                                        *n = 1;
-                                    }
-                                    Frame::IfGather { n, .. } => {
-                                        eprintln!("[CUT] IfGather.n: {} → 1", *n);
-                                        *n = 1;
-                                    }
+                                    Frame::Gather { n } => *n = 1,
+                                    Frame::IfGather { n, .. } => *n = 1,
                                     _ => {}
                                 }
                             }
-                        } else {
-                            eprintln!("[CUT] no Gather found");
                         }
-                        eprintln!("[CUT] after: work.len={}", work.len());
                         return Ok(());
                     }
                     "quote" => {

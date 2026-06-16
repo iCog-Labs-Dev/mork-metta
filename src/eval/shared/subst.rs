@@ -32,7 +32,10 @@ pub(crate) fn subst_expr_vars(expr: &Expr, env: &Env) -> Expr {
         Expr::Symbol(symbol) if symbol.starts_with('$') => {
             if let Some(atom) = crate::eval::shared::env::lookup(env, symbol) {
                 match atom {
-                    Atom::Sym(ref bound) if bound.starts_with('$') => expr.clone(),
+                    Atom::Sym(ref bound) if bound.starts_with('$') => {
+                        // Recursive substitution: variable bound to variable
+                        subst_expr_vars(&Expr::Symbol(bound.to_string()), env)
+                    }
                     _ => atom_to_expr(&atom).unwrap_or_else(|_| expr.clone()),
                 }
             } else {

@@ -184,14 +184,7 @@ pub(crate) fn apply_frame(
         }
         Frame::LetMatch { pattern, body, env } => {
             let value_rs = pop_n(vals, 1).pop().unwrap();
-            eprintln!("[DEBUG LetMatch] value_rs len={}", value_rs.len());
-            for (value, result_env) in &value_rs {
-                eprintln!("[DEBUG LetMatch]   value={} env={:?}", value.to_sexpr_string(), result_env);
-                // Check if $x is in env
-                if let Some(v) = result_env.get("$x") {
-                    eprintln!("[DEBUG LetMatch]     result_env has $x = {}", v.to_sexpr_string());
-                }
-            }
+
             let mut branches: Vec<(Arc<Expr>, Env)> = Vec::new();
             for (value, _) in &value_rs {
                 if let Ok(Some(matched)) =
@@ -325,6 +318,7 @@ pub(crate) fn apply_frame(
             env,
         } => {
             let value_rs = pop_n(vals, 1).pop().unwrap();
+
             let (pattern, _) =
                 crate::eval::forms::control::let_star_binding(&bindings, bind_index)?;
             enum Branch {
@@ -382,9 +376,6 @@ pub(crate) fn apply_frame(
                         });
                     }
                     Branch::Final { env } => {
-                        eprintln!("[DEBUG LetStarBind Final] body={:?}, $x={:?}",
-                            body.to_string(),
-                            env.get("$x").map(|a| a.to_sexpr_string()));
                         work.push(Task::Eval {
                             expr: Arc::clone(&body),
                             env,
@@ -396,19 +387,16 @@ pub(crate) fn apply_frame(
         }
         Frame::SpaceMatch { pattern, body, env } => {
             let space_rs = pop_n(vals, 1).pop().unwrap();
-            eprintln!("[DEBUG SpaceMatch] body={:?}, env={:?}, pattern=:{:?}", body.to_string(), env, pattern.to_string());
+            // Substitute body expression variables from env for indirect variable
+            // references (e.g. body=$ret where $ret→Sym($1)).
+            let body = crate::eval::shared::subst::subst_expr_vars(&body, &env);
             let mut branches: Vec<(Arc<Expr>, Env)> = Vec::new();
             for (space_ref, _) in &space_rs {
                 let matches =
                     crate::space::query::collect_match_results(funcs, space_ref, &pattern, &env)?;
                 for matched in matches {
                     let body_env = crate::eval::shared::env::bind_all(&env, &matched.bindings);
-                    eprintln!("[DEBUG SpaceMatch] match: bindings={:?}, env=$1={:?}, body_env.$1={:?}, body_env.$ret={:?}",
-                        matched.bindings,
-                        env.get("$1").map(|a| a.to_sexpr_string()),
-                        body_env.get("$1").map(|a| a.to_sexpr_string()),
-                        body_env.get("$ret").map(|a| a.to_sexpr_string()));
-                    branches.push((Arc::clone(&body), body_env));
+                    branches.push((Arc::new(body.clone()), body_env));
                 }
             }
             if branches.is_empty() {
