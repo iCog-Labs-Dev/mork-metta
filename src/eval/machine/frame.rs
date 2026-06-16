@@ -159,4 +159,8 @@ pub(crate) enum Frame {
         /// Function atom (symbol) applied each step.
         func: Atom,
     },
+    /// Sequential evaluation: evaluate N args, return the last result.
+    Progn { n: usize },
+    /// Sequential evaluation: evaluate N args, return the first result.
+    Prog1 { n: usize },
 }

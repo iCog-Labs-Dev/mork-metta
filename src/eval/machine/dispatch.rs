@@ -438,6 +438,34 @@ pub(crate) fn dispatch_expr(
                         });
                         return Ok(());
                     }
+                    "progn" => {
+                        if args.len() < 1 {
+                            return Err("progn: expected at least one form".into());
+                        }
+                        // Evaluate all args sequentially, return last result
+                        work.push(Task::Apply(Frame::Progn { n: args.len() }));
+                        for arg in args.iter().rev() {
+                            work.push(Task::Eval {
+                                expr: Arc::new(arg.clone()),
+                                env: env.clone(),
+                            });
+                        }
+                        return Ok(());
+                    }
+                    "prog1" => {
+                        if args.len() < 1 {
+                            return Err("prog1: expected at least one form".into());
+                        }
+                        // Evaluate all args sequentially, return first result
+                        work.push(Task::Apply(Frame::Prog1 { n: args.len() }));
+                        for arg in args.iter().rev() {
+                            work.push(Task::Eval {
+                                expr: Arc::new(arg.clone()),
+                                env: env.clone(),
+                            });
+                        }
+                        return Ok(());
+                    }
                     "match" => {
                         if args.len() != 3 {
                             return Err(format!("match: expected 3 args, got {}", args.len()));

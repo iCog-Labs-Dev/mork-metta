@@ -288,7 +288,7 @@ fn is_pure_expr_inner(
             if let Expr::Symbol(s) = &items[0] {
                 match s.as_str() {
                     "quote" | "superpose" | "empty" | "repr" | "|->" | "once" => true,
-                    "if" | "progn" | "let" | "let*" | "chain" | "collapse" => args_pure(),
+                    "if" | "progn" | "prog1" | "let" | "let*" | "chain" | "collapse" => args_pure(),
                     "eval" | "call" | "reduce" | "assert" | "transform" | "add-atom"
                     | "remove-atom" | "match" | "with_mutex" | "transaction" | "import!"
                     | "readln!" | "println!" | "case" | "foldall" | "map-atom" | "forall"

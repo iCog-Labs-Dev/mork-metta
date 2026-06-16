@@ -672,6 +672,18 @@ pub(crate) fn apply_frame(
             vals.push(plain(lists));
             Ok(())
         }
+        Frame::Progn { n } => {
+            let mut sets = pop_n(vals, n);
+            // Last arg evaluated last → its result is on top (end of sets)
+            vals.push(sets.pop().unwrap_or_default());
+            Ok(())
+        }
+        Frame::Prog1 { n } => {
+            let mut sets = pop_n(vals, n);
+            // First arg evaluated first → its result is at front
+            vals.push(sets.into_iter().next().unwrap_or_default());
+            Ok(())
+        }
         Frame::Call {
             head,
             arity,
