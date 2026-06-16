@@ -1,0 +1,472 @@
+//! Builtins for list-like atom operations.
+
+use crate::atom::Atom;
+use crate::func::{FnTable, FunctionKind, NDet};
+
+fn expect(args: &[Atom], n: usize, name: &str) -> Result<(), String> {
+    crate::builtins::arithmetic::expect_n_args(args, n, name)
+}
+
+/// Register collection builtins.
+pub fn register_collection_builtins(funcs: &FnTable) {
+    funcs.insert_native("size-atom", 1, |args, _| {
+        expect(args, 1, "size-atom")?;
+        let len = match &args[0] {
+            Atom::Expr(items) => items.len(),
+            _ => 1,
+        };
+        Ok(NDet::single(Atom::Num(len as i128)))
+    });
+    funcs.mark_pure("size-atom", 1);
+
+    funcs.insert_native("length", 1, |args, _| {
+        expect(args, 1, "length")?;
+        let len = match &args[0] {
+            Atom::Expr(items) => items.len(),
+            _ => 1,
+        };
+        Ok(NDet::single(Atom::Num(len as i128)))
+    });
+    funcs.mark_pure("length", 1);
+
+    funcs.insert_native("car-atom", 1, |args, _| {
+        expect(args, 1, "car-atom")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
+            Atom::Expr(_) => Err("car-atom: empty list".into()),
+            other => Err(format!("car-atom: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+    funcs.mark_pure("car-atom", 1);
+
+    funcs.insert_native("car", 1, |args, _| {
+        expect(args, 1, "car")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
+            Atom::Expr(_) => Err("car: empty list".into()),
+            other => Err(format!("car: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+    funcs.mark_pure("car", 1);
+
+    funcs.insert_native("cdr-atom", 1, |args, _| {
+        expect(args, 1, "cdr-atom")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(Atom::Expr(items[1..].to_vec()))),
+            Atom::Expr(_) => Err("cdr-atom: empty list".into()),
+            other => Err(format!("cdr-atom: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+    funcs.mark_pure("cdr-atom", 1);
+
+    funcs.insert_native("cdr", 1, |args, _| {
+        expect(args, 1, "cdr")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(Atom::Expr(items[1..].to_vec()))),
+            Atom::Expr(_) => Err("cdr: empty list".into()),
+            other => Err(format!("cdr: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+    funcs.mark_pure("cdr", 1);
+
+    funcs.insert_native("cons-atom", 2, |args, _| {
+        expect(args, 2, "cons-atom")?;
+        let mut out = vec![args[0].clone()];
+        match &args[1] {
+            Atom::Expr(items) => out.extend(items.iter().cloned()),
+            other => out.push(other.clone()),
+        }
+        Ok(NDet::single(Atom::Expr(out)))
+    });
+    funcs.mark_pure("cons-atom", 2);
+
+    funcs.insert_native("cons", 2, |args, _| {
+        expect(args, 2, "cons")?;
+        let mut out = vec![args[0].clone()];
+        match &args[1] {
+            Atom::Expr(items) => out.extend(items.iter().cloned()),
+            other => out.push(other.clone()),
+        }
+        Ok(NDet::single(Atom::Expr(out)))
+    });
+    funcs.mark_pure("cons", 2);
+
+    funcs.insert_native("decons-atom", 1, |args, _| {
+        expect(args, 1, "decons-atom")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => {
+                let head = items[0].clone();
+                let rest = Atom::Expr(items[1..].to_vec());
+                Ok(NDet::single(Atom::Expr(vec![head, rest])))
+            }
+            Atom::Expr(_) => Err("decons-atom: empty list".into()),
+            other => Err(format!("decons-atom: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+    funcs.mark_pure("decons-atom", 1);
+
+    funcs.insert_native("decons", 1, |args, _| {
+        expect(args, 1, "decons")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => {
+                let head = items[0].clone();
+                let rest = Atom::Expr(items[1..].to_vec());
+                Ok(NDet::single(Atom::Expr(vec![head, rest])))
+            }
+            Atom::Expr(_) => Err("decons: empty list".into()),
+            other => Err(format!("decons: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+    funcs.mark_pure("decons", 1);
+
+    funcs.insert_native("append", 2, |args, _| {
+        expect(args, 2, "append")?;
+        let mut out = match &args[0] {
+            Atom::Expr(items) => items.clone(),
+            other => vec![other.clone()],
+        };
+        match &args[1] {
+            Atom::Expr(items) => out.extend(items.iter().cloned()),
+            other => out.push(other.clone()),
+        }
+        Ok(NDet::single(Atom::Expr(out)))
+    });
+    funcs.mark_pure("append", 2);
+
+    funcs.insert_native("reverse", 1, |args, _| {
+        expect(args, 1, "reverse")?;
+        match &args[0] {
+            Atom::Expr(items) => {
+                let mut rev = items.clone();
+                rev.reverse();
+                Ok(NDet::single(Atom::Expr(rev)))
+            }
+            other => Err(format!("reverse: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+    funcs.mark_pure("reverse", 1);
+
+    funcs.insert_native("index-atom", 2, |args, _| {
+        expect(args, 2, "index-atom")?;
+        let idx = match &args[1] {
+            Atom::Num(n) => usize::try_from(*n)
+                .map_err(|_| format!("index-atom: index must be non-negative, got {}", n))?,
+            other => return Err(format!("index-atom: index must be a number, got {}", other.to_sexpr_string())),
+        };
+        match &args[0] {
+            Atom::Expr(items) => items.get(idx).cloned().map(NDet::single)
+                .ok_or_else(|| format!("index-atom: index {} out of bounds (len {})", idx, items.len())),
+            other => Err(format!("index-atom: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+    funcs.mark_pure("index-atom", 2);
+
+    funcs.insert_native("id", 1, |args, _| {
+        expect(args, 1, "id")?;
+        Ok(NDet::single(args[0].clone()))
+    });
+    funcs.mark_pure("id", 1);
+
+    funcs.insert_native("first-from-pair", 1, |args, _| {
+        expect(args, 1, "first-from-pair")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
+            Atom::Expr(_) => Err("first-from-pair: empty list".into()),
+            other => Err(format!("first-from-pair: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+    funcs.mark_pure("first-from-pair", 1);
+
+    funcs.insert_native("first", 1, |args, _| {
+        expect(args, 1, "first")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
+            Atom::Expr(_) => Err("first: empty list".into()),
+            other => Err(format!("first: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+    funcs.mark_pure("first", 1);
+
+    funcs.insert_native("second-from-pair", 1, |args, _| {
+        expect(args, 1, "second-from-pair")?;
+        match &args[0] {
+            Atom::Expr(items) if items.len() >= 2 => Ok(NDet::single(items[1].clone())),
+            Atom::Expr(_) => Err("second-from-pair: list too short".into()),
+            other => Err(format!("second-from-pair: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+    funcs.mark_pure("second-from-pair", 1);
+
+    funcs.insert_native("second", 1, |args, _| {
+        expect(args, 1, "second")?;
+        match &args[0] {
+            Atom::Expr(items) if items.len() >= 2 => Ok(NDet::single(items[1].clone())),
+            Atom::Expr(_) => Err("second: list too short".into()),
+            other => Err(format!("second: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+    funcs.mark_pure("second", 1);
+
+    funcs.insert_native("last", 1, |args, _| {
+        expect(args, 1, "last")?;
+        match &args[0] {
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[items.len() - 1].clone())),
+            Atom::Expr(_) => Err("last: empty list".into()),
+            other => Err(format!("last: expected list, got {}", other.to_sexpr_string())),
+        }
+    });
+    funcs.mark_pure("last", 1);
+
+    funcs.insert_native("msort", 1, |args, _| {
+        expect(args, 1, "msort")?;
+        let mut items = match &args[0] {
+            Atom::Expr(v) => v.clone(),
+            a => vec![a.clone()],
+        };
+        items.sort_by(|a, b| a.to_sexpr_string().cmp(&b.to_sexpr_string()));
+        Ok(NDet::single(Atom::Expr(items)))
+    });
+    funcs.mark_pure("msort", 1);
+
+    funcs.insert_native("sort", 1, |args, _| {
+        expect(args, 1, "sort")?;
+        let mut items = match &args[0] {
+            Atom::Expr(v) => v.clone(),
+            a => vec![a.clone()],
+        };
+        items.sort_by(|a, b| a.to_sexpr_string().cmp(&b.to_sexpr_string()));
+        items.dedup();
+        Ok(NDet::single(Atom::Expr(items)))
+    });
+    funcs.mark_pure("sort", 1);
+
+    funcs.insert_native("sort-atom", 1, |args, _| {
+        expect(args, 1, "sort-atom")?;
+        let mut items = match &args[0] {
+            Atom::Expr(v) => v.clone(),
+            a => vec![a.clone()],
+        };
+        items.sort_by(|a, b| a.to_sexpr_string().cmp(&b.to_sexpr_string()));
+        Ok(NDet::single(Atom::Expr(items)))
+    });
+    funcs.mark_pure("sort-atom", 1);
+
+    funcs.insert_native("is-member", 2, |args, _| {
+        expect(args, 2, "is-member")?;
+        let found = match &args[1] {
+            Atom::Expr(items) => items.iter().any(|x| *x == args[0]),
+            other => *other == args[0],
+        };
+        Ok(NDet::single(crate::builtins::boolean::bool_atom(found)))
+    });
+    funcs.mark_pure("is-member", 2);
+
+    funcs.insert_native("exclude-item", 2, |args, _| {
+        expect(args, 2, "exclude-item")?;
+        match &args[1] {
+            Atom::Expr(items) => {
+                let filtered: Vec<Atom> = items.iter().filter(|x| **x != args[0]).cloned().collect();
+                Ok(NDet::single(Atom::Expr(filtered)))
+            }
+            other => {
+                if *other == args[0] {
+                    Ok(NDet::single(Atom::Expr(vec![])))
+                } else {
+                    Ok(NDet::single(other.clone()))
+                }
+            }
+        }
+    });
+    funcs.mark_pure("exclude-item", 2);
+
+    funcs.insert_native("unique-atom", 1, |args, _| {
+        expect(args, 1, "unique-atom")?;
+        match &args[0] {
+            Atom::Expr(items) => {
+                let mut seen = Vec::with_capacity(items.len());
+                let mut deduped = Vec::with_capacity(items.len());
+                for item in items {
+                    if !seen.contains(item) {
+                        seen.push(item.clone());
+                        deduped.push(item.clone());
+                    }
+                }
+                Ok(NDet::single(Atom::Expr(deduped)))
+            }
+            other => Ok(NDet::single(other.clone())),
+        }
+    });
+    funcs.mark_pure("unique-atom", 1);
+
+    funcs.insert_native("alpha-unique-atom", 1, |args, _| {
+        expect(args, 1, "alpha-unique-atom")?;
+        match &args[0] {
+            Atom::Expr(items) => {
+                let mut deduped: Vec<Atom> = Vec::with_capacity(items.len());
+                'outer: for item in items {
+                    for existing in &deduped {
+                        let mut map_ab = std::collections::HashMap::new();
+                        let mut map_ba = std::collections::HashMap::new();
+                        if crate::builtins::arithmetic::alpha_equiv(item, existing, &mut map_ab, &mut map_ba) {
+                            continue 'outer;
+                        }
+                    }
+                    deduped.push(item.clone());
+                }
+                Ok(NDet::single(Atom::Expr(deduped)))
+            }
+            other => Ok(NDet::single(other.clone())),
+        }
+    });
+    funcs.mark_pure("alpha-unique-atom", 1);
+
+    funcs.insert_native("union-atom", 2, |args, _| {
+        expect(args, 2, "union-atom")?;
+        let items1 = match &args[0] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
+        let items2 = match &args[1] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
+        let mut result = items1;
+        for item in items2 {
+            if !result.contains(&item) { result.push(item); }
+        }
+        Ok(NDet::single(Atom::Expr(result)))
+    });
+    funcs.mark_pure("union-atom", 2);
+
+    funcs.insert_native("intersection-atom", 2, |args, _| {
+        expect(args, 2, "intersection-atom")?;
+        let items1 = match &args[0] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
+        let items2 = match &args[1] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
+        let mut result = Vec::new();
+        for item in &items1 {
+            if items2.contains(item) && !result.contains(item) { result.push(item.clone()); }
+        }
+        Ok(NDet::single(Atom::Expr(result)))
+    });
+    funcs.mark_pure("intersection-atom", 2);
+
+    funcs.insert_native("subtraction-atom", 2, |args, _| {
+        expect(args, 2, "subtraction-atom")?;
+        let items1 = match &args[0] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
+        let items2 = match &args[1] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
+        let result: Vec<Atom> = items1.into_iter().filter(|x| !items2.contains(x)).collect();
+        Ok(NDet::single(Atom::Expr(result)))
+    });
+    funcs.mark_pure("subtraction-atom", 2);
+
+    funcs.insert_native("list_to_set", 1, |args, _| {
+        expect(args, 1, "list_to_set")?;
+        match &args[0] {
+            Atom::Expr(items) => {
+                let mut seen = Vec::with_capacity(items.len());
+                let mut deduped = Vec::with_capacity(items.len());
+                for item in items {
+                    if !seen.contains(item) {
+                        seen.push(item.clone());
+                        deduped.push(item.clone());
+                    }
+                }
+                Ok(NDet::single(Atom::Expr(deduped)))
+            }
+            other => Ok(NDet::single(other.clone())),
+        }
+    });
+    funcs.mark_pure("list_to_set", 1);
+
+    funcs.insert_native("foldl", 3, |args, table| {
+        expect(args, 3, "foldl")?;
+        let items = match &args[2] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
+        let mut acc = args[1].clone();
+        for item in &items {
+            let fname = match &args[0] {
+                Atom::Sym(s) => s.clone(),
+                _ => return Err("foldl: first arg must be a symbol (function name)".into()),
+            };
+            let func_ref = table.get(&fname, 2)
+                .ok_or_else(|| format!("foldl: function {} with arity 2 not found", fname))?;
+            let func_ptr = match &func_ref.kind { FunctionKind::Native { func } => func.clone() };
+            drop(func_ref);
+            let mut result = func_ptr(&[acc, item.clone()], table)?;
+            acc = result.next().ok_or_else(|| "foldl: function produced no results".to_string())?;
+        }
+        Ok(NDet::single(acc))
+    });
+
+    // foldl-atom is handled as a special form in dispatch.rs via Frame::FoldlInit/FoldlAtom
+
+    funcs.insert_native("maplist", 2, |args, table| {
+        expect(args, 2, "maplist")?;
+        let items = match &args[1] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
+        let fname = match &args[0] {
+            Atom::Sym(s) => s.clone(),
+            _ => return Err("maplist: first arg must be a symbol (function name)".into()),
+        };
+        let mut results = Vec::with_capacity(items.len());
+        for item in &items {
+            let func_ref = table.get(&fname, 1)
+                .ok_or_else(|| format!("maplist: function {} with arity 1 not found", fname))?;
+            let func_ptr = match &func_ref.kind { FunctionKind::Native { func } => func.clone() };
+            drop(func_ref);
+            let mut result = func_ptr(&[item.clone()], table)?;
+            let val = result.next().ok_or_else(|| format!("maplist: function produced no results for item {}", item.to_sexpr_string()))?;
+            results.push(val);
+        }
+        Ok(NDet::single(Atom::Expr(results)))
+    });
+
+    funcs.insert_native("filter-atom", 2, |args, table| {
+        expect(args, 2, "filter-atom")?;
+        let items = match &args[1] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
+        let fname = match &args[0] {
+            Atom::Sym(s) => s.clone(),
+            _ => return Err("filter-atom: first arg must be a symbol (function name)".into()),
+        };
+        let mut results = Vec::with_capacity(items.len());
+        for item in &items {
+            let func_ref = table.get(&fname, 1)
+                .ok_or_else(|| format!("filter-atom: function {} with arity 1 not found", fname))?;
+            let func_ptr = match &func_ref.kind { FunctionKind::Native { func } => func.clone() };
+            drop(func_ref);
+            let mut result = func_ptr(&[item.clone()], table)?;
+            if let Some(val) = result.next() {
+                if val == Atom::sym("True") { results.push(item.clone()); }
+            }
+        }
+        Ok(NDet::single(Atom::Expr(results)))
+    });
+
+    funcs.insert_native("concat", 2, |args, _| {
+        expect(args, 2, "concat")?;
+        match (&args[0], &args[1]) {
+            (Atom::Expr(a), Atom::Expr(b)) => {
+                let mut out = a.clone();
+                out.extend(b.iter().cloned());
+                Ok(NDet::single(Atom::Expr(out)))
+            }
+            (Atom::Sym(a), Atom::Sym(b)) => Ok(NDet::single(Atom::sym(&format!("{a}{b}")))),
+            _ => Ok(NDet::single(Atom::sym(&format!("{}{}", args[0].to_sexpr_string(), args[1].to_sexpr_string())))),
+        }
+    });
+    funcs.mark_pure("concat", 2);
+
+    funcs.insert_native("atom_concat", 2, |args, _| {
+        expect(args, 2, "atom_concat")?;
+        Ok(NDet::single(Atom::sym(&format!("{}{}", args[0].to_sexpr_string(), args[1].to_sexpr_string()))))
+    });
+    funcs.mark_pure("atom_concat", 2);
+
+    funcs.insert_native("atom_chars", 1, |args, _| {
+        expect(args, 1, "atom_chars")?;
+        let chars: Vec<Atom> = args[0].to_sexpr_string().chars().map(|c| Atom::sym(&c.to_string())).collect();
+        Ok(NDet::single(Atom::Expr(chars)))
+    });
+    funcs.mark_pure("atom_chars", 1);
+
+    funcs.insert_native("term_hash", 1, |args, _| {
+        expect(args, 1, "term_hash")?;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        args[0].hash(&mut hasher);
+        Ok(NDet::single(Atom::Num(hasher.finish() as i128)))
+    });
+    funcs.mark_pure("term_hash", 1);
+}
