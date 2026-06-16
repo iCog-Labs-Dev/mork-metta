@@ -23,7 +23,7 @@
 /// - `par_iter` in `call_with_cloned` (pure function arg eval)
 /// - `par_iter` in `eval_data_list_par` (pure data list elements)
 /// All use Rayon's global thread pool.
-use crate::atom::Atom;
+use crate::atom::{Atom, ClosureData};
 use crate::env::Env;
 use crate::eval_parts::constrained::cartesian_product;
 use crate::eval_parts::data_list::{eval_data_list, eval_data_list_with_head};
@@ -201,6 +201,75 @@ fn definition_arg_atom(expr: &Expr, env: &Env) -> Option<Atom> {
     }
 }
 
+fn is_eval_only_param(body: &Expr, var: &str) -> bool {
+    fn walk(expr: &Expr, var: &str, seen: &mut bool, ok: &mut bool) {
+        match expr {
+            Expr::List(items)
+                if items.len() == 2
+                    && matches!(&items[0], Expr::Symbol(s) if s == "eval")
+                    && matches!(&items[1], Expr::Symbol(s) if s == var) =>
+            {
+                *seen = true;
+            }
+            Expr::List(items) => {
+                for item in items {
+                    walk(item, var, seen, ok);
+                    if !*ok {
+                        return;
+                    }
+                }
+            }
+            Expr::Symbol(s) if s == var => {
+                *seen = true;
+                *ok = false;
+            }
+            _ => {}
+        }
+    }
+
+    let mut seen = false;
+    let mut ok = true;
+    walk(body, var, &mut seen, &mut ok);
+    seen && ok
+}
+
+pub(crate) fn lazy_user_arg_mask(clauses: &[(&[Expr], &Expr)]) -> Vec<bool> {
+    let Some((patterns, _)) = clauses.first() else {
+        return Vec::new();
+    };
+    let arity = patterns.len();
+    (0..arity)
+        .map(|idx| {
+            clauses.iter().all(|(patterns, body)| {
+                patterns.len() == arity
+                    && matches!(
+                        &patterns[idx],
+                        Expr::Symbol(name)
+                            if name.starts_with('$') && is_eval_only_param(body, name)
+                    )
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn user_call_arg_needs_prepass(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::List(items)
+            if items.len() == 3
+                && matches!(&items[0], Expr::Symbol(s) if s == "=")
+                && matches!(&items[1], Expr::List(_))
+    )
+}
+
+fn delayed_user_call_arg(expr: &Expr, env: &Env) -> Atom {
+    Atom::Closure(Box::new(ClosureData {
+        params: Vec::new(),
+        body: expr.clone(),
+        env: env.clone(),
+    }))
+}
+
 pub(crate) fn eval_user_call_arg(
     expr: &Expr,
     env: &Env,
@@ -210,6 +279,19 @@ pub(crate) fn eval_user_call_arg(
         Ok(vec![atom])
     } else {
         Ok(eval(expr, env, funcs)?.collect())
+    }
+}
+
+pub(crate) fn eval_user_call_arg_slot(
+    expr: &Expr,
+    env: &Env,
+    funcs: &FnTable,
+    lazy: bool,
+) -> Result<Vec<Atom>, String> {
+    if lazy {
+        Ok(vec![delayed_user_call_arg(expr, env)])
+    } else {
+        eval_user_call_arg(expr, env, funcs)
     }
 }
 
@@ -611,9 +693,39 @@ fn try_eval_from_space_fallback(
         return Ok(None);
     }
 
+    let parsed_clauses: Vec<(Vec<Expr>, Expr)> = matches
+        .iter()
+        .filter_map(|m| match &m.atom {
+            Atom::Expr(items) if items.len() == 3 => match &items[1] {
+                Atom::Expr(head_items) if head_items.len() == args.len() + 1 => Some((
+                    head_items[1..]
+                        .iter()
+                        .map(|atom| {
+                            crate::parser::atom_to_expr(atom)
+                                .unwrap_or_else(|_| Expr::Symbol(atom.to_sexpr_string()))
+                        })
+                        .collect(),
+                    crate::parser::atom_to_expr(&items[2])
+                        .unwrap_or_else(|_| Expr::Symbol(items[2].to_sexpr_string())),
+                )),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let clause_refs: Vec<(&[Expr], &Expr)> = parsed_clauses
+        .iter()
+        .map(|(patterns, body)| (patterns.as_slice(), body))
+        .collect();
+    let lazy_mask = lazy_user_arg_mask(&clause_refs);
     let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(args.len());
-    for arg in args {
-        let vals = eval_user_call_arg(arg, env, funcs)?;
+    for (idx, arg) in args.iter().enumerate() {
+        let vals = eval_user_call_arg_slot(
+            arg,
+            env,
+            funcs,
+            lazy_mask.get(idx).copied().unwrap_or(false),
+        )?;
         if vals.is_empty() {
             return Ok(None);
         }
@@ -698,9 +810,19 @@ fn try_eval_from_space(
     };
 
     // Evaluate each argument to collect all result alternatives.
+    let clause_refs: Vec<(&[Expr], &Expr)> = clauses
+        .iter()
+        .map(|clause| (clause.patterns.as_slice(), &clause.body))
+        .collect();
+    let lazy_mask = lazy_user_arg_mask(&clause_refs);
     let mut arg_options: Vec<Vec<Atom>> = Vec::with_capacity(args.len());
-    for arg in args {
-        let vals = eval_user_call_arg(arg, env, funcs)?;
+    for (idx, arg) in args.iter().enumerate() {
+        let vals = eval_user_call_arg_slot(
+            arg,
+            env,
+            funcs,
+            lazy_mask.get(idx).copied().unwrap_or(false),
+        )?;
         if vals.is_empty() {
             return Ok(None);
         }

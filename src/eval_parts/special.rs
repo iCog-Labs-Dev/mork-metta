@@ -438,6 +438,11 @@ pub(crate) fn eval_eval(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDe
             let val = env
                 .get(s)
                 .ok_or_else(|| format!("eval: unbound variable {}", s))?;
+            if let Atom::Closure(c) = &val {
+                if c.params.is_empty() {
+                    return super::core::eval(&c.body, &c.env, funcs);
+                }
+            }
             let expr = crate::parser::atom_to_expr(&val)?;
             super::core::eval(&expr, env, funcs)
         }

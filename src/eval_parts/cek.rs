@@ -33,7 +33,7 @@
 //! the harness infrastructure is established. Later phases replace the body with
 //! the real step loop.
 
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::atom::{Atom, ClosureData};
@@ -53,6 +53,18 @@ pub(crate) type ResultSet = Vec<(Atom, Env)>;
 /// Wrap plain atoms (no constraint bindings) as a result-set.
 fn plain(atoms: Vec<Atom>) -> ResultSet {
     atoms.into_iter().map(|a| (a, Env::Empty)).collect()
+}
+
+static DEBUG_LAZY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn debug_lazy(msg: impl FnOnce() -> String) {
+    if std::env::var_os("MORK_DEBUG_LAZY").is_none() {
+        return;
+    }
+    let seen = DEBUG_LAZY_COUNT.fetch_add(1, Ordering::Relaxed);
+    if seen < 400 {
+        eprintln!("{}", msg());
+    }
 }
 
 /// Strip bindings from a result-set, keeping only the result atoms in order.
@@ -184,6 +196,7 @@ enum Head {
     User {
         name: String,
         clauses: Vec<(Vec<Expr>, Expr)>,
+        lazy_mask: Vec<bool>,
     },
 }
 
@@ -197,6 +210,9 @@ enum Frame {
         env: Env,
         /// Original list items, for the data-list fallback (empty-arg case).
         all_items: Arc<Vec<Expr>>,
+        /// Prebound args for mixed eager/lazy user calls; `None` slots are
+        /// still evaluated as CEK tasks and filled from `vals` at apply time.
+        prebound_args: Option<Vec<Option<ResultSet>>>,
     },
     /// Evaluate a list as data: cartesian over the N element result-sets,
     /// each combo wrapped in one `Atom::Expr`.
@@ -218,6 +234,13 @@ enum Frame {
     CollapseGather,
     /// `once`: keep the first sub-result, drop the rest.
     OnceCut,
+    /// `chain`: bind one pair result, then continue with the next pair or the
+    /// final expression without leaving the CEK work loop.
+    ChainBind {
+        args: Arc<Vec<Expr>>,
+        pair_index: usize,
+        env: Env,
+    },
     /// `superpose` non-list: unpack the first result if it is an `Atom::Expr`.
     SuperposeUnpack,
     /// `let`: value result-set evaluated; match the pattern per value and push
@@ -384,7 +407,18 @@ fn dispatch(
                                 let val = env
                                     .get(v)
                                     .ok_or_else(|| format!("eval: unbound variable {}", v))?;
-                                (atom_to_expr(&val)?, env.clone())
+                                match &val {
+                                    Atom::Closure(c) if c.params.is_empty() => {
+                                        debug_lazy(|| {
+                                            format!(
+                                                "force thunk: {}",
+                                                crate::parser::expr_to_atom(&c.body).to_sexpr_string()
+                                            )
+                                        });
+                                        (c.body.clone(), c.env.clone())
+                                    }
+                                    _ => (atom_to_expr(&val)?, env.clone()),
+                                }
                             }
                             other => (other.clone(), env.clone()),
                         };
@@ -455,21 +489,32 @@ fn dispatch(
                     }
 
                     // --- chain: thread (expr $var) pairs eagerly, final is a task ---
-                    "chain" => {
-                        if args.len() == 1 {
-                            work.push(Task::Eval {
-                                expr: Arc::new(args[0].clone()),
-                                env: env.clone(),
-                            });
-                            return Ok(());
-                        }
-                        let (final_expr, final_env) = cek_chain_env(args, env, funcs)?;
+                "chain" => {
+                    if args.len() == 1 {
                         work.push(Task::Eval {
-                            expr: final_expr,
-                            env: final_env,
+                            expr: Arc::new(args[0].clone()),
+                            env: env.clone(),
                         });
                         return Ok(());
                     }
+                    if args.len() < 3 || args.len() % 2 == 0 {
+                        return Err(format!(
+                            "chain: expected odd number of args (expr $var expr ...), got {}",
+                            args.len()
+                        ));
+                    }
+                    let args_arc = Arc::new(args.to_vec());
+                    work.push(Task::Apply(Frame::ChainBind {
+                        args: Arc::clone(&args_arc),
+                        pair_index: 0,
+                        env: env.clone(),
+                    }));
+                    work.push(Task::Eval {
+                        expr: Arc::new(args[0].clone()),
+                        env: env.clone(),
+                    });
+                    return Ok(());
+                }
 
                     // --- progn: AST-rewrite for let-leak, last form is a task ---
                     "progn" => return cek_progn(args, env, funcs, work),
@@ -508,7 +553,7 @@ fn dispatch(
             // Route to the constrained evaluator. Ground expressions (e.g. fib's
             // `(+ (fib (- $N 1)) ...)` where $N is bound) skip this and stay on
             // the fast iterative spine, preserving deep-recursion support.
-            if expr_has_unbound_var(expr, env) {
+            if expr_has_unbound_var(expr, env, funcs) {
                 vals.push(eval_constrained(expr, env, funcs)?);
                 return Ok(());
             }
@@ -554,15 +599,34 @@ fn dispatch_call(
     vals: &mut Vec<ResultSet>,
 ) -> Result<(), String> {
     let arity = args.len() as u8;
+    debug_lazy(|| {
+        format!(
+            "dispatch_call {} /{} args={}",
+            name,
+            arity,
+            args.iter()
+                .map(|arg| crate::parser::expr_to_atom(arg).to_sexpr_string())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        )
+    });
 
     let head = if let Some(func) = funcs.get(name, arity) {
         match &func.kind {
             FunctionKind::Native { func: f } => Some(Head::Native(Arc::clone(f))),
         }
     } else if let Some(clauses) = lookup_user_clauses(name, arity, funcs) {
+        let lazy_mask = {
+            let clause_refs: Vec<(&[Expr], &Expr)> = clauses
+                .iter()
+                .map(|(patterns, body)| (patterns.as_slice(), body))
+                .collect();
+            crate::eval_parts::core::lazy_user_arg_mask(&clause_refs)
+        };
         Some(Head::User {
             name: name.to_string(),
             clauses,
+            lazy_mask,
         })
     } else {
         None
@@ -571,35 +635,60 @@ fn dispatch_call(
     let all_items_arc = Arc::new(all_items.to_vec());
     match head {
         Some(head) => {
+            if let Head::User { lazy_mask, .. } = &head {
+                if lazy_mask.iter().any(|lazy| *lazy)
+                    || args
+                        .iter()
+                        .any(crate::eval_parts::core::user_call_arg_needs_prepass)
+                {
+                    debug_lazy(|| {
+                        format!(
+                            "user-prebind {} lazy={:?} args={}",
+                            name,
+                            lazy_mask,
+                            args.iter()
+                                .map(|arg| crate::parser::expr_to_atom(arg).to_sexpr_string())
+                                .collect::<Vec<_>>()
+                                .join(" | ")
+                        )
+                    });
+                    let mut prebound_args = vec![None; args.len()];
+                    let mut eager_indices = Vec::new();
+                    for (idx, arg) in args.iter().enumerate() {
+                        let is_lazy = lazy_mask.get(idx).copied().unwrap_or(false);
+                        if is_lazy || crate::eval_parts::core::user_call_arg_needs_prepass(arg) {
+                            prebound_args[idx] = Some(plain(
+                                crate::eval_parts::core::eval_user_call_arg_slot(
+                                    arg, env, funcs, is_lazy,
+                                )?,
+                            ));
+                        } else {
+                            eager_indices.push(idx);
+                        }
+                    }
+                    work.push(Task::Apply(Frame::Call {
+                        head,
+                        arity: args.len(),
+                        env: env.clone(),
+                        all_items: Arc::clone(&all_items_arc),
+                        prebound_args: Some(prebound_args),
+                    }));
+                    for idx in eager_indices.into_iter().rev() {
+                        work.push(Task::Eval {
+                            expr: Arc::new(args[idx].clone()),
+                            env: env.clone(),
+                        });
+                    }
+                    return Ok(());
+                }
+            }
             let frame = Frame::Call {
                 head,
                 arity: args.len(),
                 env: env.clone(),
                 all_items: Arc::clone(&all_items_arc),
+                prebound_args: None,
             };
-            if matches!(
-                &frame,
-                Frame::Call {
-                    head: Head::User { .. },
-                    ..
-                }
-            ) && args.iter().any(|arg| {
-                matches!(
-                    arg,
-                    Expr::List(items)
-                        if items.len() == 3
-                            && matches!(&items[0], Expr::Symbol(s) if s == "=")
-                            && matches!(&items[1], Expr::List(_))
-                )
-            }) {
-                for arg in args {
-                    vals.push(plain(crate::eval_parts::core::eval_user_call_arg(
-                        arg, env, funcs,
-                    )?));
-                }
-                work.push(Task::Apply(frame));
-                return Ok(());
-            }
             let parallel = crate::eval_parts::data_list::worth_parallel(args)
                 && args
                     .iter()
@@ -768,6 +857,50 @@ fn combine(
             Ok(())
         }
 
+        Frame::ChainBind {
+            args,
+            pair_index,
+            env,
+        } => {
+            let rs = pop_n(vals, 1).pop().unwrap();
+            let val = rs
+                .into_iter()
+                .next()
+                .map(|(a, _)| a)
+                .ok_or_else(|| format!("chain: expression {} produced no results", pair_index * 2))?;
+            let var = &args[pair_index * 2 + 1];
+            let var_name = match var {
+                Expr::Symbol(s) if s.starts_with('$') => s.clone(),
+                _ => {
+                    return Err(format!(
+                        "chain: arg {} must be a $variable, got {}",
+                        pair_index * 2 + 1,
+                        var.to_string()
+                    ))
+                }
+            };
+            let next_env = env.extend(&var_name, val);
+            let pairs = args.len() / 2;
+            if pair_index + 1 < pairs {
+                let next_pair = pair_index + 1;
+                work.push(Task::Apply(Frame::ChainBind {
+                    args: Arc::clone(&args),
+                    pair_index: next_pair,
+                    env: next_env.clone(),
+                }));
+                work.push(Task::Eval {
+                    expr: Arc::new(args[next_pair * 2].clone()),
+                    env: next_env,
+                });
+            } else {
+                work.push(Task::Eval {
+                    expr: Arc::new(args[args.len() - 1].clone()),
+                    env: next_env,
+                });
+            }
+            Ok(())
+        }
+
         Frame::SuperposeUnpack => {
             let rs = pop_n(vals, 1).pop().unwrap();
             let first = rs
@@ -823,8 +956,18 @@ fn combine(
             arity,
             env,
             all_items,
+            prebound_args,
         } => {
-            let arg_sets = pop_n(vals, arity);
+            let arg_sets = if let Some(prebound_args) = prebound_args {
+                let eager_count = prebound_args.iter().filter(|slot| slot.is_none()).count();
+                let mut eager_sets = pop_n(vals, eager_count).into_iter();
+                prebound_args
+                    .into_iter()
+                    .map(|slot| slot.unwrap_or_else(|| eager_sets.next().unwrap()))
+                    .collect()
+            } else {
+                pop_n(vals, arity)
+            };
             let arg_options: Vec<Vec<Atom>> = arg_sets.iter().map(atoms_of).collect();
 
             match head {
@@ -851,7 +994,11 @@ fn combine(
                     Ok(())
                 }
 
-                Head::User { name, clauses } => {
+                Head::User {
+                    name,
+                    clauses,
+                    lazy_mask: _,
+                } => {
                     // Empty arg result-set: fall back to data-list interpretation
                     // (mirrors try_eval_from_space returning Ok(None)).
                     if arg_options.iter().any(|v| v.is_empty()) {
@@ -946,10 +1093,31 @@ fn pop_n(vals: &mut Vec<ResultSet>, n: usize) -> Vec<ResultSet> {
 
 /// Does `expr` contain a `$`-variable that is not bound in `env`? Such an
 /// expression is a relational query needing binding propagation.
-fn expr_has_unbound_var(expr: &Expr, env: &Env) -> bool {
+fn expr_has_unbound_var(expr: &Expr, env: &Env, funcs: &FnTable) -> bool {
     match expr {
         Expr::Symbol(s) if s.starts_with('$') => env.get(s).is_none(),
-        Expr::List(items) => items.iter().any(|e| expr_has_unbound_var(e, env)),
+        Expr::List(items) => {
+            if let Some(Expr::Symbol(name)) = items.first() {
+                let arity = items.len().saturating_sub(1) as u8;
+                if let Some(clauses) = lookup_user_clauses(name, arity, funcs) {
+                    let lazy_mask = {
+                        let clause_refs: Vec<(&[Expr], &Expr)> = clauses
+                            .iter()
+                            .map(|(patterns, body)| (patterns.as_slice(), body))
+                            .collect();
+                        crate::eval_parts::core::lazy_user_arg_mask(&clause_refs)
+                    };
+                    return items[1..]
+                        .iter()
+                        .enumerate()
+                        .any(|(idx, arg)| {
+                            !lazy_mask.get(idx).copied().unwrap_or(false)
+                                && expr_has_unbound_var(arg, env, funcs)
+                        });
+                }
+            }
+            items.iter().any(|e| expr_has_unbound_var(e, env, funcs))
+        }
         _ => false,
     }
 }
@@ -1614,7 +1782,7 @@ fn lookup_user_clauses(name: &str, arity: u8, funcs: &FnTable) -> Option<Vec<(Ve
     }
 
     // Cache miss: query the space for `(= (name _ ...) _)` definitions.
-    eprintln!("CACHE MISS: name={}, arity={}", name, arity);
+    debug_lazy(|| format!("CACHE MISS: name={}, arity={}", name, arity));
     let mut head_patterns: Vec<crate::space::Pattern> =
         vec![crate::space::Pattern::Exact(Atom::sym(name))];
     for _ in 0..arity {
