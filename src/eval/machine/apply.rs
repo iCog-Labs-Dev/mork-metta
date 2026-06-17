@@ -627,7 +627,60 @@ pub(crate) fn apply_frame(
                                 return Ok(());
                             }
                         }
+                        // Partial application: function exists at higher arity
+                        if funcs.has_higher_arity(name, arity) {
+                            let partial_args: Vec<Atom> = arg_options.into_iter().flatten().collect();
+                            vals.push(plain(vec![
+                                Atom::Expr(vec![
+                                    Atom::sym("partial"),
+                                    Atom::Sym(name.clone()),
+                                    Atom::Expr(partial_args),
+                                ])
+                            ]));
+                            return Ok(());
+                        }
                         // Fall through to data list
+                    }
+                    Atom::Expr(items) => {
+                        // Check if this is a (partial fn-name (old-args...)) application
+                        if items.len() == 3
+                            && items[0] == Atom::sym("partial")
+                        {
+                            if let Atom::Sym(fn_name) = &items[1] {
+                                if let Atom::Expr(old_args) = &items[2] {
+                                    let arg_options: Vec<Vec<Atom>> = arg_sets.iter().map(atoms_of).collect();
+                                    if arg_options.iter().any(|values| values.is_empty()) {
+                                        vals.push(Vec::new());
+                                        return Ok(());
+                                    }
+                                    let combos = cartesian_product(&arg_options);
+                                    let mut results = Vec::new();
+                                    for combo in &combos {
+                                        let mut all_args = old_args.clone();
+                                        all_args.extend(combo.iter().cloned());
+                                        let fn_expr = crate::parser::atom_to_expr(&Atom::Sym(fn_name.clone()))
+                                            .unwrap_or(Expr::Symbol(fn_name.to_string()));
+                                        let mut call_items = vec![fn_expr];
+                                        for arg in &all_args {
+                                            call_items.push(
+                                                crate::parser::atom_to_expr(arg)
+                                                    .unwrap_or(Expr::Symbol(arg.to_sexpr_string()))
+                                            );
+                                        }
+                                        let call_expr = Expr::List(call_items);
+                                        let body_rs = super::step::run_rs(
+                                            Arc::new(call_expr),
+                                            Env::new(),
+                                            funcs,
+                                            &mut None,
+                                        )?;
+                                        results.extend(body_rs.into_iter().map(|(a, _)| a));
+                                    }
+                                    vals.push(plain(results));
+                                    return Ok(());
+                                }
+                            }
+                        }
                     }
                     Atom::Closure(c) => {
                         let clauses: Vec<(Vec<Expr>, Expr)> =
