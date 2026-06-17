@@ -1,0 +1,13 @@
+(= (range $K $N)
+   (if (< $K $N)
+       (superpose ($K (range (+ $K 1) $N)))
+       (empty)))
+
+!(let* (($k (range 0 inf))
+        ($inp (readln!))
+        ($quotedfunc (quote (= $X $Y)))
+        ($output (if (= $inp $quotedfunc)
+                        (add-atom &self $inp)
+                        (eval $inp)))
+        ($printed (println! $output)))
+       (empty))

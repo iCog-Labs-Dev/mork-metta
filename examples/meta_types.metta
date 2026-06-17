@@ -1,0 +1,6 @@
+!(test (get-metatype (foo 1 2)) Expression)
+!(test (get-metatype (a b)) Expression)
+!(test (get-metatype 1) Grounded)
+!(test (get-metatype +) Grounded)
+!(test (get-metatype $x) Variable)
+!(test (get-metatype a) Symbol)
