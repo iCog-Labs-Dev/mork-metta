@@ -40,7 +40,7 @@ pub(crate) fn eval_import(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<N
         .ok_or_else(|| "import!: space expression produced no results".to_string())?;
     // Extract path string
     let path_str = match &args[1] {
-        Expr::Symbol(s) => s.clone(),
+        Expr::Symbol(s) | Expr::Str(s) => s.clone(),
         Expr::Number(_) => return Err("import!: file path must be a symbol, not a number".into()),
         Expr::List(_) => return Err("import!: file path must be a symbol, not a list".into()),
     };

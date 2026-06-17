@@ -7,7 +7,7 @@ use crate::func::{FnTable, NDet};
 pub fn register_io_builtins(funcs: &FnTable) {
     funcs.insert_native("repr", 1, |args, _| {
         crate::builtins::arithmetic::expect_n_args(args, 1, "repr")?;
-        Ok(NDet::single(Atom::sym(&args[0].to_sexpr_string())))
+        Ok(NDet::single(Atom::str_val(&args[0].to_sexpr_string())))
     });
     funcs.mark_pure("repr", 1);
 

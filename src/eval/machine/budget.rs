@@ -25,7 +25,7 @@ pub(crate) fn atoms_of(results: &ResultSet) -> Vec<Atom> {
 /// Calculate the structural cost of an atom.
 pub fn calculate_cost(atom: &Atom) -> Option<i64> {
     match atom {
-        Atom::Sym(_) => Some(1),
+        Atom::Sym(_) | Atom::Str(_) => Some(1),
         Atom::Num(_) => Some(1),
         Atom::Expr(items) => {
             let base_cost = (items.len() as i64) * 2;

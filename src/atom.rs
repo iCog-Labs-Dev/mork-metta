@@ -5,6 +5,7 @@ use crate::parser::Expr;
 /// Every value in MeTTa is an Atom. Atoms are either:
 /// - `Num(i128)` — integer numbers (i128 handles fib(100) = 354224848179261915075)
 /// - `Sym(String)` — symbolic names (functions, variables, bare symbols)
+/// - `Str(String)` — string literals (distinct from symbols, e.g. `"hello"` vs `hello`)
 /// - `Expr(Vec<Atom>)` — S-expressions (nested lists)
 /// - `Closure { params, body, env }` — anonymous functions (|->)
 ///
@@ -14,9 +15,10 @@ use crate::parser::Expr;
 /// # Assumptions
 /// - Numbers are 128-bit signed integers (no floats, no bigints).
 /// - Symbols are Unicode strings stored as `Arc<str>` (shared, O(1) clone).
+/// - Strings are Unicode strings stored as `Arc<str>`, distinct from symbols.
 /// - `Expr` is an owned, fully-evaluated value — not a thunk or promise.
 /// - `Atom::Expr` with no elements represents the empty list `()`.
-/// - Equality is structural (recursive).
+/// - Equality is structural (recursive). Str != Sym even with same content.
 /// - Empty symbol `Sym("")` represents MeTTa's `Empty` / false / unit value.
 /// - `Closure` equality compares params, body, and captured env structurally.
 use std::sync::Arc;
@@ -34,6 +36,9 @@ pub enum Atom {
     /// A symbolic name: function names, variable names (with $ prefix), data symbols.
     /// Stored as Arc<str> so cloning is O(1) — hot paths clone symbols frequently.
     Sym(Arc<str>),
+    /// A string literal value, distinct from symbols.
+    /// `"hello"` in source → `Str("hello")`, NOT equal to symbol `hello`.
+    Str(Arc<str>),
     /// A 128-bit signed integer.
     Num(i128),
     /// An S-expression — ordered list of atoms.
@@ -46,6 +51,7 @@ impl PartialEq for Atom {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Atom::Sym(a), Atom::Sym(b)) => a == b,
+            (Atom::Str(a), Atom::Str(b)) => a == b,
             (Atom::Num(a), Atom::Num(b)) => a == b,
             (Atom::Expr(a), Atom::Expr(b)) => a == b,
             (Atom::Closure(a), Atom::Closure(b)) => a == b,
@@ -62,13 +68,17 @@ impl std::hash::Hash for Atom {
 }
 
 impl Atom {
-    /// Format an Atom as an S-expression string (for display).
+    /// Format an Atom as an S-expression string (for display and repr).
     ///
     /// # Assumptions
     /// - The result is valid MeTTa (can be re-parsed by a compliant reader).
     pub fn to_sexpr_string(&self) -> String {
         match self {
             Atom::Sym(s) => s.to_string(),
+            Atom::Str(s) => {
+                let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{}\"", escaped)
+            }
             Atom::Num(n) => n.to_string(),
             Atom::Expr(items) => {
                 let inner: Vec<String> = items.iter().map(|a| a.to_sexpr_string()).collect();
@@ -90,6 +100,11 @@ impl Atom {
             other => other,
         };
         Atom::Sym(Arc::from(canonical))
+    }
+
+    /// Convenience: create a string atom.
+    pub fn str_val(s: &str) -> Self {
+        Atom::Str(Arc::from(s))
     }
 
     /// Convenience: create a number atom.
@@ -124,6 +139,17 @@ impl Atom {
         }
     }
 
+    /// Extract the string content from a `Str` variant.
+    ///
+    /// # Errors
+    /// Returns an error description if the atom is not a string.
+    pub fn as_str_val(&self) -> Result<&str, String> {
+        match self {
+            Atom::Str(s) => Ok(s.as_ref()),
+            other => Err(format!("expected string, got {}", other.to_sexpr_string())),
+        }
+    }
+
     /// Extract the element slice from an `Expr` variant.
     ///
     /// # Errors
@@ -144,6 +170,7 @@ impl Atom {
     /// - `Expr` with any elements is always truthy (PeTTa convention).
     /// - Empty expression `Expr([])` is truthy (non-zero structure).
     /// - `Closure` is always truthy.
+    /// - Strings are always truthy.
     pub fn is_truthy(&self) -> bool {
         match self {
             Atom::Num(0) => false,

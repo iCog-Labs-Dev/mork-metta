@@ -280,7 +280,7 @@ fn is_pure_expr_inner(
 ) -> bool {
     use crate::parser::Expr;
     match expr {
-        Expr::Number(_) | Expr::Symbol(_) => true,
+        Expr::Number(_) | Expr::Symbol(_) | Expr::Str(_) => true,
         Expr::List(items) if items.is_empty() => true,
         Expr::List(items) => {
             let args_pure =

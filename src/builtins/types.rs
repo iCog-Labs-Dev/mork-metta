@@ -32,7 +32,7 @@ pub fn register_type_builtins(funcs: &FnTable) {
         crate::builtins::arithmetic::expect_n_args(args, 1, "get-metatype")?;
         let kind = match &args[0] {
             Atom::Sym(symbol) if symbol.starts_with('$') => "Variable",
-            Atom::Sym(_) | Atom::Num(_) => "Grounded",
+            Atom::Sym(_) | Atom::Num(_) | Atom::Str(_) => "Grounded",
             Atom::Expr(_) => "Expression",
             Atom::Closure(_) => "Grounded",
         };

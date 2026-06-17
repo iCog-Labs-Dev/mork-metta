@@ -34,6 +34,7 @@ impl Pattern {
         match expr {
             Expr::Symbol(s) if s.starts_with('$') => Pattern::Var(s.clone()),
             Expr::Symbol(s) => Pattern::Exact(Atom::sym(s)),
+            Expr::Str(s) => Pattern::Exact(Atom::str_val(s)),
             Expr::Number(n) => Pattern::Exact(Atom::Num(*n)),
             Expr::List(items) => Pattern::Expr(items.iter().map(Self::from_expr).collect()),
         }

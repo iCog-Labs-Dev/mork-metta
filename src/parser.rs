@@ -32,6 +32,8 @@ pub enum TopForm {
 pub enum Expr {
     /// A symbolic token: `fib`, `$N`, `+`, `if`, `=`
     Symbol(String),
+    /// A string literal: `"hello"`, `"foo bar"`
+    Str(String),
     /// An integer literal: `30`, `-1`, `354224848179261915075`
     Number(i128),
     /// A parenthesized list: `(fib 30)`, `(+ $N 1)`
@@ -43,6 +45,10 @@ impl Expr {
     pub fn to_string(&self) -> String {
         match self {
             Expr::Symbol(s) => s.clone(),
+            Expr::Str(s) => {
+                let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{}\"", escaped)
+            }
             Expr::Number(n) => n.to_string(),
             Expr::List(items) => {
                 let inner: Vec<String> = items.iter().map(|e| e.to_string()).collect();
@@ -63,6 +69,7 @@ impl Expr {
 pub fn expr_to_atom(expr: &Expr) -> Atom {
     match expr {
         Expr::Symbol(s) => Atom::sym(s),
+        Expr::Str(s) => Atom::str_val(s),
         Expr::Number(n) => Atom::Num(*n),
         Expr::List(items) => Atom::Expr(items.iter().map(expr_to_atom).collect()),
     }
@@ -83,6 +90,7 @@ pub fn expr_to_atom(expr: &Expr) -> Atom {
 pub fn atom_to_expr(atom: &Atom) -> Result<Expr, String> {
     match atom {
         Atom::Sym(s) => Ok(Expr::Symbol(s.to_string())),
+        Atom::Str(s) => Ok(Expr::Str(s.to_string())),
         Atom::Num(n) => Ok(Expr::Number(*n)),
         Atom::Expr(items) => {
             let mut exprs = Vec::with_capacity(items.len());
@@ -170,9 +178,8 @@ pub(crate) fn parse_sexpr_body(chars: &mut std::iter::Peekable<std::str::Chars<'
                 items.push(sub);
             }
             Some(&'"') => {
-                // Quoted string literal: always a symbol, never a number
                 let token = read_token(chars);
-                items.push(Expr::Symbol(token));
+                items.push(Expr::Str(token));
             }
             Some(&_) => {
                 let token = read_token(chars);
@@ -196,8 +203,22 @@ fn read_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
         chars.next(); // consume opening "
         while let Some(&c) = chars.peek() {
             if c == '"' {
-                chars.next(); // consume closing "
+                chars.next();
                 break;
+            }
+            if c == '\\' {
+                chars.next();
+                if let Some(&esc) = chars.peek() {
+                    chars.next();
+                    match esc {
+                        '"' => s.push('"'),
+                        '\\' => s.push('\\'),
+                        'n' => s.push('\n'),
+                        't' => s.push('\t'),
+                        other => { s.push('\\'); s.push(other); }
+                    }
+                }
+                continue;
             }
             s.push(c);
             chars.next();

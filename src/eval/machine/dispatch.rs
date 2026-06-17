@@ -108,6 +108,10 @@ pub(crate) fn dispatch_expr(
             vals.push(plain(vec![atom]));
             Ok(())
         }
+        Expr::Str(s) => {
+            vals.push(plain(vec![crate::atom::Atom::str_val(s)]));
+            Ok(())
+        }
         Expr::List(items) => {
             if items.is_empty() {
                 vals.push(plain(vec![crate::atom::Atom::Expr(Vec::new())]));
@@ -202,15 +206,7 @@ pub(crate) fn dispatch_expr(
                         ))]));
                         return Ok(());
                     }
-                    "repr" => {
-                        if args.len() != 1 {
-                            return Err(format!("repr: expected 1 arg, got {}", args.len()));
-                        }
-                        vals.push(plain(vec![crate::eval::forms::immediate::repr_expr(
-                            &args[0],
-                        )]));
-                        return Ok(());
-                    }
+
                     "empty" => {
                         vals.push(Vec::new());
                         return Ok(());
