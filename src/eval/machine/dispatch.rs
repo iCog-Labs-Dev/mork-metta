@@ -108,6 +108,10 @@ pub(crate) fn dispatch_expr(
             vals.push(plain(vec![atom]));
             Ok(())
         }
+        Expr::Str(s) => {
+            vals.push(plain(vec![crate::atom::Atom::str_val(s)]));
+            Ok(())
+        }
         Expr::List(items) => {
             if items.is_empty() {
                 vals.push(plain(vec![crate::atom::Atom::Expr(Vec::new())]));
@@ -202,6 +206,7 @@ pub(crate) fn dispatch_expr(
                         ))]));
                         return Ok(());
                     }
+
                     "empty" => {
                         vals.push(Vec::new());
                         return Ok(());

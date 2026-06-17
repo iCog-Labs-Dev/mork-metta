@@ -63,6 +63,10 @@ pub(crate) fn try_match_one(
                 atom.clone(),
             ))),
         },
+        Expr::Str(s) => match atom {
+            Atom::Str(value) if s.as_str() == value.as_ref() => Ok(Some(env.clone())),
+            _ => Ok(None),
+        },
         Expr::Number(number) => match atom {
             Atom::Num(value) if number == value => Ok(Some(env.clone())),
             // Free variable from term conversion: bind to the literal number.

@@ -14,6 +14,7 @@ use crate::parser::{atom_to_expr, Expr};
 pub(crate) fn subst_and_atomize(expr: &Expr, env: &Env) -> Atom {
     match expr {
         Expr::Number(number) => Atom::Num(*number),
+        Expr::Str(s) => Atom::str_val(s),
         Expr::Symbol(symbol) if symbol.starts_with('$') => {
             crate::eval::shared::env::lookup(env, symbol).unwrap_or_else(|| Atom::sym(symbol))
         }
