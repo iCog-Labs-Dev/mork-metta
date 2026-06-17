@@ -59,14 +59,22 @@ for metta_file in "$EXAMPLES_DIR"/*.metta; do
 
 	printf "RUN   %-50s" "$(basename "$metta_file")"
 	if output=$($BINARY "$metta_file" 2>&1); then
-		echo "ok"
-		((PASS++)) || true
+		if grep -q "❌" <<<"$output"; then
+			echo "FAIL"
+			echo "$output" | sed -n '/❌/p' | sed 's/^/      /'
+			FAILED_FILES+=("$(basename "$metta_file")")
+			((FAIL++)) || true
+		else
+			echo "ok"
+			((PASS++)) || true
+		fi
 	else
 		echo "FAIL"
 		echo "      $output" | head -5
 		FAILED_FILES+=("$(basename "$metta_file")")
 		((FAIL++)) || true
 	fi
+
 done
 
 echo ""
