@@ -202,15 +202,6 @@ pub(crate) fn dispatch_expr(
                         ))]));
                         return Ok(());
                     }
-                    "repr" => {
-                        if args.len() != 1 {
-                            return Err(format!("repr: expected 1 arg, got {}", args.len()));
-                        }
-                        vals.push(plain(vec![crate::eval::forms::immediate::repr_expr(
-                            &args[0],
-                        )]));
-                        return Ok(());
-                    }
                     "empty" => {
                         vals.push(Vec::new());
                         return Ok(());
@@ -613,6 +604,26 @@ pub(crate) fn dispatch_expr(
                     for index in eager_indices.into_iter().rev() {
                         work.push(Task::Eval {
                             expr: Arc::new(args[index].clone()),
+                            env: env.clone(),
+                        });
+                    }
+                    return Ok(());
+                }
+
+                // Partial application: function exists at higher arity.
+                if funcs.has_higher_arity(head, args.len()) {
+                    let n_args = args.len();
+                    work.push(Task::Apply(Frame::ApplyHead {
+                        arity: n_args,
+                        env: env.clone(),
+                    }));
+                    work.push(Task::Eval {
+                        expr: Arc::new(items[0].clone()),
+                        env: env.clone(),
+                    });
+                    for arg in args.iter().rev() {
+                        work.push(Task::Eval {
+                            expr: Arc::new(arg.clone()),
                             env: env.clone(),
                         });
                     }
