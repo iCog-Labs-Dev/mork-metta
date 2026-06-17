@@ -51,11 +51,17 @@ pub fn collect_match_results(
             if symbol == "," {
                 let mut bindings_sets: Vec<Vec<(String, Atom)>> = vec![Vec::new()];
                 for subpattern in &items[1..] {
-                    let submatches = collect_match_results(funcs, space_ref, subpattern, env)?;
                     let mut next = Vec::new();
                     for bindings in &bindings_sets {
+                        // Propagate current bindings into subpattern before querying.
+                        // Bound vars become ground terms → trie does direct lookup O(1)
+                        // instead of full scan O(n).
+                        let bound_env = crate::eval::shared::env::bind_all(env, bindings);
+                        let submatches =
+                            collect_match_results(funcs, space_ref, subpattern, &bound_env)?;
                         for matched in &submatches {
-                            if let Some(merged) = merge_match_bindings(bindings, &matched.bindings)
+                            if let Some(merged) =
+                                merge_match_bindings(bindings, &matched.bindings)
                             {
                                 next.push(merged);
                             }

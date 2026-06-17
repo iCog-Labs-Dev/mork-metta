@@ -2,6 +2,7 @@
 
 use crate::atom::Atom;
 use crate::func::{FnTable, FunctionKind, NDet};
+use std::collections::HashMap;
 
 fn expect(args: &[Atom], n: usize, name: &str) -> Result<(), String> {
     crate::builtins::arithmetic::expect_n_args(args, n, name)
@@ -322,13 +323,10 @@ pub fn register_collection_builtins(funcs: &FnTable) {
 
     funcs.insert_native("union-atom", 2, |args, _| {
         expect(args, 2, "union-atom")?;
-        let items1 = match &args[0] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
+        let mut items1 = match &args[0] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
         let items2 = match &args[1] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
-        let mut result = items1;
-        for item in items2 {
-            if !result.contains(&item) { result.push(item); }
-        }
-        Ok(NDet::single(Atom::Expr(result)))
+        items1.extend(items2);
+        Ok(NDet::single(Atom::Expr(items1)))
     });
     funcs.mark_pure("union-atom", 2);
 
@@ -336,9 +334,18 @@ pub fn register_collection_builtins(funcs: &FnTable) {
         expect(args, 2, "intersection-atom")?;
         let items1 = match &args[0] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
         let items2 = match &args[1] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
+        let mut count2 = HashMap::new();
+        for item in &items2 {
+            *count2.entry(item.clone()).or_insert(0usize) += 1;
+        }
         let mut result = Vec::new();
         for item in &items1 {
-            if items2.contains(item) && !result.contains(item) { result.push(item.clone()); }
+            if let Some(c) = count2.get_mut(item) {
+                if *c > 0 {
+                    result.push(item.clone());
+                    *c -= 1;
+                }
+            }
         }
         Ok(NDet::single(Atom::Expr(result)))
     });
@@ -348,7 +355,23 @@ pub fn register_collection_builtins(funcs: &FnTable) {
         expect(args, 2, "subtraction-atom")?;
         let items1 = match &args[0] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
         let items2 = match &args[1] { Atom::Expr(v) => v.clone(), other => vec![other.clone()] };
-        let result: Vec<Atom> = items1.into_iter().filter(|x| !items2.contains(x)).collect();
+        let mut count2 = HashMap::new();
+        for item in &items2 {
+            *count2.entry(item.clone()).or_insert(0usize) += 1;
+        }
+        let mut result = Vec::new();
+        for item in items1 {
+            if let Some(c) = count2.get_mut(&item) {
+                if *c > 0 {
+                    *c -= 1;
+                    // skip — this occurrence consumed by subtraction
+                } else {
+                    result.push(item);
+                }
+            } else {
+                result.push(item);
+            }
+        }
         Ok(NDet::single(Atom::Expr(result)))
     });
     funcs.mark_pure("subtraction-atom", 2);
