@@ -51,11 +51,19 @@ pub(crate) fn match_clause(
         return None;
     }
 
+    let args_str: Vec<String> = args.iter().map(|a| a.to_sexpr_string()).collect();
+    let pats_str: Vec<String> = patterns.iter().map(|p| format!("{:?}", p)).collect();
+
     let mut unification_env = Env::new();
-    for (pattern, arg) in patterns.iter().zip(args.iter()) {
+    for (i, (pattern, arg)) in patterns.iter().zip(args.iter()).enumerate() {
         match crate::eval::shared::pattern::try_match_one(pattern, arg, &unification_env, funcs) {
             Ok(Some(new_env)) => unification_env = new_env,
-            _ => return None,
+            Ok(None) => {
+                return None;
+            }
+            Err(e) => {
+                return None;
+            }
         }
     }
 

@@ -584,16 +584,16 @@ pub(crate) fn dispatch_expr(
                     let mut eager_indices = Vec::new();
                     for (index, arg) in args.iter().enumerate() {
                         if lazy_mask.get(index).copied().unwrap_or(false) {
+                            // Lazy: wrap in closure so the unevaluated expression
+                            // is preserved for structural pattern matching
+                            // (e.g., (== $A $B) or (eval $A)).
                             prebound_args.push(Some(plain(vec![
                                 crate::eval::forms::query::delayed_user_call_arg(arg, env),
                             ])));
                         } else if let Some(atom) =
                             crate::eval::shared::closure::definition_arg_atom(arg, env)
                         {
-                            // Preserve (= head body) as a data atom — do not
-                            // evaluate = as equality (it would reduce to False
-                            // since head ≠ body). This is how add-reduct and
-                            // friends receive definition expressions as args.
+                            // Preserve (= head body) or (quote ...) as data atom
                             prebound_args.push(Some(plain(vec![atom])));
                         } else {
                             prebound_args.push(None);
