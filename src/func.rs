@@ -245,6 +245,23 @@ impl FnTable {
         }
     }
 
+    /// Check if the given name has a function registered at a higher arity than `given`.
+    pub fn has_higher_arity(&self, name: &str, given: usize) -> bool {
+        // Check native functions
+        if let Some(inner) = self.map.read().unwrap().get(name) {
+            if inner.keys().any(|&a| a as usize > given) {
+                return true;
+            }
+        }
+        // Check user functions
+        if let Some(inner) = self.fn_cache.read().unwrap().get(name) {
+            if inner.keys().any(|&a| a as usize > given) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Check if a named function is pure at the given arity.
     /// Returns `false` if the function is not found (conservative).
     pub fn is_pure(&self, name: &str, arity: u8) -> bool {
