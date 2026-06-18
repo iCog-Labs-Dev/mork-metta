@@ -64,16 +64,30 @@ pub trait Space: Send + Sync {
     fn description(&self) -> &str;
 }
 
+// Per-thread encode buffer. Avoids a shared lock during the encode phase so
+// multiple threads can each parse queries without contending on a single buffer.
+thread_local! {
+    static ENCODE_BUF: std::cell::RefCell<Vec<u8>> =
+        std::cell::RefCell::new(vec![0u8; 1 << 16]);
+}
+
+// Per-thread encode buffer: each thread encodes its own query pattern without
+// contending on a shared buffer, while the trie itself is read concurrently.
+thread_local! {
+    static MORK_SPACE_ENCODE_BUF: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub struct MorkSpace {
-    inner: std::sync::Mutex<mork::space::Space<mork::weightedsweep::UnitHeader>>,
-    encode_buf: std::sync::Mutex<Vec<u8>>,
+    /// RwLock: ArenaCompactTree is now Sync (Cell moved to zipper), so concurrent
+    /// reads are safe. Only add_atom/remove_atom take the write lock.
+    inner: std::sync::RwLock<mork::space::Space<mork::weightedsweep::UnitHeader>>,
 }
 
 impl MorkSpace {
     pub fn new() -> Self {
         MorkSpace {
-            inner: std::sync::Mutex::new(mork::space::Space::new()),
-            encode_buf: std::sync::Mutex::new(vec![0u8; 1 << 16]),
+            inner: std::sync::RwLock::new(mork::space::Space::new()),
         }
     }
 
@@ -100,52 +114,66 @@ impl MorkSpace {
 impl Space for MorkSpace {
     fn add_atom(&self, atom: &Atom) -> Result<(), String> {
         let sexpr = atom.to_sexpr_string();
-        let mut buf = self.encode_buf.lock().unwrap();
-        let mut inner = self.inner.lock().unwrap();
-        let len = Self::encode_into(&mut buf, &mut inner, &sexpr)?;
-        inner.btm.insert(&buf[..len], Default::default());
-        Ok(())
+        MORK_SPACE_ENCODE_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            let mut inner = self.inner.write().unwrap();
+            let len = Self::encode_into(&mut buf, &mut inner, &sexpr)?;
+            inner.btm.insert(&buf[..len], Default::default());
+            Ok(())
+        })
     }
 
     fn remove_atom(&self, atom: &Atom) -> Result<bool, String> {
         let sexpr = atom.to_sexpr_string();
-        let mut buf = self.encode_buf.lock().unwrap();
-        let mut inner = self.inner.lock().unwrap();
-        let len = Self::encode_into(&mut buf, &mut inner, &sexpr)?;
-        Ok(inner.btm.remove(&buf[..len]).is_some())
+        MORK_SPACE_ENCODE_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            let mut inner = self.inner.write().unwrap();
+            let len = Self::encode_into(&mut buf, &mut inner, &sexpr)?;
+            Ok(inner.btm.remove(&buf[..len]).is_some())
+        })
     }
 
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
         if let Some(atom) = pattern.as_ground_atom() {
             let sexpr = atom.to_sexpr_string();
-            let mut buf = self.encode_buf.lock().unwrap();
-            let mut inner = self.inner.lock().unwrap();
-            let len = match Self::encode_into(&mut buf, &mut inner, &sexpr) {
-                Ok(l) => l,
-                Err(_) => return vec![],
-            };
-            return if inner.btm.get_val_at(&buf[..len]).is_some() {
-                vec![MatchResult {
-                    atom,
-                    bindings: vec![],
-                }]
+            // Phase 1: encode (write lock, parse_sexpr needs &mut Space).
+            let encoded: Vec<u8> = MORK_SPACE_ENCODE_BUF.with(|cell| {
+                let mut buf = cell.borrow_mut();
+                let mut inner = self.inner.write().unwrap();
+                match Self::encode_into(&mut buf, &mut inner, &sexpr) {
+                    Ok(len) => buf[..len].to_vec(),
+                    Err(_) => vec![],
+                }
+            });
+            if encoded.is_empty() { return vec![]; }
+            // Phase 2: lookup (read lock, concurrent with other readers).
+            let inner = self.inner.read().unwrap();
+            return if inner.btm.get_val_at(&encoded).is_some() {
+                vec![MatchResult { atom, bindings: vec![] }]
             } else {
                 vec![]
             };
         }
 
         let query_sexpr = pattern_to_query_sexpr(pattern);
-        let mut buf = self.encode_buf.lock().unwrap();
-        let mut inner = self.inner.lock().unwrap();
-        let prefix: &[u8] = match inner.parse_sexpr(query_sexpr.as_bytes(), buf.as_mut_ptr()) {
-            Ok((e, _len)) => match e.prefix() {
-                Ok(p) | Err(p) => unsafe { &*p },
-            },
-            Err(_) => &[],
-        };
+        // Phase 1: encode prefix (write lock, short duration).
+        let prefix_bytes: Vec<u8> = MORK_SPACE_ENCODE_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            let cap = query_sexpr.len() * 8 + 64;
+            if cap > buf.len() { buf.resize(cap, 0); }
+            let mut inner = self.inner.write().unwrap();
+            match inner.parse_sexpr(query_sexpr.as_bytes(), buf.as_mut_ptr()) {
+                Ok((e, _len)) => match e.prefix() {
+                    Ok(p) | Err(p) => unsafe { &*p }.to_vec(),
+                },
+                Err(_) => vec![],
+            }
+        });
 
+        // Phase 2: traverse (read lock — concurrent with other readers).
+        let inner = self.inner.read().unwrap();
         let mut results = Vec::new();
-        let mut z = inner.btm.read_zipper_at_path(prefix);
+        let mut z = inner.btm.read_zipper_at_path(&prefix_bytes);
         while z.to_next_val() {
             if let Some(stored) = decode_expr_bytes(z.origin_path()) {
                 if let Some(mr) = match_one(pattern, &stored) {
@@ -154,7 +182,7 @@ impl Space for MorkSpace {
             }
         }
 
-        if results.is_empty() && !prefix.is_empty() {
+        if results.is_empty() && !prefix_bytes.is_empty() {
             let mut z = inner.btm.read_zipper();
             while z.to_next_val() {
                 if let Some(stored) = decode_expr_bytes(z.origin_path()) {
@@ -169,7 +197,7 @@ impl Space for MorkSpace {
     }
 
     fn get_atoms(&self) -> Vec<Atom> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         let mut out = Vec::new();
         let mut z = inner.btm.read_zipper();
         while z.to_next_val() {

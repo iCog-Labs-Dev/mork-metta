@@ -20,7 +20,7 @@ pub struct TransactionSnapshot {
     /// Cached user clause lookup results.
     pub fn_cache: HashMap<String, HashMap<u8, Vec<crate::func::Clause>>>,
     /// Cached function purity results.
-    pub fn_purity: HashMap<String, HashMap<u8, bool>>,
+    pub fn_effect: HashMap<String, HashMap<u8, crate::func::Effect>>,
 }
 
 /// Add an atom to a resolved space.
@@ -131,14 +131,14 @@ pub fn snapshot_transaction_state(funcs: &FnTable) -> TransactionSnapshot {
         .collect();
     let state = funcs.state.lock().unwrap().clone();
     let fn_cache = funcs.fn_cache.read().unwrap().clone();
-    let fn_purity = funcs.fn_purity.read().unwrap().clone();
+    let fn_effect = funcs.fn_effect.read().unwrap().clone();
 
     TransactionSnapshot {
         self_atoms,
         named_space_atoms,
         state,
         fn_cache,
-        fn_purity,
+        fn_effect,
     }
 }
 
@@ -162,7 +162,7 @@ pub fn restore_transaction_state(
         named_space_atoms,
         state,
         fn_cache,
-        fn_purity,
+        fn_effect,
     } = snapshot;
 
     *funcs.space.write().unwrap() = rebuild_space(&self_atoms)?;
@@ -174,6 +174,6 @@ pub fn restore_transaction_state(
     *funcs.named_spaces.lock().unwrap() = named_spaces;
     *funcs.state.lock().unwrap() = state;
     *funcs.fn_cache.write().unwrap() = fn_cache;
-    *funcs.fn_purity.write().unwrap() = fn_purity;
+    *funcs.fn_effect.write().unwrap() = fn_effect;
     Ok(())
 }

@@ -75,7 +75,36 @@ pub enum FunctionKind {
 pub struct Function {
     pub name: String,
     pub kind: FunctionKind,
-    pub pure: bool,
+    pub effect: Effect,
+}
+
+/// Declares what kind of knowledge-base access a native function performs.
+/// Aligned to the MeTTa spec's structural rule distinction:
+///   - QUERY (match) reads `k` but doesn't mutate it  → SpaceRead
+///   - ADDATOM / REMATOM mutate `k`                   → SpaceMutate
+///   - Arithmetic / control / pure rewriting           → Pure
+///
+/// Used for memoization decisions, parallelism guards, and transitively
+/// propagating purity through user-defined functions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Effect {
+    /// No KB access. Safe to memoize and run in parallel branches.
+    Pure,
+    /// Reads KB (e.g. match). Safe to parallelize; memoizable only with stamp guard.
+    SpaceRead,
+    /// Mutates KB (add-atom, remove-atom) or performs IO. Neither memoizable nor parallelizable.
+    SpaceMutate,
+}
+
+impl Effect {
+    /// Return the more restrictive of two effects (Pure < SpaceRead < SpaceMutate).
+    pub fn max(self, other: Effect) -> Effect {
+        match (self, other) {
+            (Effect::SpaceMutate, _) | (_, Effect::SpaceMutate) => Effect::SpaceMutate,
+            (Effect::SpaceRead, _) | (_, Effect::SpaceRead) => Effect::SpaceRead,
+            _ => Effect::Pure,
+        }
+    }
 }
 
 /// Two-level function map: name → (arity → Function).
@@ -97,7 +126,7 @@ pub struct FnTable {
     /// recomputed on redefinition (self-evolution-stable). Drives the *only*
     /// sound parallelization decision: a function is parallel-safe iff it (and
     /// everything it calls) performs no space access and no IO. Absent ⇒ impure.
-    pub fn_purity: RwLock<HashMap<String, HashMap<u8, bool>>>,
+    pub fn_effect: RwLock<HashMap<String, HashMap<u8, Effect>>>,
     /// Directory of the file currently being loaded (load-time only).
     pub import_dir: Mutex<PathBuf>,
     /// Incremented on every add-atom/remove-atom. Memo cache entries tagged
@@ -114,7 +143,7 @@ impl FnTable {
             space: RwLock::new(Box::new(crate::space::MorkSpace::new())),
             named_spaces: Mutex::new(HashMap::new()),
             fn_cache: RwLock::new(HashMap::new()),
-            fn_purity: RwLock::new(HashMap::new()),
+            fn_effect: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
             import_dir: Mutex::new(PathBuf::from(".")),
             memo_stamp: AtomicU64::new(0),
@@ -128,7 +157,7 @@ impl FnTable {
             space: RwLock::new(space),
             named_spaces: Mutex::new(HashMap::new()),
             fn_cache: RwLock::new(HashMap::new()),
-            fn_purity: RwLock::new(HashMap::new()),
+            fn_effect: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
             import_dir: Mutex::new(PathBuf::from(".")),
             memo_stamp: AtomicU64::new(0),
@@ -152,7 +181,7 @@ impl FnTable {
                     kind: FunctionKind::Native {
                         func: Arc::new(func),
                     },
-                    pure: false,
+                    effect: Effect::SpaceMutate,
                 }),
             );
     }
@@ -166,7 +195,7 @@ impl FnTable {
             .and_then(|inner| inner.get_mut(&arity))
             .and_then(|a| Arc::get_mut(a))
         {
-            arc_func.pure = true;
+            arc_func.effect = Effect::Pure;
         }
     }
 
@@ -213,10 +242,10 @@ impl FnTable {
 
     pub fn cache_fn(&self, name: &str, arity: u8, clause: Clause) {
         // Compute space-free purity BEFORE taking the cache write lock: the
-        // analysis reads fn_cache/fn_purity, so locking first would deadlock.
+        // analysis reads fn_cache/fn_effect, so locking first would deadlock.
         // Self-recursion is optimistically pure, so directly recursive pure
         // functions (e.g. fib) stay parallelizable.
-        let clause_pure =
+        let clause_effect =
             is_pure_expr_assuming(&clause.body, self, name);
 
         {
@@ -236,21 +265,21 @@ impl FnTable {
             clauses.push(clause);
         }
 
-        // A function is parallel-safe only if EVERY clause is pure.
-        let mut purity = self.fn_purity.write().unwrap();
-        let entry = purity
+        // Most restrictive clause wins: SpaceMutate beats SpaceRead beats Pure.
+        let mut effects = self.fn_effect.write().unwrap();
+        let entry = effects
             .entry(name.to_string())
             .or_insert_with(HashMap::new)
             .entry(arity)
-            .or_insert(true);
-        *entry = *entry && clause_pure;
+            .or_insert(Effect::Pure);
+        *entry = entry.max(clause_effect);
     }
 
     pub fn uncache_fn(&self, name: &str, arity: u8) {
         if let Some(inner) = self.fn_cache.write().unwrap().get_mut(name) {
             inner.remove(&arity);
         }
-        if let Some(inner) = self.fn_purity.write().unwrap().get_mut(name) {
+        if let Some(inner) = self.fn_effect.write().unwrap().get_mut(name) {
             inner.remove(&arity);
         }
     }
@@ -297,13 +326,19 @@ impl FnTable {
     }
 
     /// True if the named function at the given arity is marked pure.
+    /// Return the registered Effect for a native function, or None if not found.
+    pub fn effect_of(&self, name: &str, arity: u8) -> Option<Effect> {
+        self.get(name, arity).map(|f| f.effect)
+    }
+
     pub fn is_pure_fn(&self, name: &str, arity: u8) -> bool {
-        self.fn_purity
+        self.fn_effect
             .read()
             .unwrap()
             .get(name)
-            .and_then(|m| m.get(&arity))
+            .and_then(|m: &HashMap<u8, Effect>| m.get(&arity))
             .copied()
+            .map(|e| e == Effect::Pure)
             .unwrap_or(false)
     }
 
@@ -313,7 +348,7 @@ impl FnTable {
         // Native builtins carry an authoritative space-free purity flag.
         if let Some(inner) = self.map.read().unwrap().get(name) {
             if let Some(f) = inner.get(&arity) {
-                return f.pure;
+                return f.effect == Effect::Pure;
             }
         }
         // User-defined functions: purity computed at definition time (sound and
@@ -321,17 +356,35 @@ impl FnTable {
         // space are treated as impure — never parallelized on an unproven
         // assumption. (A cache miss still dispatches correctly via the space
         // fallback; it just runs sequentially.)
-        self.fn_purity
+        self.fn_effect
             .read()
             .unwrap()
             .get(name)
             .and_then(|inner| inner.get(&arity))
             .copied()
+            .map(|e| e == Effect::Pure)
+            .unwrap_or(false)
+    }
+
+    /// True if this function is safe to run in parallel (Pure or SpaceRead).
+    pub fn is_parallelizable(&self, name: &str, arity: u8) -> bool {
+        if let Some(inner) = self.map.read().unwrap().get(name) {
+            if let Some(f) = inner.get(&arity) {
+                return f.effect != Effect::SpaceMutate;
+            }
+        }
+        self.fn_effect
+            .read()
+            .unwrap()
+            .get(name)
+            .and_then(|inner| inner.get(&arity))
+            .copied()
+            .map(|e| e != Effect::SpaceMutate)
             .unwrap_or(false)
     }
 }
 
-fn is_pure_expr_assuming(expr: &crate::parser::Expr, funcs: &FnTable, self_name: &str) -> bool {
+fn is_pure_expr_assuming(expr: &crate::parser::Expr, funcs: &FnTable, self_name: &str) -> Effect {
     is_pure_expr_inner(expr, funcs, Some(self_name))
 }
 
@@ -339,30 +392,46 @@ fn is_pure_expr_inner(
     expr: &crate::parser::Expr,
     funcs: &FnTable,
     assume_pure: Option<&str>,
-) -> bool {
+) -> Effect {
     use crate::parser::Expr;
     match expr {
-        Expr::Number(_) | Expr::Symbol(_) | Expr::Str(_) => true,
-        Expr::List(items) if items.is_empty() => true,
+        Expr::Number(_) | Expr::Symbol(_) | Expr::Str(_) => Effect::Pure,
+        Expr::List(items) if items.is_empty() => Effect::Pure,
         Expr::List(items) => {
-            let args_pure =
-                || items[1..].iter().all(|e| is_pure_expr_inner(e, funcs, assume_pure));
+            let args_effect =
+                || items[1..].iter()
+                    .map(|e| is_pure_expr_inner(e, funcs, assume_pure))
+                    .fold(Effect::Pure, Effect::max);
             if let Expr::Symbol(s) = &items[0] {
+                // Dispatch-level special forms not in the fn table.
                 match s.as_str() {
-                    "quote" | "superpose" | "empty" | "repr" | "|->" | "once" => true,
-                    "if" | "progn" | "prog1" | "let" | "let*" | "chain" | "collapse" => args_pure(),
+                    // Unconditionally pure: never evaluate their argument or body.
+                    "quote" | "|->" | "empty" => Effect::Pure,
+                    // Effect = max of all argument effects.
+                    "if" | "progn" | "prog1" | "let" | "let*" | "chain" | "collapse"
+                    | "superpose" | "once" => args_effect(),
+                    // SpaceRead: reads `k` (QUERY rule in spec) but never mutates it.
+                    // RwLock allows concurrent readers → parallelizable.
+                    "match" | "case" => Effect::SpaceRead,
+                    // SpaceMutate: ADDATOM/REMATOM in spec, forced re-eval, or IO.
                     "eval" | "call" | "reduce" | "assert" | "transform" | "add-atom"
-                    | "remove-atom" | "match" | "with_mutex" | "transaction" | "import!"
-                    | "readln!" | "println!" | "case" | "foldall" | "map-atom" | "forall"
-                    | "within" | "py-call" | "import-rs!" => false,
+                    | "remove-atom" | "with_mutex" | "transaction" | "import!"
+                    | "foldall" | "map-atom" | "forall" | "within" | "py-call"
+                    | "import-rs!" => Effect::SpaceMutate,
                     _ => {
-                        let callee_pure = assume_pure == Some(s.as_str())
-                            || funcs.is_pure(s, (items.len() - 1) as u8);
-                        callee_pure && args_pure()
+                        // Registered natives: look up their declared Effect.
+                        // Self-recursion: optimistically Pure to avoid infinite loop.
+                        let callee_effect = if assume_pure == Some(s.as_str()) {
+                            Effect::Pure
+                        } else {
+                            funcs.effect_of(s, (items.len() - 1) as u8)
+                                .unwrap_or(Effect::SpaceMutate) // unknown = conservative
+                        };
+                        callee_effect.max(args_effect())
                     }
                 }
             } else {
-                false
+                Effect::SpaceMutate // non-symbol head = dynamic dispatch = conservative
             }
         }
     }
