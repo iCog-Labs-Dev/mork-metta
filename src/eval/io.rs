@@ -165,67 +165,172 @@ pub(crate) fn resolve_import_path(path_str: &str, import_dir: &Path) -> Option<P
     None
 }
 
-/// Stream-load a `.metta` file: parse one balanced form at a time and process
-/// it immediately, so only O(1-form) memory is used regardless of file size.
+/// Load a `.metta` file: read entire file at once, scan bytes for form
+/// boundaries, slice out each form and dispatch — no per-line allocation.
 ///
-/// Returns the first result of the last runnable form, or `None` if the file
-/// ends with a definition (matching the semantics of `load_form`).
+/// Fast path: non-`=` data facts bypass `Expr` entirely — parsed directly to
+/// `Atom` via `parse_atom_bytes` and inserted with no intermediate allocation.
+/// Slow path: runnables and `(= ...)` definitions still use `process_form` →
+/// `Expr` → `compile_definition` so the fn_cache is populated correctly.
 pub fn load_metta_file(path: &Path, env: &Env, funcs: &FnTable) -> Result<Vec<Atom>, String> {
-    use std::io::{BufRead, BufReader};
-    let file = std::fs::File::open(path)
+    let content = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot open '{}': {}", path.display(), e))?;
-    let mut form_buf = String::with_capacity(256);
-    let mut depth: i32 = 0;
-    let mut saw_bang = false;
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut pos = 0;
+    let mut line_no = 1usize;
     let mut results: Vec<Atom> = Vec::new();
-    for (line_no, line_result) in BufReader::new(file).lines().enumerate() {
-        let line = line_result.map_err(|e| {
-            format!(
-                "read error at line {} in '{}': {}",
-                line_no + 1,
+
+    while pos < n {
+        skip_file_ws(bytes, &mut pos, &mut line_no);
+        if pos >= n {
+            break;
+        }
+
+        let saw_bang = bytes[pos] == b'!';
+        if saw_bang {
+            pos += 1;
+            skip_file_ws(bytes, &mut pos, &mut line_no);
+        }
+        if pos >= n {
+            break;
+        }
+
+        if bytes[pos] != b'(' {
+            return Err(format!(
+                "expected '(' in '{}' at line {}, found '{}'",
                 path.display(),
-                e
-            )
-        })?;
-        for ch in line.chars() {
-            match ch {
-                ';' => break,
-                '!' if depth == 0 => saw_bang = true,
-                '(' => {
-                    depth += 1;
-                    form_buf.push(ch);
-                }
-                ')' if depth > 0 => {
-                    depth -= 1;
-                    form_buf.push(ch);
-                    if depth == 0 {
-                        if let Some(result) = process_form(&form_buf, saw_bang, env, funcs)
-                            .map_err(|e| {
-                                format!("{} (in '{}' near line {})", e, path.display(), line_no + 1)
-                            })?
-                        {
-                            results.push(result);
-                        }
-                        form_buf.clear();
-                        saw_bang = false;
+                line_no,
+                bytes[pos] as char
+            ));
+        }
+
+        let start_line = line_no;
+
+        if !saw_bang && is_data_form(bytes, pos) {
+            // Fast path: parse directly to Atom, skip Expr entirely.
+            // Safe for non-'=' forms — compile_definition is a no-op for these.
+            let atom = crate::parser::parse_atom_bytes(&content, &mut pos, &mut line_no)
+                .map_err(|e| format!("{} (in '{}' near line {})", e, path.display(), start_line))?;
+            funcs
+                .space
+                .write()
+                .unwrap()
+                .add_atom(&atom)
+                .map_err(|e| {
+                    format!("add_atom: {} (in '{}' near line {})", e, path.display(), start_line)
+                })?;
+        } else {
+            // Slow path: runnables and `(= ...)` definitions need Expr for eval/compile.
+            let form_start = pos;
+            let mut depth: i32 = 0;
+            while pos < n {
+                match bytes[pos] {
+                    b'\n' => {
+                        line_no += 1;
+                        pos += 1;
                     }
+                    b';' => {
+                        while pos < n && bytes[pos] != b'\n' {
+                            pos += 1;
+                        }
+                    }
+                    b'"' => {
+                        pos += 1;
+                        while pos < n {
+                            match bytes[pos] {
+                                b'\\' => pos += 2,
+                                b'"' => {
+                                    pos += 1;
+                                    break;
+                                }
+                                b'\n' => {
+                                    line_no += 1;
+                                    pos += 1;
+                                }
+                                _ => pos += 1,
+                            }
+                        }
+                    }
+                    b'(' => {
+                        depth += 1;
+                        pos += 1;
+                    }
+                    b')' => {
+                        depth -= 1;
+                        pos += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        if depth < 0 {
+                            return Err(format!(
+                                "unmatched ')' in '{}' at line {}",
+                                path.display(),
+                                line_no
+                            ));
+                        }
+                    }
+                    _ => pos += 1,
                 }
-                ')' => {
-                    return Err(format!(
-                        "unmatched ')' in '{}' at line {}",
-                        path.display(),
-                        line_no + 1
-                    ));
-                }
-                _ if depth > 0 => form_buf.push(ch),
-                _ => {}
+            }
+            if depth != 0 {
+                return Err(format!(
+                    "unclosed '(' in '{}' at line {}",
+                    path.display(),
+                    start_line
+                ));
+            }
+            let form_str = &content[form_start..pos];
+            if let Some(result) = process_form(form_str, saw_bang, env, funcs)
+                .map_err(|e| format!("{} (in '{}' near line {})", e, path.display(), start_line))?
+            {
+                results.push(result);
             }
         }
     }
-    if depth != 0 {
-        return Err(format!("unclosed '(' in '{}'", path.display()));
-    }
+
     Ok(results)
+}
+
+/// Skip ASCII whitespace and `;` line-comments, tracking line numbers.
+fn skip_file_ws(bytes: &[u8], pos: &mut usize, line_no: &mut usize) {
+    loop {
+        while *pos < bytes.len() && bytes[*pos].is_ascii_whitespace() {
+            if bytes[*pos] == b'\n' {
+                *line_no += 1;
+            }
+            *pos += 1;
+        }
+        if *pos < bytes.len() && bytes[*pos] == b';' {
+            while *pos < bytes.len() && bytes[*pos] != b'\n' {
+                *pos += 1;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+/// True when the form at `pos` (which is `(`) is a data fact safe for the
+/// fast parse path — i.e., the first token inside is not a standalone `=`.
+fn is_data_form(bytes: &[u8], pos: usize) -> bool {
+    let mut i = pos + 1; // skip '('
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] == b')' {
+        return true; // empty form
+    }
+    if bytes[i] != b'=' {
+        return true; // first token not '='
+    }
+    // '=' found — standalone only if followed by delimiter
+    let j = i + 1;
+    if j >= bytes.len() {
+        return false; // '=' at EOF → eq-form
+    }
+    let b = bytes[j];
+    !(b.is_ascii_whitespace() || b == b'(' || b == b')')
 }
 
 /// Parse a single buffered form string and dispatch it.
