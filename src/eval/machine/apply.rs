@@ -44,6 +44,25 @@ pub(crate) fn cartesian_product(options: &[Vec<Atom>]) -> Vec<Vec<Atom>> {
     result
 }
 
+/// Lazy cartesian product: visits every combination via callback without
+/// materialising the full M^K intermediate Vec. Uses O(depth) stack memory.
+#[inline]
+fn cartesian_product_apply<E>(
+    options: &[Vec<Atom>],
+    buf: &mut Vec<Atom>,
+    f: &mut impl FnMut(&[Atom]) -> Result<(), E>,
+) -> Result<(), E> {
+    if options.is_empty() {
+        return f(buf);
+    }
+    for atom in &options[0] {
+        buf.push(atom.clone());
+        cartesian_product_apply(&options[1..], buf, f)?;
+        buf.pop();
+    }
+    Ok(())
+}
+
 /// Threaded cartesian product of result sets, preserving environments.
 ///
 /// Each result set is a list of (Atom, Env) pairs. This produces all combinations
@@ -562,16 +581,15 @@ pub(crate) fn apply_frame(
                 vals.push(Vec::new());
                 return Ok(());
             }
-            let combos = cartesian_product(&tail_atoms);
-            let lists = combos
-                .into_iter()
-                .map(|tail_values| {
-                    let mut atoms = Vec::with_capacity(tail_values.len() + 1);
-                    atoms.push(head.clone());
-                    atoms.extend(tail_values);
-                    Atom::Expr(atoms.into())
-                })
-                .collect();
+            let mut lists = Vec::new();
+            let mut buf = Vec::new();
+            cartesian_product_apply(&tail_atoms, &mut buf, &mut |combo: &[Atom]| {
+                let mut atoms = Vec::with_capacity(combo.len() + 1);
+                atoms.push(head.clone());
+                atoms.extend_from_slice(combo);
+                lists.push(Atom::Expr(atoms.into()));
+                Ok::<(), String>(())
+            })?;
             vals.push(plain(lists));
             Ok(())
         }
@@ -582,8 +600,12 @@ pub(crate) fn apply_frame(
                 vals.push(Vec::new());
                 return Ok(());
             }
-            let combos = cartesian_product(&per_elem);
-            let lists: Vec<Atom> = combos.into_iter().map(|v| Atom::Expr(Arc::from(v))).collect();
+            let mut lists = Vec::new();
+            let mut buf = Vec::new();
+            cartesian_product_apply(&per_elem, &mut buf, &mut |combo: &[Atom]| {
+                lists.push(Atom::Expr(Arc::from(combo)));
+                Ok::<(), String>(())
+            })?;
             vals.push(plain(lists));
             Ok(())
         }
@@ -603,14 +625,14 @@ pub(crate) fn apply_frame(
                         // Try native
                         if let Some(function) = funcs.get(name, arity as u8) {
                             if let crate::func::FunctionKind::Native { func } = &function.kind {
-                                let combos = cartesian_product(&arg_options);
                                 let mut results = Vec::new();
-                                for slice in &combos {
+                                let mut buf = Vec::new();
+                                cartesian_product_apply(&arg_options, &mut buf, &mut |slice: &[Atom]| {
                                     match func(slice, funcs) {
-                                        Ok(nd) => results.extend(nd),
-                                        Err(e) => return Err(e),
+                                        Ok(nd) => { results.extend(nd); Ok(()) }
+                                        Err(e) => Err(e),
                                     }
-                                }
+                                })?;
                                 vals.push(plain(results));
                                 return Ok(());
                             }
@@ -698,11 +720,11 @@ pub(crate) fn apply_frame(
                                         vals.push(Vec::new());
                                         return Ok(());
                                     }
-                                    let combos = cartesian_product(&arg_options);
                                     let mut results = Vec::new();
-                                    for combo in &combos {
+                                    let mut buf = Vec::new();
+                                    cartesian_product_apply(&arg_options, &mut buf, &mut |combo: &[Atom]| {
                                         let mut all_args: Vec<Atom> = old_args.to_vec();
-                                        all_args.extend(combo.iter().cloned());
+                                        all_args.extend_from_slice(combo);
                                         let fn_expr = crate::parser::atom_to_expr(&Atom::Sym(fn_name.clone()))
                                             .unwrap_or(Expr::Symbol(fn_name.to_string()));
                                         let mut call_items = vec![fn_expr];
@@ -720,7 +742,8 @@ pub(crate) fn apply_frame(
                                             &mut None,
                                         )?;
                                         results.extend(body_rs.into_iter().map(|(a, _)| a));
-                                    }
+                                        Ok::<(), String>(())
+                                    })?;
                                     vals.push(plain(results));
                                     return Ok(());
                                 }
@@ -765,8 +788,12 @@ pub(crate) fn apply_frame(
             let all_atoms: Vec<Vec<Atom>> = std::iter::once(
                 head_rs.into_iter().map(|(a, _)| a).collect()
             ).chain(per_elem).collect();
-            let combos = cartesian_product(&all_atoms);
-            let lists: Vec<Atom> = combos.into_iter().map(|v| Atom::Expr(Arc::from(v))).collect();
+            let mut lists = Vec::new();
+            let mut buf = Vec::new();
+            cartesian_product_apply(&all_atoms, &mut buf, &mut |combo: &[Atom]| {
+                lists.push(Atom::Expr(Arc::from(combo)));
+                Ok::<(), String>(())
+            })?;
             vals.push(plain(lists));
             Ok(())
         }
@@ -825,15 +852,15 @@ pub(crate) fn apply_frame(
                     if arg_options.iter().any(|values| values.is_empty()) {
                         return Err("argument produced no results".to_string());
                     }
-                    let combos = cartesian_product(&arg_options);
                     let mut results = Vec::new();
                     let mut last_err = None;
-                    for slice in &combos {
+                    let mut buf = Vec::new();
+                    cartesian_product_apply(&arg_options, &mut buf, &mut |slice: &[Atom]| {
                         match f(slice, funcs) {
-                            Ok(nd) => results.extend(nd),
-                            Err(err) => last_err = Some(err),
+                            Ok(nd) => { results.extend(nd); Ok::<(), String>(()) }
+                            Err(err) => { last_err = Some(err); Ok(()) }
                         }
-                    }
+                    })?;
                     if results.is_empty() {
                         if let Some(err) = last_err {
                             return Err(err);

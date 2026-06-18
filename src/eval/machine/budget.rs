@@ -14,7 +14,7 @@ pub(crate) type ResultSet = Vec<(Atom, Env)>;
 
 /// Wrap plain atoms as a result set with empty environments.
 pub(crate) fn plain(atoms: Vec<Atom>) -> ResultSet {
-    atoms.into_iter().map(|atom| (atom, Env::Empty)).collect()
+    atoms.into_iter().map(|atom| (atom, Env::new())).collect()
 }
 
 /// Extract the result atoms from a result set in evaluation order.

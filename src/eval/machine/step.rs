@@ -41,11 +41,9 @@ pub(crate) fn run_rs(
     funcs: &FnTable,
     budget: &mut Option<i64>,
 ) -> Result<ResultSet, String> {
-    let mut work = vec![super::task::Task::Eval {
-        expr: root,
-        env: root_env,
-    }];
-    let mut vals: Vec<ResultSet> = Vec::new();
+    let mut work = Vec::with_capacity(64);
+    work.push(super::task::Task::Eval { expr: root, env: root_env });
+    let mut vals: Vec<ResultSet> = Vec::with_capacity(32);
 
     while let Some(task) = work.pop() {
         match task {

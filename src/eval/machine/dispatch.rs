@@ -45,7 +45,7 @@ pub(crate) fn dispatch_if(args: &[Expr], env: &Env, funcs: &FnTable, work: &mut 
     let mut branches: Vec<(Arc<Expr>, Env)> = Vec::new();
     let mut had_bindings = false;
     for (cond, cond_env) in &condition_rs {
-        if !matches!(cond_env, Env::Empty) {
+        if !cond_env.is_empty_env() {
             had_bindings = true;
         }
         if crate::eval::forms::control::is_truthy(cond) {

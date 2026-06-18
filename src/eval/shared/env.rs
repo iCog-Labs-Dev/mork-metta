@@ -1,7 +1,7 @@
 //! Helpers for environment construction and lookup.
 
 use crate::atom::Atom;
-use crate::env::Env;
+use crate::env::{Env, EnvNode};
 use std::sync::Arc;
 
 /// Look up a bound variable in an environment.
@@ -21,19 +21,14 @@ pub fn bind_all(env: &Env, bindings: &[(String, Atom)]) -> Env {
 
 /// Prepend one environment chain onto another environment.
 pub fn prepend_chain(prefix: Env, base: &Env) -> Env {
-    match prefix {
-        Env::Empty => base.clone(),
-        Env::Cons {
-            name,
-            value,
-            next,
-        } => {
-            let inner = next.as_ref().clone();
-            Env::Cons {
-                name,
-                value,
-                next: Arc::new(prepend_chain(inner, base)),
-            }
+    match prefix.inner() {
+        EnvNode::Empty => base.clone(),
+        EnvNode::Cons { name, value, next } => {
+            Env(Arc::new(EnvNode::Cons {
+                name: name.clone(),
+                value: value.clone(),
+                next: prepend_chain(next.clone(), base),
+            }))
         }
     }
 }

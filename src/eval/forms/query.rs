@@ -28,9 +28,9 @@ pub(crate) fn prepare_arg_slot(
 
 /// Compute the total structural cost of the bindings in an environment.
 pub(crate) fn env_binding_cost(env: &Env) -> i64 {
-    match env {
-        Env::Empty => 0,
-        Env::Cons { value, next, .. } => {
+    match env.inner() {
+        crate::env::EnvNode::Empty => 0,
+        crate::env::EnvNode::Cons { value, next, .. } => {
             crate::eval::machine::budget::calculate_cost(value).unwrap_or(0)
                 + env_binding_cost(next)
         }
