@@ -2,6 +2,7 @@
 
 use crate::atom::Atom;
 use crate::parser::Expr;
+use std::sync::Arc;
 
 /// Convert a parsed expression into a runtime atom.
 pub fn expr_to_atom(expr: &Expr) -> Atom {
@@ -24,12 +25,15 @@ pub fn atom_to_expr(atom: &Atom) -> Result<Expr, String> {
             for item in items.iter() {
                 exprs.push(atom_to_expr(item)?);
             }
-            Ok(Expr::List(exprs))
+            Ok(Expr::List(exprs.into()))
         }
-        Atom::Closure(closure) => Ok(Expr::List(vec![
-            Expr::Symbol("|->".to_string()),
-            Expr::List(closure.params.clone()),
-            closure.body.clone(),
-        ])),
+        Atom::Closure(closure) => {
+            let items: Vec<Expr> = vec![
+                Expr::Symbol("|->".to_string()),
+                Expr::List(Arc::from(closure.params.as_slice())),
+                closure.body.clone(),
+            ];
+            Ok(Expr::List(items.into()))
+        }
     }
 }

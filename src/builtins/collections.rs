@@ -447,7 +447,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
                 for item in &items {
                     let item_expr = crate::parser::atom_to_expr(item)
                         .unwrap_or(crate::parser::Expr::Symbol(item.to_sexpr_string()));
-                    let call = crate::parser::Expr::List(vec![fn_expr.clone(), item_expr]);
+                    let call = crate::parser::Expr::List(std::sync::Arc::from([fn_expr.clone(), item_expr]));
                     let body_rs = crate::eval::machine::step::run_rs(
                         std::sync::Arc::new(call),
                         crate::env::Env::new(),
@@ -478,7 +478,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
                         let mut call_items = vec![fn_expr.clone()];
                         call_items.extend(old_arg_exprs.clone());
                         call_items.push(item_expr);
-                        let call = crate::parser::Expr::List(call_items);
+                        let call = crate::parser::Expr::List(call_items.into());
                         let body_rs = crate::eval::machine::step::run_rs(
                             std::sync::Arc::new(call),
                             crate::env::Env::new(),
@@ -500,7 +500,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
                 for item in &items {
                     let item_expr = crate::parser::atom_to_expr(item)
                         .unwrap_or(crate::parser::Expr::Symbol(item.to_sexpr_string()));
-                    let call = crate::parser::Expr::List(vec![func_expr.clone(), item_expr]);
+                    let call = crate::parser::Expr::List(std::sync::Arc::from([func_expr.clone(), item_expr]));
                     let body_rs = crate::eval::machine::step::run_rs(
                         std::sync::Arc::new(call),
                         crate::env::Env::new(),

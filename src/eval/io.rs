@@ -299,11 +299,11 @@ pub(crate) fn eval_readln(_args: &[Expr], _env: &Env, _funcs: &FnTable) -> Resul
     let wrapped = format!("({})", input);
     match crate::parser::parse_forms(&wrapped) {
         Ok(forms) => {
-            if let Some(crate::parser::TopForm::Definition(crate::parser::Expr::List(mut items))) =
+            if let Some(crate::parser::TopForm::Definition(crate::parser::Expr::List(items))) =
                 forms.into_iter().next()
             {
                 if items.len() == 1 {
-                    Ok(NDet::single(crate::parser::expr_to_atom(&items.remove(0))))
+                    Ok(NDet::single(crate::parser::expr_to_atom(&items[0])))
                 } else if items.is_empty() {
                     Ok(NDet::single(crate::atom::Atom::Expr(Arc::from([]))))
                 } else {

@@ -43,7 +43,7 @@ fn is_eval_only_param(body: &Expr, var: &str) -> bool {
                 *seen = true;
             }
             Expr::List(items) => {
-                for item in items {
+                for item in items.iter() {
                     walk(item, var, seen, ok);
                     if !*ok {
                         return;

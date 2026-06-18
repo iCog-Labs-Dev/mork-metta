@@ -17,6 +17,7 @@
 /// - Integer tokens are prefixed or unprefixed ASCII digits.
 /// - Symbols can contain any non-whitespace, non-paren characters.
 use crate::atom::Atom;
+use std::sync::Arc;
 
 /// A top-level form in a MeTTa file.
 #[derive(Clone, Debug)]
@@ -37,7 +38,7 @@ pub enum Expr {
     /// An integer literal: `30`, `-1`, `354224848179261915075`
     Number(crate::atom::Numeric),
     /// A parenthesized list: `(fib 30)`, `(+ $N 1)`
-    List(Vec<Expr>),
+    List(Arc<[Expr]>),
 }
 
 impl Expr {
@@ -97,15 +98,16 @@ pub fn atom_to_expr(atom: &Atom) -> Result<Expr, String> {
             for item in items.iter() {
                 exprs.push(atom_to_expr(item)?);
             }
-            Ok(Expr::List(exprs))
+            Ok(Expr::List(exprs.into()))
         }
         Atom::Closure(c) => {
             // Convert closure back to (|-> params body) form
-            let mut items = Vec::with_capacity(3);
-            items.push(Expr::Symbol("|->".to_string()));
-            items.push(Expr::List(c.params.clone()));
-            items.push(c.body.clone());
-            Ok(Expr::List(items))
+            let items: Vec<Expr> = vec![
+                Expr::Symbol("|->".to_string()),
+                Expr::List(Arc::from(c.params.as_slice())),
+                c.body.clone(),
+            ];
+            Ok(Expr::List(items.into()))
         }
     }
 }
@@ -170,7 +172,7 @@ pub(crate) fn parse_sexpr_body(chars: &mut std::iter::Peekable<std::str::Chars<'
             None => return Err("unexpected end of input inside S-expression".into()),
             Some(&')') => {
                 chars.next(); // consume ')'
-                return Ok(Expr::List(items));
+                return Ok(Expr::List(items.into()));
             }
             Some(&'(') => {
                 chars.next(); // consume '('

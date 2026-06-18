@@ -234,7 +234,7 @@ pub(crate) fn apply_frame(
                 .unwrap_or(crate::parser::Expr::Symbol(acc.to_sexpr_string()));
             let item_expr = crate::parser::atom_to_expr(&item)
                 .unwrap_or(crate::parser::Expr::Symbol(item.to_sexpr_string()));
-            let call = crate::parser::Expr::List(vec![func_expr, acc_expr, item_expr]);
+            let call = crate::parser::Expr::List(Arc::from([func_expr, acc_expr, item_expr]));
             work.push(Task::Apply(Frame::FoldlAtom {
                 items: Arc::new(items),
                 index: 1,
@@ -299,7 +299,7 @@ pub(crate) fn apply_frame(
                 .unwrap_or(crate::parser::Expr::Symbol(new_acc.to_sexpr_string()));
             let item_expr = crate::parser::atom_to_expr(&item)
                 .unwrap_or(crate::parser::Expr::Symbol(item.to_sexpr_string()));
-            let call = crate::parser::Expr::List(vec![func_expr, acc_expr, item_expr]);
+            let call = crate::parser::Expr::List(Arc::from([func_expr, acc_expr, item_expr]));
             work.push(Task::Apply(Frame::FoldlAtom {
                 items,
                 index: index + 1,
@@ -712,7 +712,7 @@ pub(crate) fn apply_frame(
                                                     .unwrap_or(Expr::Symbol(arg.to_sexpr_string()))
                                             );
                                         }
-                                        let call_expr = Expr::List(call_items);
+                                        let call_expr = Expr::List(call_items.into());
                                         let body_rs = super::step::run_rs(
                                             Arc::new(call_expr),
                                             Env::new(),

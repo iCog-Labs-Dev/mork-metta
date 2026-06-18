@@ -16,12 +16,12 @@ pub fn bind_value(env: &Env, name: &str, value: Atom) -> Env {
 }
 
 /// Return the sequential binding list for a `let*` form.
-pub(crate) fn let_star_bindings(args: &[Expr]) -> Result<Arc<Vec<Expr>>, String> {
+pub(crate) fn let_star_bindings(args: &[Expr]) -> Result<Arc<[Expr]>, String> {
     if args.len() != 2 {
         return Err(format!("let*: expected 2 args, got {}", args.len()));
     }
     match &args[0] {
-        Expr::List(items) => Ok(Arc::new(items.clone())),
+        Expr::List(items) => Ok(Arc::clone(items)),
         _ => Err("let*: bindings must be a list".to_string()),
     }
 }

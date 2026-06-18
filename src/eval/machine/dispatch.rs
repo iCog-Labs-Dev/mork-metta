@@ -112,7 +112,7 @@ pub(crate) fn dispatch_case(args: &[Expr], env: &Env, work: &mut Vec<Task>) -> R
         other => return Err(format!("case: expected clause list, got {}", other.to_string())),
     };
     work.push(Task::Apply(Frame::CaseSelect {
-        clauses: Arc::new(clauses.clone()),
+        clauses: Arc::clone(clauses),
         env: env.clone(),
     }));
     work.push(Task::Eval {
@@ -229,8 +229,8 @@ pub(crate) fn dispatch_expr(
                         if args.len() != 2 {
                             return Err(format!("|->: expected (params body), got {} args", args.len()));
                         }
-                        let params = match &args[0] {
-                            Expr::List(items) => items.clone(),
+                        let params: Vec<Expr> = match &args[0] {
+                            Expr::List(items) => items.to_vec(),
                             other => vec![other.clone()],
                         };
                         let body = args[1].clone();
@@ -315,7 +315,7 @@ pub(crate) fn dispatch_expr(
                         let accum = gen_values.into_iter().try_fold(init, |acc, val| {
                             let acc_expr = crate::parser::atom_to_expr(&acc)?;
                             let val_expr = crate::parser::atom_to_expr(&val)?;
-                            let call = Expr::List(vec![agg_head.clone(), acc_expr, val_expr]);
+                            let call = Expr::List(Arc::from([agg_head.clone(), acc_expr, val_expr]));
                             super::step::run_rs(Arc::new(call), agg_env.clone(), funcs, &mut None)?
                                 .into_iter().next().map(|(a, _)| a)
                                 .ok_or_else(|| "foldall: agg-func produced no result".to_string())
@@ -349,12 +349,12 @@ pub(crate) fn dispatch_expr(
                             };
                             let results: Vec<crate::atom::Atom> = match &check_atom {
                                 crate::atom::Atom::Sym(fname) => {
-                                    let call = Expr::List(vec![Expr::Symbol(fname.to_string()), arg_sym.clone()]);
+                                    let call = Expr::List(Arc::from([Expr::Symbol(fname.to_string()), arg_sym.clone()]));
                                     super::step::run_rs(Arc::new(call), call_env, funcs, &mut None)?
                                         .into_iter().map(|(a, _)| a).collect()
                                 }
                                 crate::atom::Atom::Closure(_) => {
-                                    let call = Expr::List(vec![Expr::Symbol("$__check_fn".to_string()), arg_sym.clone()]);
+                                    let call = Expr::List(Arc::from([Expr::Symbol("$__check_fn".to_string()), arg_sym.clone()]));
                                     super::step::run_rs(Arc::new(call), call_env, funcs, &mut None)?
                                         .into_iter().map(|(a, _)| a).collect()
                                 }
@@ -470,7 +470,7 @@ pub(crate) fn dispatch_expr(
                                 args.len()
                             ));
                         }
-                        let args_arc = Arc::new(args.to_vec());
+                        let args_arc: Arc<[Expr]> = Arc::from(args);
                         work.push(Task::Apply(Frame::ChainBind {
                             args: Arc::clone(&args_arc),
                             pair_index: 0,

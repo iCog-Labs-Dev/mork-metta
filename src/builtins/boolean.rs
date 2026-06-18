@@ -92,11 +92,11 @@ fn register_truth_tables(funcs: &FnTable) {
                 .collect(),
         );
         let body = Expr::Symbol(body_str.to_string());
-        let def_expr = Expr::List(vec![
+        let def_expr = Expr::List(std::sync::Arc::from([
             Expr::Symbol("=".to_string()),
             head.clone(),
             body,
-        ]);
+        ]));
         let def_atom = crate::parser::expr_to_atom(&def_expr);
         funcs.space.write().unwrap().add_atom(&def_atom).unwrap();
         let head_atom = crate::parser::expr_to_atom(&head);

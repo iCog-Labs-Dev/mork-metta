@@ -107,7 +107,19 @@ impl Eq for Atom {}
 
 impl std::hash::Hash for Atom {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.to_sexpr_string().hash(state);
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Atom::Sym(s) => s.hash(state),
+            Atom::Str(s) => s.hash(state),
+            Atom::Num(n) => n.to_string().hash(state),
+            Atom::Expr(items) => {
+                items.len().hash(state);
+                for a in items.iter() {
+                    a.hash(state);
+                }
+            }
+            Atom::Closure(c) => c.body.to_string().hash(state),
+        }
     }
 }
 

@@ -52,7 +52,7 @@ pub(crate) enum Frame {
     /// Select `case` branches from evaluated scrutinee results.
     CaseSelect {
         /// Ordered clause list.
-        clauses: Arc<Vec<Expr>>,
+        clauses: Arc<[Expr]>,
         /// Environment active outside branch-local evaluation.
         env: Env,
     },
@@ -70,7 +70,7 @@ pub(crate) enum Frame {
     /// Continue a `chain` form after one pair has been evaluated and bound.
     ChainBind {
         /// The original chain arguments.
-        args: Arc<Vec<Expr>>,
+        args: Arc<[Expr]>,
         /// The index of the current pair within the chain.
         pair_index: usize,
         /// The environment active after previous bindings.
@@ -79,7 +79,7 @@ pub(crate) enum Frame {
     /// Continue a `let*` form after one binding value has been evaluated.
     LetStarBind {
         /// Sequential binding list.
-        bindings: Arc<Vec<Expr>>,
+        bindings: Arc<[Expr]>,
         /// Current binding index.
         bind_index: usize,
         /// Body evaluated after all bindings succeed.
