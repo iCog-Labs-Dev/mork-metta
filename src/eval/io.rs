@@ -15,6 +15,7 @@ use crate::func::{FnTable, NDet};
 use crate::parser::{Expr, TopForm, parse_forms};
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Evaluate `(import! space path)` — load a MeTTa file into the space.
 ///
@@ -304,7 +305,7 @@ pub(crate) fn eval_readln(_args: &[Expr], _env: &Env, _funcs: &FnTable) -> Resul
                 if items.len() == 1 {
                     Ok(NDet::single(crate::parser::expr_to_atom(&items.remove(0))))
                 } else if items.is_empty() {
-                    Ok(NDet::single(crate::atom::Atom::Expr(vec![])))
+                    Ok(NDet::single(crate::atom::Atom::Expr(Arc::from([]))))
                 } else {
                     Ok(NDet::single(crate::atom::Atom::Expr(
                         items

@@ -151,7 +151,7 @@ pub(crate) fn dispatch_expr(
         }
         Expr::List(items) => {
             if items.is_empty() {
-                vals.push(plain(vec![crate::atom::Atom::Expr(Vec::new())]));
+                vals.push(plain(vec![crate::atom::Atom::Expr(Arc::from([]))]));
                 return Ok(());
             }
 

@@ -2,6 +2,7 @@
 
 use crate::atom::Atom;
 use crate::func::{FnTable, NDet};
+use std::sync::Arc;
 
 /// Register representation, parsing, assertion, and I/O builtins.
 pub fn register_io_builtins(funcs: &FnTable) {
@@ -69,7 +70,7 @@ fn sread_parse(input: &str) -> Result<Atom, String> {
     if input.starts_with('(') && input.ends_with(')') {
         let inner = input[1..input.len() - 1].trim();
         if inner.is_empty() {
-            return Ok(Atom::Expr(vec![]));
+            return Ok(Atom::Expr(Arc::from([])));
         }
         let mut items = Vec::new();
         let mut depth = 0i32;
@@ -96,7 +97,7 @@ fn sread_parse(input: &str) -> Result<Atom, String> {
                 items.push(sread_parse(token)?);
             }
         }
-        return Ok(Atom::Expr(items));
+        return Ok(Atom::Expr(items.into()));
     }
     if let Ok(n) = input.parse::<i128>() {
         return Ok(Atom::num(n));

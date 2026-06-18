@@ -6,6 +6,7 @@ use crate::func::FnTable;
 use crate::parser::Expr;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::space::core::{MatchResult, Pattern};
 
@@ -124,7 +125,7 @@ pub fn collect_match_results(
                 return Ok(results
                     .into_iter()
                     .map(|bindings| MatchResult {
-                        atom: Atom::Expr(vec![Atom::sym(",")]),
+                        atom: Atom::Expr(Arc::from([Atom::sym(",")])),
                         bindings,
                     })
                     .collect());

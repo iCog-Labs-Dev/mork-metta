@@ -228,12 +228,12 @@ fn parse_call_result(result: &str) -> Result<NDet, String> {
 fn parse_plugin_atom(input: &str) -> Result<Atom, String> {
     let input = input.trim();
     if input.is_empty() {
-        return Ok(Atom::Expr(vec![]));
+        return Ok(Atom::Expr(std::sync::Arc::from([])));
     }
     if input.starts_with('(') && input.ends_with(')') {
         let inner = &input[1..input.len() - 1].trim();
         if inner.is_empty() {
-            return Ok(Atom::Expr(vec![]));
+            return Ok(Atom::Expr(std::sync::Arc::from([])));
         }
         let mut items = Vec::new();
         let mut depth = 0i32;
@@ -260,7 +260,7 @@ fn parse_plugin_atom(input: &str) -> Result<Atom, String> {
                 items.push(parse_plugin_atom(token)?);
             }
         }
-        return Ok(Atom::Expr(items));
+        return Ok(Atom::Expr(items.into()));
     }
     if let Ok(n) = input.parse::<i128>() {
         return Ok(Atom::num(n));

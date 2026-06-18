@@ -85,8 +85,8 @@ pub enum Atom {
     Str(Arc<str>),
     /// An arbitrary-precision integer or decimal.
     Num(Numeric),
-    /// An S-expression — ordered list of atoms.
-    Expr(Vec<Atom>),
+    /// An S-expression — ordered list of atoms. Arc-shared so clone is O(1).
+    Expr(Arc<[Atom]>),
     /// An anonymous function created by `|->`. Boxed to keep Atom at 32 bytes.
     Closure(Box<ClosureData>),
 }
@@ -97,7 +97,7 @@ impl PartialEq for Atom {
             (Atom::Sym(a), Atom::Sym(b)) => a == b,
             (Atom::Str(a), Atom::Str(b)) => a == b,
             (Atom::Num(a), Atom::Num(b)) => a == b, // delegates to Numeric::PartialEq
-            (Atom::Expr(a), Atom::Expr(b)) => a == b,
+            (Atom::Expr(a), Atom::Expr(b)) => Arc::ptr_eq(a, b) || a == b,
             (Atom::Closure(a), Atom::Closure(b)) => a == b,
             _ => false,
         }
@@ -166,7 +166,7 @@ impl Atom {
 
     /// Convenience: create an expression atom.
     pub fn expr(items: Vec<Atom>) -> Self {
-        Atom::Expr(items)
+        Atom::Expr(Arc::from(items))
     }
 
     /// Extract the integer value as i128. Fails if the number is a decimal or
@@ -222,7 +222,7 @@ impl Atom {
     /// Returns an error description if the atom is not an expression.
     pub fn as_expr(&self) -> Result<&[Atom], String> {
         match self {
-            Atom::Expr(items) => Ok(items.as_slice()),
+            Atom::Expr(items) => Ok(items.as_ref()),
             other => Err(format!(
                 "expected expression, got {}",
                 other.to_sexpr_string()

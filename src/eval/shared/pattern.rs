@@ -6,6 +6,7 @@
 use crate::atom::Atom;
 use crate::env::Env;
 use crate::func::{Clause, FnTable};
+use std::sync::Arc;
 use crate::parser::Expr;
 
 /// Match a clause's argument patterns against evaluated argument atoms.
@@ -117,7 +118,7 @@ pub(crate) fn try_match_one(
                         else {
                             return Ok(None);
                         };
-                        let tail = Atom::Expr(elements[1..].to_vec());
+                        let tail = Atom::Expr(Arc::from(&elements[1..]));
                         try_match_one(&items[2], &tail, &head_env, funcs)
                     }
                     _ => Ok(None),

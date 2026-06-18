@@ -328,7 +328,7 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
 
     funcs.insert_native("min-atom", 1, |args, _| {
         let items = match &args[0] {
-            Atom::Expr(v) => v.clone(),
+            Atom::Expr(v) => v.to_vec(),
             a => vec![a.clone()],
         };
         let mut best = f64::INFINITY;
@@ -341,7 +341,7 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
 
     funcs.insert_native("max-atom", 1, |args, _| {
         let items = match &args[0] {
-            Atom::Expr(v) => v.clone(),
+            Atom::Expr(v) => v.to_vec(),
             a => vec![a.clone()],
         };
         let mut best = f64::NEG_INFINITY;
@@ -355,7 +355,7 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
     funcs.insert_native("sort-math", 1, |args, _| {
         expect_n_args(args, 1, "sort-math")?;
         let items = match &args[0] {
-            Atom::Expr(v) => v.clone(),
+            Atom::Expr(v) => v.to_vec(),
             a => vec![a.clone()],
         };
         let mut pairs: Vec<(f64, Atom)> = Vec::with_capacity(items.len());

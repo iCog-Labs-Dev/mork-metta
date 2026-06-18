@@ -6,6 +6,7 @@
 
 use crate::atom::Atom;
 use crate::parser::Expr;
+use std::sync::Arc;
 
 use pathmap::zipper::{ZipperAbsolutePath, ZipperIteration, ZipperMoving};
 
@@ -26,7 +27,7 @@ impl Pattern {
                 .iter()
                 .map(|p| p.as_ground_atom())
                 .collect::<Option<Vec<_>>>()
-                .map(Atom::Expr),
+                .map(|v| Atom::Expr(v.into())),
         }
     }
 
@@ -295,7 +296,7 @@ fn decode_children(b: &[u8], pos: &mut usize, var_count: &mut u8, n: usize) -> O
     for _ in 0..n {
         items.push(decode_one(b, pos, var_count)?);
     }
-    Some(Atom::Expr(items))
+    Some(Atom::Expr(items.into()))
 }
 
 fn match_one(pattern: &Pattern, atom: &Atom) -> Option<MatchResult> {
@@ -370,7 +371,8 @@ fn substitute_stored(atom: &Atom, bindings: &[(String, Atom)]) -> Atom {
             items
                 .iter()
                 .map(|a| substitute_stored(a, bindings))
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
         ),
         _ => atom.clone(),
     }
@@ -426,7 +428,7 @@ fn parse_value(chars: &[char], pos: &mut usize) -> Result<Atom, String> {
                 }
                 if chars[*pos] == ')' {
                     *pos += 1;
-                    return Ok(Atom::Expr(items));
+                    return Ok(Atom::Expr(items.into()));
                 }
                 items.push(parse_value(chars, pos)?);
             }

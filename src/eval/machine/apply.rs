@@ -93,7 +93,7 @@ pub(crate) fn apply_frame(
             let result = match out.len() {
                 0 => Vec::new(),
                 1 => plain(out),
-                _ if had_bindings => plain(vec![Atom::Expr(out)]),
+                _ if had_bindings => plain(vec![Atom::Expr(out.into())]),
                 _ => plain(out),
             };
             vals.push(result);
@@ -219,7 +219,7 @@ pub(crate) fn apply_frame(
             let acc = acc_rs.into_iter().next().map(|(a, _)| a)
                 .ok_or_else(|| "foldl-atom: acc arg produced no result".to_string())?;
             let items: Vec<crate::atom::Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
-                Some(crate::atom::Atom::Expr(v)) => v,
+                Some(crate::atom::Atom::Expr(v)) => v.to_vec(),
                 Some(other) => vec![other],
                 None => return Err("foldl-atom: list arg produced no result".to_string()),
             };
@@ -475,7 +475,7 @@ pub(crate) fn apply_frame(
         }
         Frame::CollapseGather => {
             let result_set = pop_n(vals, 1).pop().unwrap();
-            vals.push(plain(vec![Atom::Expr(atoms_of(&result_set))]));
+            vals.push(plain(vec![Atom::Expr(Arc::from(atoms_of(&result_set)))]));
             Ok(())
         }
         Frame::OnceCut => {
@@ -524,6 +524,17 @@ pub(crate) fn apply_frame(
                     env: next_env,
                 });
             } else {
+                // Tail call: Gather{1} between MergeEnv and the deeper continuation
+                // is a no-op (pop 1 ResultSet, re-emit unchanged). Remove it to save
+                // one frame allocation per tail step — halves stack depth for linear
+                // tail-recursive chain programs like iterative div/fib.
+                let n = work.len();
+                if n >= 2
+                    && matches!(work[n - 1], Task::Apply(Frame::MergeEnv { .. }))
+                    && matches!(work[n - 2], Task::Apply(Frame::Gather { n: 1 }))
+                {
+                    work.remove(n - 2);
+                }
                 work.push(Task::Eval {
                     expr: Arc::new(args[args.len() - 1].clone()),
                     env: next_env,
@@ -539,7 +550,7 @@ pub(crate) fn apply_frame(
                 .map(|(atom, _)| atom)
                 .ok_or_else(|| "superpose: argument produced no results".to_string())?;
             match first {
-                Atom::Expr(elements) => vals.push(plain(elements)),
+                Atom::Expr(elements) => vals.push(plain(elements.to_vec())),
                 other => vals.push(plain(vec![other])),
             }
             Ok(())
@@ -558,7 +569,7 @@ pub(crate) fn apply_frame(
                     let mut atoms = Vec::with_capacity(tail_values.len() + 1);
                     atoms.push(head.clone());
                     atoms.extend(tail_values);
-                    Atom::Expr(atoms)
+                    Atom::Expr(atoms.into())
                 })
                 .collect();
             vals.push(plain(lists));
@@ -572,7 +583,7 @@ pub(crate) fn apply_frame(
                 return Ok(());
             }
             let combos = cartesian_product(&per_elem);
-            let lists: Vec<Atom> = combos.into_iter().map(Atom::Expr).collect();
+            let lists: Vec<Atom> = combos.into_iter().map(|v| Atom::Expr(Arc::from(v))).collect();
             vals.push(plain(lists));
             Ok(())
         }
@@ -665,11 +676,11 @@ pub(crate) fn apply_frame(
                         if funcs.has_higher_arity(name, arity) {
                             let partial_args: Vec<Atom> = arg_options.into_iter().flatten().collect();
                             vals.push(plain(vec![
-                                Atom::Expr(vec![
+                                Atom::Expr(Arc::from([
                                     Atom::sym("partial"),
                                     Atom::Sym(name.clone()),
-                                    Atom::Expr(partial_args),
-                                ])
+                                    Atom::Expr(Arc::from(partial_args)),
+                                ]))
                             ]));
                             return Ok(());
                         }
@@ -690,7 +701,7 @@ pub(crate) fn apply_frame(
                                     let combos = cartesian_product(&arg_options);
                                     let mut results = Vec::new();
                                     for combo in &combos {
-                                        let mut all_args = old_args.clone();
+                                        let mut all_args: Vec<Atom> = old_args.to_vec();
                                         all_args.extend(combo.iter().cloned());
                                         let fn_expr = crate::parser::atom_to_expr(&Atom::Sym(fn_name.clone()))
                                             .unwrap_or(Expr::Symbol(fn_name.to_string()));
@@ -755,7 +766,7 @@ pub(crate) fn apply_frame(
                 head_rs.into_iter().map(|(a, _)| a).collect()
             ).chain(per_elem).collect();
             let combos = cartesian_product(&all_atoms);
-            let lists: Vec<Atom> = combos.into_iter().map(Atom::Expr).collect();
+            let lists: Vec<Atom> = combos.into_iter().map(|v| Atom::Expr(Arc::from(v))).collect();
             vals.push(plain(lists));
             Ok(())
         }

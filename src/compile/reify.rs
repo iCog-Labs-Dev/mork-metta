@@ -21,7 +21,7 @@ pub fn atom_to_expr(atom: &Atom) -> Result<Expr, String> {
         Atom::Num(number) => Ok(Expr::Number(number.clone())),
         Atom::Expr(items) => {
             let mut exprs = Vec::with_capacity(items.len());
-            for item in items {
+            for item in items.iter() {
                 exprs.push(atom_to_expr(item)?);
             }
             Ok(Expr::List(exprs))
