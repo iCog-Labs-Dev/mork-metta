@@ -163,4 +163,7 @@ pub(crate) enum Frame {
     Progn { n: usize },
     /// Sequential evaluation: evaluate N args, return the first result.
     Prog1 { n: usize },
+    /// After a Gather completes, store the top-of-vals result in the memo cache.
+    /// Runs only for pure single-combo user function calls.
+    MemoStore { key: (String, Vec<Atom>) },
 }

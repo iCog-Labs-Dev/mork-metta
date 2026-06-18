@@ -3,6 +3,7 @@ use crate::parser::Expr;
 use crate::space::Space;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 /// Function dispatch table.
 ///
 /// Stores both user-defined functions (compiled from `(= ...)` forms) and
@@ -99,6 +100,11 @@ pub struct FnTable {
     pub fn_purity: RwLock<HashMap<String, HashMap<u8, bool>>>,
     /// Directory of the file currently being loaded (load-time only).
     pub import_dir: Mutex<PathBuf>,
+    /// Incremented on every add-atom/remove-atom. Memo cache entries tagged
+    /// with a stale stamp are evicted, making memoization self-evolution-safe.
+    pub memo_stamp: AtomicU64,
+    /// Memo cache for pure user-defined functions: (name, args) → (stamp, results).
+    pub memo_cache: RwLock<HashMap<(String, Vec<Atom>), (u64, Vec<Atom>)>>,
 }
 
 impl FnTable {
@@ -111,6 +117,8 @@ impl FnTable {
             fn_purity: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
             import_dir: Mutex::new(PathBuf::from(".")),
+            memo_stamp: AtomicU64::new(0),
+            memo_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -123,6 +131,8 @@ impl FnTable {
             fn_purity: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
             import_dir: Mutex::new(PathBuf::from(".")),
+            memo_stamp: AtomicU64::new(0),
+            memo_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -260,6 +270,41 @@ impl FnTable {
             }
         }
         false
+    }
+
+    /// Bump the mutation stamp. Call on every add-atom / remove-atom so that
+    /// memo cache entries from before the mutation are treated as stale.
+    pub fn bump_memo_stamp(&self) {
+        self.memo_stamp.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Look up a memoized result. Returns `Some(results)` only when the entry
+    /// exists AND was stored under the current mutation stamp.
+    pub fn memo_get(&self, key: &(String, Vec<Atom>)) -> Option<Vec<Atom>> {
+        let stamp = self.memo_stamp.load(Ordering::Relaxed);
+        self.memo_cache
+            .read()
+            .unwrap()
+            .get(key)
+            .filter(|(s, _)| *s == stamp)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// Store a memoized result tagged with the current mutation stamp.
+    pub fn memo_set(&self, key: (String, Vec<Atom>), result: Vec<Atom>) {
+        let stamp = self.memo_stamp.load(Ordering::Relaxed);
+        self.memo_cache.write().unwrap().insert(key, (stamp, result));
+    }
+
+    /// True if the named function at the given arity is marked pure.
+    pub fn is_pure_fn(&self, name: &str, arity: u8) -> bool {
+        self.fn_purity
+            .read()
+            .unwrap()
+            .get(name)
+            .and_then(|m| m.get(&arity))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Check if a named function is pure at the given arity.

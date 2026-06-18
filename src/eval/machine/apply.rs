@@ -606,6 +606,19 @@ pub(crate) fn apply_frame(
                             crate::eval::forms::query::lookup_user_clauses(name, arity as u8, funcs)
                         {
                             let combos_with_envs = threaded_combinations(&arg_sets);
+                            // Memo: single-combo pure calls only (multi-combo = ndet, skip).
+                            let memo_key = if funcs.is_pure_fn(name, arity as u8)
+                                && combos_with_envs.len() == 1
+                            {
+                                let k = (name.to_string(), combos_with_envs[0].0.clone());
+                                if let Some(cached) = funcs.memo_get(&k) {
+                                    vals.push(plain(cached));
+                                    return Ok(());
+                                }
+                                Some(k)
+                            } else {
+                                None
+                            };
                             let mut bodies: Vec<(Arc<Expr>, Env, i64)> = Vec::new();
                             for (combo, combo_env) in &combos_with_envs {
                                 for (patterns, body) in &clauses {
@@ -623,6 +636,9 @@ pub(crate) fn apply_frame(
                                     out.extend(body_rs);
                                 }
                                 let merged: Vec<Atom> = out.into_iter().map(|(a, _)| a).collect();
+                                if let Some(key) = memo_key {
+                                    funcs.memo_set(key, merged.clone());
+                                }
                                 vals.push(plain(merged));
                                 return Ok(());
                             }
@@ -725,6 +741,16 @@ pub(crate) fn apply_frame(
             vals.push(plain(lists));
             Ok(())
         }
+        Frame::MemoStore { key } => {
+            // Gather already pushed its result onto vals. Peek at it, store in
+            // cache tagged with the current mutation stamp, leave it in place.
+            if let Some(top) = vals.last() {
+                let result: Vec<Atom> = top.iter().map(|(a, _)| a.clone()).collect();
+                funcs.memo_set(key.clone(), result);
+            }
+            Ok(())
+        }
+
         Frame::Progn { n } => {
             let mut sets = pop_n(vals, n);
             // Last arg evaluated last → its result is on top (end of sets)
@@ -778,7 +804,7 @@ pub(crate) fn apply_frame(
                     Ok(())
                 }
                 super::task::Head::User {
-                    name: _,
+                    name,
                     clauses,
                     lazy_mask: _,
                 } => {
@@ -787,6 +813,19 @@ pub(crate) fn apply_frame(
                         vals.push(Vec::new());
                         return Ok(());
                     }
+                    // Memo check: pure + single-combo only.
+                    let memo_key = if funcs.is_pure_fn(&name, arity as u8)
+                        && combos_with_envs.len() == 1
+                    {
+                        let k = (name.to_string(), combos_with_envs[0].0.clone());
+                        if let Some(cached) = funcs.memo_get(&k) {
+                            vals.push(plain(cached));
+                            return Ok(());
+                        }
+                        Some(k)
+                    } else {
+                        None
+                    };
                     let mut bodies: Vec<(Arc<Expr>, Env, i64)> = Vec::new();
                     for (combo, combo_env) in &combos_with_envs {
                         for (patterns, body) in &clauses {
@@ -805,6 +844,10 @@ pub(crate) fn apply_frame(
                     if bodies.is_empty() {
                         vals.push(plain(Vec::new()));
                         return Ok(());
+                    }
+                    // MemoStore runs after Gather captures all body results.
+                    if let Some(key) = memo_key {
+                        work.push(Task::Apply(Frame::MemoStore { key }));
                     }
                     work.push(Task::Apply(Frame::Gather { n: bodies.len() }));
                     for (body, body_env, _) in bodies.into_iter().rev() {

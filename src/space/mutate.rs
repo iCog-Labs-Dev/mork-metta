@@ -28,6 +28,7 @@ pub struct TransactionSnapshot {
 /// so they can be found by the fast dispatch path.
 pub fn add_atom(funcs: &FnTable, space_ref: &Atom, atom: &Atom) -> Result<(), String> {
     funcs.with_resolved_space(space_ref, |space| space.add_atom(atom))?;
+    funcs.bump_memo_stamp();
     if matches!(space_ref, Atom::Sym(name) if name.as_ref() == "&self") {
         maybe_cache_definition_atom(atom, funcs);
         // Also store bare head atom for match premise lookup
@@ -43,6 +44,9 @@ pub fn add_atom(funcs: &FnTable, space_ref: &Atom, atom: &Atom) -> Result<(), St
 /// and bare head shadow atoms.
 pub fn remove_atom(funcs: &FnTable, space_ref: &Atom, atom: &Atom) -> Result<bool, String> {
     let removed = funcs.with_resolved_space(space_ref, |space| space.remove_atom(atom))?;
+    if removed {
+        funcs.bump_memo_stamp();
+    }
     if removed && matches!(space_ref, Atom::Sym(name) if name.as_ref() == "&self") {
         maybe_uncache_definition_atom(atom, funcs);
         // Only remove head shadow if no other definition with same head remains
