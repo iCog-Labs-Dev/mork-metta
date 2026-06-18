@@ -116,7 +116,7 @@ pub struct FnTable {
     /// Atom storage — RwLock allows concurrent readers (queries), exclusive writers (add/remove).
     pub space: RwLock<Box<dyn Space + Send + Sync>>,
     /// Lazily-created named spaces addressed by `&name`.
-    pub named_spaces: Mutex<HashMap<String, Box<dyn Space + Send + Sync>>>,
+    pub named_spaces: RwLock<HashMap<String, Box<dyn Space + Send + Sync>>>,
     /// Mutable state store for `get-state`, `change-state!`, `bind!`.
     pub state: Mutex<HashMap<String, Atom>>,
     /// Function definition cache — populated from space at reify time, updated
@@ -141,7 +141,7 @@ impl FnTable {
         FnTable {
             map: RwLock::new(HashMap::new()),
             space: RwLock::new(Box::new(crate::space::MorkSpace::new())),
-            named_spaces: Mutex::new(HashMap::new()),
+            named_spaces: RwLock::new(HashMap::new()),
             fn_cache: RwLock::new(HashMap::new()),
             fn_effect: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
@@ -155,7 +155,7 @@ impl FnTable {
         FnTable {
             map: RwLock::new(HashMap::new()),
             space: RwLock::new(space),
-            named_spaces: Mutex::new(HashMap::new()),
+            named_spaces: RwLock::new(HashMap::new()),
             fn_cache: RwLock::new(HashMap::new()),
             fn_effect: RwLock::new(HashMap::new()),
             state: Mutex::new(HashMap::new()),
@@ -227,7 +227,15 @@ impl FnTable {
                 f(space.as_ref())
             }
             Atom::Sym(name) if name.starts_with('&') => {
-                let mut spaces = self.named_spaces.lock().unwrap();
+                // Fast path: space already exists — read lock only (concurrent readers).
+                {
+                    let spaces = self.named_spaces.read().unwrap();
+                    if let Some(space) = spaces.get(name.as_ref()) {
+                        return f(space.as_ref());
+                    }
+                }
+                // Slow path: lazily create the space — write lock.
+                let mut spaces = self.named_spaces.write().unwrap();
                 let space = spaces.entry(name.to_string()).or_insert_with(|| {
                     Box::new(crate::space::MorkSpace::new()) as Box<dyn Space + Send + Sync>
                 });

@@ -124,7 +124,7 @@ pub fn snapshot_transaction_state(funcs: &FnTable) -> TransactionSnapshot {
     let self_atoms = funcs.space.read().unwrap().get_atoms();
     let named_space_atoms = funcs
         .named_spaces
-        .lock()
+        .read()
         .unwrap()
         .iter()
         .map(|(name, space)| (name.clone(), space.get_atoms()))
@@ -171,7 +171,7 @@ pub fn restore_transaction_state(
     for (name, atoms) in named_space_atoms {
         named_spaces.insert(name, rebuild_space(&atoms)?);
     }
-    *funcs.named_spaces.lock().unwrap() = named_spaces;
+    *funcs.named_spaces.write().unwrap() = named_spaces;
     *funcs.state.lock().unwrap() = state;
     *funcs.fn_cache.write().unwrap() = fn_cache;
     *funcs.fn_effect.write().unwrap() = fn_effect;

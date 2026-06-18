@@ -11,6 +11,7 @@ use crate::atom::Atom;
 use crate::env::Env;
 use crate::func::FnTable;
 use crate::parser::Expr;
+use rayon::prelude::*;
 use std::sync::Arc;
 
 /// Pop the top `n` result sets from the value stack.
@@ -403,13 +404,15 @@ pub(crate) fn apply_frame(
                 vals.push(Vec::new());
                 return Ok(());
             }
-            work.push(Task::Apply(Frame::Gather { n: branches.len() }));
-            for (expr, body_env) in branches.into_iter().rev() {
-                work.push(Task::Eval {
-                    expr,
-                    env: body_env,
-                });
+            let n = branches.len();
+            // Reverse so pop() gives original order (first branch evaluated first).
+            let mut remaining: Vec<_> = branches.into_iter().rev().collect();
+            let (first_expr, first_env) = remaining.pop().unwrap();
+            work.push(Task::Apply(Frame::Gather { n }));
+            if !remaining.is_empty() {
+                work.push(Task::Apply(Frame::SpaceMatchStream { remaining }));
             }
+            work.push(Task::Eval { expr: first_expr, env: first_env });
             Ok(())
         }
         Frame::SpaceAdd { atom, env } => {
@@ -630,12 +633,27 @@ pub(crate) fn apply_frame(
                                 }
                             }
                             if !bodies.is_empty() {
-                                let mut out = Vec::new();
-                                for (body, body_env, _) in bodies {
-                                    let body_rs = super::step::run_rs(body, body_env, funcs, &mut None)?;
-                                    out.extend(body_rs);
-                                }
-                                let merged: Vec<Atom> = out.into_iter().map(|(a, _)| a).collect();
+                                let merged: Vec<Atom> = if bodies.len() > 1
+                                    && funcs.is_parallelizable(name, arity as u8)
+                                {
+                                    bodies
+                                        .into_par_iter()
+                                        .map(|(body, body_env, _)| {
+                                            super::step::run_rs(body, body_env, funcs, &mut None)
+                                                .map(|rs| rs.into_iter().map(|(a, _)| a).collect::<Vec<_>>())
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()?
+                                        .into_iter()
+                                        .flatten()
+                                        .collect()
+                                } else {
+                                    let mut out = Vec::new();
+                                    for (body, body_env, _) in bodies {
+                                        let body_rs = super::step::run_rs(body, body_env, funcs, &mut None)?;
+                                        out.extend(body_rs);
+                                    }
+                                    out.into_iter().map(|(a, _)| a).collect()
+                                };
                                 if let Some(key) = memo_key {
                                     funcs.memo_set(key, merged.clone());
                                 }
@@ -741,6 +759,16 @@ pub(crate) fn apply_frame(
             vals.push(plain(lists));
             Ok(())
         }
+        Frame::SpaceMatchStream { mut remaining } => {
+            // One branch just completed (its result is on vals).
+            // Fire the next branch, or do nothing if we're the last (Gather collects).
+            if let Some((expr, env)) = remaining.pop() {
+                work.push(Task::Apply(Frame::SpaceMatchStream { remaining }));
+                work.push(Task::Eval { expr, env });
+            }
+            Ok(())
+        }
+
         Frame::MemoStore { key } => {
             // Gather already pushed its result onto vals. Peek at it, store in
             // cache tagged with the current mutation stamp, leave it in place.
@@ -845,7 +873,25 @@ pub(crate) fn apply_frame(
                         vals.push(plain(Vec::new()));
                         return Ok(());
                     }
-                    // MemoStore runs after Gather captures all body results.
+                    // Parallel path: pure/SpaceRead functions with multiple matched bodies.
+                    if bodies.len() > 1 && funcs.is_parallelizable(&name, arity as u8) {
+                        let merged: Vec<Atom> = bodies
+                            .into_par_iter()
+                            .map(|(body, body_env, _)| {
+                                super::step::run_rs(body, body_env, funcs, &mut None)
+                                    .map(|rs| rs.into_iter().map(|(a, _)| a).collect::<Vec<_>>())
+                            })
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                        if let Some(key) = memo_key {
+                            funcs.memo_set(key, merged.clone());
+                        }
+                        vals.push(plain(merged));
+                        return Ok(());
+                    }
+                    // Sequential path: impure or single-body.
                     if let Some(key) = memo_key {
                         work.push(Task::Apply(Frame::MemoStore { key }));
                     }

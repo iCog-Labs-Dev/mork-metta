@@ -166,4 +166,10 @@ pub(crate) enum Frame {
     /// After a Gather completes, store the top-of-vals result in the memo cache.
     /// Runs only for pure single-combo user function calls.
     MemoStore { key: (String, Vec<Atom>) },
+    /// Stream one SpaceMatch branch at a time instead of pushing all N body evals
+    /// at once. Holds the pending branches; pops one per firing, then yields to
+    /// the Gather frame that was pushed before the first branch.
+    SpaceMatchStream {
+        remaining: Vec<(Arc<crate::parser::Expr>, Env)>,
+    },
 }

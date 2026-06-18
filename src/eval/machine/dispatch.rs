@@ -65,6 +65,43 @@ pub(crate) fn dispatch_if(args: &[Expr], env: &Env, funcs: &FnTable, work: &mut 
     Ok(())
 }
 
+/// Dispatch an `and` form as sequential conjunction (Prolog-style).
+/// Evaluates arg1 first; if truthy, propagates its bindings into arg2's environment
+/// before evaluating arg2. This prevents the exponential cross-product that would
+/// occur if both args were evaluated independently with free variables.
+pub(crate) fn dispatch_and(args: &[Expr], env: &Env, funcs: &FnTable, work: &mut Vec<Task>, vals: &mut Vec<super::budget::ResultSet>) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err(format!("and: expected 2 args, got {}", args.len()));
+    }
+    let arg1_rs = super::step::run_rs(
+        Arc::new(args[0].clone()),
+        env.clone(),
+        funcs,
+        &mut None,
+    )?;
+    let mut branches: Vec<(Arc<Expr>, Env)> = Vec::new();
+    for (atom, atom_env) in &arg1_rs {
+        if crate::eval::forms::control::is_truthy(atom) {
+            // Propagate arg1's bindings so free variables (e.g. $Z) are bound
+            // when arg2 is evaluated — prevents free-variable combinatorial blowup.
+            let branch_env = crate::eval::shared::pattern::prepend_env(
+                atom_env.clone(),
+                env,
+            );
+            branches.push((Arc::new(args[1].clone()), branch_env));
+        }
+    }
+    if branches.is_empty() {
+        vals.push(super::budget::plain(vec![]));
+        return Ok(());
+    }
+    work.push(Task::Apply(Frame::Gather { n: branches.len() }));
+    for (branch_expr, branch_env) in branches.into_iter().rev() {
+        work.push(Task::Eval { expr: branch_expr, env: branch_env });
+    }
+    Ok(())
+}
+
 /// Dispatch a `case` form by evaluating its scrutinee and deferring branch choice.
 pub(crate) fn dispatch_case(args: &[Expr], env: &Env, work: &mut Vec<Task>) -> Result<(), String> {
     if args.len() != 2 {
@@ -376,6 +413,17 @@ pub(crate) fn dispatch_expr(
                             });
                         }
                         return Ok(());
+                    }
+                    "and" => {
+                        // Sequential only when BOTH args are complex expressions.
+                        // If either arg is a simple symbol (free var like $y or literal),
+                        // fall through to space rules so truth-table matching can bind it.
+                        let both_complex = args.len() == 2
+                            && !matches!(&args[0], Expr::Symbol(_) | Expr::Number(_) | Expr::Str(_))
+                            && !matches!(&args[1], Expr::Symbol(_) | Expr::Number(_) | Expr::Str(_));
+                        if both_complex {
+                            return dispatch_and(args, env, funcs, work, vals);
+                        }
                     }
                     "let" => {
                         if args.len() != 3 {
