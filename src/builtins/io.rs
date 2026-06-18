@@ -99,7 +99,7 @@ fn sread_parse(input: &str) -> Result<Atom, String> {
         return Ok(Atom::Expr(items));
     }
     if let Ok(n) = input.parse::<i128>() {
-        return Ok(Atom::Num(n));
+        return Ok(Atom::num(n));
     }
     Ok(Atom::sym(input))
 }

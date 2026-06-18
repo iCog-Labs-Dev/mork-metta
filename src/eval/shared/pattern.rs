@@ -73,12 +73,12 @@ pub(crate) fn try_match_one(
             Atom::Sym(var_name) if var_name.starts_with('$') => {
                 let key: &str = var_name.as_ref();
                 match crate::eval::shared::env::lookup(env, key) {
-                    Some(bound) if Atom::Num(*number) == bound => Ok(Some(env.clone())),
+                    Some(bound) if Atom::Num(number.clone()) == bound => Ok(Some(env.clone())),
                     Some(_) => Ok(None),
                     None => Ok(Some(crate::eval::shared::env::bind(
                         env,
                         key,
-                        Atom::Num(*number),
+                        Atom::Num(number.clone()),
                     ))),
                 }
             }

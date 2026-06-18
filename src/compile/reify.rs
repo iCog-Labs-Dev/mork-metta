@@ -8,7 +8,7 @@ pub fn expr_to_atom(expr: &Expr) -> Atom {
     match expr {
         Expr::Symbol(symbol) => Atom::sym(symbol),
         Expr::Str(s) => Atom::str_val(s),
-        Expr::Number(number) => Atom::Num(*number),
+        Expr::Number(number) => Atom::Num(number.clone()),
         Expr::List(items) => Atom::Expr(items.iter().map(expr_to_atom).collect()),
     }
 }
@@ -18,7 +18,7 @@ pub fn atom_to_expr(atom: &Atom) -> Result<Expr, String> {
     match atom {
         Atom::Sym(symbol) => Ok(Expr::Symbol(symbol.to_string())),
         Atom::Str(s) => Ok(Expr::Str(s.to_string())),
-        Atom::Num(number) => Ok(Expr::Number(*number)),
+        Atom::Num(number) => Ok(Expr::Number(number.clone())),
         Atom::Expr(items) => {
             let mut exprs = Vec::with_capacity(items.len());
             for item in items {

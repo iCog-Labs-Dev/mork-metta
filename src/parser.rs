@@ -35,7 +35,7 @@ pub enum Expr {
     /// A string literal: `"hello"`, `"foo bar"`
     Str(String),
     /// An integer literal: `30`, `-1`, `354224848179261915075`
-    Number(i128),
+    Number(crate::atom::Numeric),
     /// A parenthesized list: `(fib 30)`, `(+ $N 1)`
     List(Vec<Expr>),
 }
@@ -70,7 +70,7 @@ pub fn expr_to_atom(expr: &Expr) -> Atom {
     match expr {
         Expr::Symbol(s) => Atom::sym(s),
         Expr::Str(s) => Atom::str_val(s),
-        Expr::Number(n) => Atom::Num(*n),
+        Expr::Number(n) => Atom::Num(n.clone()),
         Expr::List(items) => Atom::Expr(items.iter().map(expr_to_atom).collect()),
     }
 }
@@ -91,7 +91,7 @@ pub fn atom_to_expr(atom: &Atom) -> Result<Expr, String> {
     match atom {
         Atom::Sym(s) => Ok(Expr::Symbol(s.to_string())),
         Atom::Str(s) => Ok(Expr::Str(s.to_string())),
-        Atom::Num(n) => Ok(Expr::Number(*n)),
+        Atom::Num(n) => Ok(Expr::Number(n.clone())),
         Atom::Expr(items) => {
             let mut exprs = Vec::with_capacity(items.len());
             for item in items {
@@ -183,8 +183,25 @@ pub(crate) fn parse_sexpr_body(chars: &mut std::iter::Peekable<std::str::Chars<'
             }
             Some(&_) => {
                 let token = read_token(chars);
-                if let Ok(n) = token.parse::<i128>() {
-                    items.push(Expr::Number(n));
+                // Pure integer: only digits (with optional leading '-').
+                // Dashu accepts '_' separators so we guard manually to keep
+                // atoms like 2025_12_12 as symbols, not numbers.
+                let pure_int = {
+                    let s = token.trim_start_matches('-');
+                    !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit())
+                };
+                if pure_int {
+                    if let Ok(n) = token.parse::<dashu::Integer>() {
+                        items.push(Expr::Number(crate::atom::Numeric::Int(n)));
+                    } else {
+                        items.push(Expr::Symbol(token));
+                    }
+                } else if (token.contains('.') || token.contains('e') || token.contains('E'))
+                    && token.parse::<dashu::Decimal>().is_ok()
+                {
+                    items.push(Expr::Number(crate::atom::Numeric::Dec(
+                        token.parse::<dashu::Decimal>().unwrap(),
+                    )));
                 } else {
                     items.push(Expr::Symbol(token));
                 }

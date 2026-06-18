@@ -16,7 +16,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
             Atom::Expr(items) => items.len(),
             _ => 1,
         };
-        Ok(NDet::single(Atom::Num(len as i128)))
+        Ok(NDet::single(Atom::num(len as i128)))
     });
     funcs.mark_pure("size-atom", 1);
 
@@ -26,7 +26,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
             Atom::Expr(items) => items.len(),
             _ => 1,
         };
-        Ok(NDet::single(Atom::Num(len as i128)))
+        Ok(NDet::single(Atom::num(len as i128)))
     });
     funcs.mark_pure("length", 1);
 
@@ -150,7 +150,8 @@ pub fn register_collection_builtins(funcs: &FnTable) {
     funcs.insert_native("index-atom", 2, |args, _| {
         expect(args, 2, "index-atom")?;
         let idx = match &args[1] {
-            Atom::Num(n) => usize::try_from(*n)
+            Atom::Num(n) => args[1].as_num()
+                .and_then(|i| usize::try_from(i).map_err(|_| format!("index-atom: negative index {}", i)))
                 .map_err(|_| format!("index-atom: index must be non-negative, got {}", n))?,
             other => return Err(format!("index-atom: index must be a number, got {}", other.to_sexpr_string())),
         };
@@ -587,7 +588,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         args[0].hash(&mut hasher);
-        Ok(NDet::single(Atom::Num(hasher.finish() as i128)))
+        Ok(NDet::single(Atom::num(hasher.finish() as i128)))
     });
     funcs.mark_pure("term_hash", 1);
 }

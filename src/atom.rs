@@ -1,9 +1,53 @@
 use crate::env::Env;
 use crate::parser::Expr;
+use dashu::Integer as IBig;
+use dashu::Decimal as DBig;
+
+/// A growing numeric value — either an arbitrary-precision integer or decimal.
+/// Integer values up to ~2×64 bits are stored inline (no heap alloc); larger
+/// values promote to heap. Decimal values are exact (no NaN, no IEEE rounding).
+#[derive(Clone, Debug)]
+pub enum Numeric {
+    /// Arbitrary-precision signed integer.
+    Int(IBig),
+    /// Arbitrary-precision signed decimal (exact, no NaN/Inf).
+    Dec(DBig),
+}
+
+impl PartialEq for Numeric {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Numeric::Int(a), Numeric::Int(b)) => a == b,
+            (Numeric::Dec(a), Numeric::Dec(b)) => a == b,
+            _ => false, // Int and Dec are distinct types
+        }
+    }
+}
+impl Eq for Numeric {}
+
+impl std::fmt::Display for Numeric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Numeric::Int(n) => write!(f, "{}", n),
+            Numeric::Dec(d) => write!(f, "{}", d),
+        }
+    }
+}
+
+impl Numeric {
+    /// True if the value is zero.
+    pub fn is_zero(&self) -> bool {
+        match self {
+            Numeric::Int(n) => *n == IBig::from(0i32),
+            Numeric::Dec(d) => *d == DBig::from(0i32),
+        }
+    }
+}
+
 /// Core value type for the MeTTa evaluator.
 ///
 /// Every value in MeTTa is an Atom. Atoms are either:
-/// - `Num(i128)` — integer numbers (i128 handles fib(100) = 354224848179261915075)
+/// - `Num(Numeric)` — arbitrary-precision integers and decimals (no overflow, no NaN)
 /// - `Sym(String)` — symbolic names (functions, variables, bare symbols)
 /// - `Str(String)` — string literals (distinct from symbols, e.g. `"hello"` vs `hello`)
 /// - `Expr(Vec<Atom>)` — S-expressions (nested lists)
@@ -13,7 +57,7 @@ use crate::parser::Expr;
 /// are replaced by their values from the environment during evaluation.
 ///
 /// # Assumptions
-/// - Numbers are 128-bit signed integers (no floats, no bigints).
+/// - Numbers are arbitrary-precision integers or decimals via `dashu`.
 /// - Symbols are Unicode strings stored as `Arc<str>` (shared, O(1) clone).
 /// - Strings are Unicode strings stored as `Arc<str>`, distinct from symbols.
 /// - `Expr` is an owned, fully-evaluated value — not a thunk or promise.
@@ -39,8 +83,8 @@ pub enum Atom {
     /// A string literal value, distinct from symbols.
     /// `"hello"` in source → `Str("hello")`, NOT equal to symbol `hello`.
     Str(Arc<str>),
-    /// A 128-bit signed integer.
-    Num(i128),
+    /// An arbitrary-precision integer or decimal.
+    Num(Numeric),
     /// An S-expression — ordered list of atoms.
     Expr(Vec<Atom>),
     /// An anonymous function created by `|->`. Boxed to keep Atom at 32 bytes.
@@ -52,7 +96,7 @@ impl PartialEq for Atom {
         match (self, other) {
             (Atom::Sym(a), Atom::Sym(b)) => a == b,
             (Atom::Str(a), Atom::Str(b)) => a == b,
-            (Atom::Num(a), Atom::Num(b)) => a == b,
+            (Atom::Num(a), Atom::Num(b)) => a == b, // delegates to Numeric::PartialEq
             (Atom::Expr(a), Atom::Expr(b)) => a == b,
             (Atom::Closure(a), Atom::Closure(b)) => a == b,
             _ => false,
@@ -79,7 +123,7 @@ impl Atom {
                 let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
                 format!("\"{}\"", escaped)
             }
-            Atom::Num(n) => n.to_string(),
+            Atom::Num(n) => n.to_string(), // uses Numeric::Display
             Atom::Expr(items) => {
                 let inner: Vec<String> = items.iter().map(|a| a.to_sexpr_string()).collect();
                 format!("({})", inner.join(" "))
@@ -108,8 +152,16 @@ impl Atom {
     }
 
     /// Convenience: create a number atom.
+    /// Construct an integer atom from an i128 (the common small-integer fast path).
     pub fn num(n: i128) -> Self {
-        Atom::Num(n)
+        Atom::Num(Numeric::Int(IBig::from(n)))
+    }
+
+    /// Construct a decimal atom by parsing a string (e.g. "3.14").
+    pub fn decimal(s: &str) -> Result<Self, String> {
+        s.parse::<DBig>()
+            .map(|d| Atom::Num(Numeric::Dec(d)))
+            .map_err(|e| format!("invalid decimal '{}': {}", s, e))
     }
 
     /// Convenience: create an expression atom.
@@ -117,13 +169,27 @@ impl Atom {
         Atom::Expr(items)
     }
 
-    /// Extract the numeric value from a `Num` variant.
+    /// Extract the integer value as i128. Fails if the number is a decimal or
+    /// too large for i128.
     ///
     /// # Errors
     /// Returns an error description if the atom is not a number.
     pub fn as_num(&self) -> Result<i128, String> {
         match self {
-            Atom::Num(n) => Ok(*n),
+            Atom::Num(Numeric::Int(n)) => {
+                i128::try_from(n.clone()).map_err(|_| format!("integer {} overflows i128", n))
+            }
+            Atom::Num(Numeric::Dec(d)) => {
+                Err(format!("expected integer, got decimal {}", d))
+            }
+            other => Err(format!("expected number, got {}", other.to_sexpr_string())),
+        }
+    }
+
+    /// Extract the Numeric value from a Num atom.
+    pub fn as_numeric(&self) -> Result<&Numeric, String> {
+        match self {
+            Atom::Num(n) => Ok(n),
             other => Err(format!("expected number, got {}", other.to_sexpr_string())),
         }
     }
@@ -173,7 +239,7 @@ impl Atom {
     /// - Strings are always truthy.
     pub fn is_truthy(&self) -> bool {
         match self {
-            Atom::Num(0) => false,
+            Atom::Num(n) if n.is_zero() => false,
             Atom::Sym(s) if s.is_empty() || s.as_ref().eq_ignore_ascii_case("false") => false,
             _ => true,
         }

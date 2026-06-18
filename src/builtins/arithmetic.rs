@@ -1,12 +1,20 @@
 //! Builtins for numeric operations.
 
-use crate::atom::Atom;
+use crate::atom::{Atom, Numeric};
 use crate::func::{FnTable, NDet};
 
-/// Parse an atom as a floating-point number.
+/// Convert a Numeric to f64 for operations that need a floating-point value.
+fn numeric_as_f64(n: &Numeric) -> f64 {
+    match n {
+        Numeric::Int(i) => i.to_string().parse::<f64>().unwrap_or(f64::NAN),
+        Numeric::Dec(d) => d.to_string().parse::<f64>().unwrap_or(f64::NAN),
+    }
+}
+
+/// Parse an atom as a floating-point number (used by trig/sqrt/etc.).
 pub fn atom_as_f64(atom: &Atom, name: &str) -> Result<f64, String> {
     match atom {
-        Atom::Num(n) => Ok(*n as f64),
+        Atom::Num(n) => Ok(numeric_as_f64(n)),
         Atom::Sym(symbol) => symbol
             .parse::<f64>()
             .map_err(|_| format!("{name}: expected number, got {symbol}")),
@@ -17,12 +25,74 @@ pub fn atom_as_f64(atom: &Atom, name: &str) -> Result<f64, String> {
     }
 }
 
+/// Add two Numeric values, promoting to Dec when either operand is Dec.
+fn numeric_add(a: &Numeric, b: &Numeric) -> Numeric {
+    match (a, b) {
+        (Numeric::Int(x), Numeric::Int(y)) => Numeric::Int(x + y),
+        _ => {
+            let x: dashu::Decimal = a.to_string().parse().unwrap();
+            let y: dashu::Decimal = b.to_string().parse().unwrap();
+            Numeric::Dec(x + y)
+        }
+    }
+}
+
+/// Subtract two Numeric values, promoting to Dec when either operand is Dec.
+fn numeric_sub(a: &Numeric, b: &Numeric) -> Numeric {
+    match (a, b) {
+        (Numeric::Int(x), Numeric::Int(y)) => Numeric::Int(x - y),
+        _ => {
+            let x: dashu::Decimal = a.to_string().parse().unwrap();
+            let y: dashu::Decimal = b.to_string().parse().unwrap();
+            Numeric::Dec(x - y)
+        }
+    }
+}
+
+/// Multiply two Numeric values, promoting to Dec when either operand is Dec.
+fn numeric_mul(a: &Numeric, b: &Numeric) -> Numeric {
+    match (a, b) {
+        (Numeric::Int(x), Numeric::Int(y)) => Numeric::Int(x * y),
+        _ => {
+            let x: dashu::Decimal = a.to_string().parse().unwrap();
+            let y: dashu::Decimal = b.to_string().parse().unwrap();
+            Numeric::Dec(x * y)
+        }
+    }
+}
+
+/// Remainder of two Numeric values (integers only; returns error message on Dec).
+fn numeric_rem(a: &Numeric, b: &Numeric) -> Result<Numeric, String> {
+    match (a, b) {
+        (Numeric::Int(x), Numeric::Int(y)) => {
+            if *y == dashu::Integer::from(0i32) {
+                Err("% by zero".into())
+            } else {
+                Ok(Numeric::Int(x % y))
+            }
+        }
+        _ => Err("% requires integers".into()),
+    }
+}
+
+/// Compare two Numeric values. Promotes to Dec for mixed comparisons.
+fn numeric_cmp(a: &Numeric, b: &Numeric) -> std::cmp::Ordering {
+    match (a, b) {
+        (Numeric::Int(x), Numeric::Int(y)) => x.cmp(y),
+        _ => {
+            let x: dashu::Decimal = a.to_string().parse().unwrap();
+            let y: dashu::Decimal = b.to_string().parse().unwrap();
+            x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+        }
+    }
+}
+
 /// Convert a floating-point value into an atom preserving integers.
 pub fn f64_to_atom(value: f64) -> Atom {
-    if value.fract() == 0.0 && value >= i128::MIN as f64 && value <= i128::MAX as f64 {
-        Atom::Num(value as i128)
+    if value.fract() == 0.0 && value.is_finite() {
+        Atom::num(value as i128)
     } else {
-        Atom::sym(&value.to_string())
+        Atom::decimal(&value.to_string()).unwrap_or_else(|_| Atom::sym(&value.to_string()))
     }
 }
 
@@ -33,7 +103,7 @@ pub fn f64_to_float_atom(value: f64) -> Atom {
     } else {
         value.to_string()
     };
-    Atom::sym(&rendered)
+    Atom::decimal(&rendered).unwrap_or_else(|_| Atom::sym(&rendered))
 }
 
 /// Check the expected arity for a builtin call.
@@ -84,7 +154,7 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
     funcs.insert_native("+", 2, |args, _| {
         expect_n_args(args, 2, "+")?;
         Ok(NDet::single(match (&args[0], &args[1]) {
-            (Atom::Num(a), Atom::Num(b)) => Atom::Num(a + b),
+            (Atom::Num(a), Atom::Num(b)) => Atom::Num(numeric_add(a, b)),
             _ => f64_to_atom(atom_as_f64(&args[0], "+")? + atom_as_f64(&args[1], "+")?),
         }))
     });
@@ -93,7 +163,7 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
     funcs.insert_native("-", 2, |args, _| {
         expect_n_args(args, 2, "-")?;
         Ok(NDet::single(match (&args[0], &args[1]) {
-            (Atom::Num(a), Atom::Num(b)) => Atom::Num(a - b),
+            (Atom::Num(a), Atom::Num(b)) => Atom::Num(numeric_sub(a, b)),
             _ => f64_to_atom(atom_as_f64(&args[0], "-")? - atom_as_f64(&args[1], "-")?),
         }))
     });
@@ -102,7 +172,7 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
     funcs.insert_native("*", 2, |args, _| {
         expect_n_args(args, 2, "*")?;
         Ok(NDet::single(match (&args[0], &args[1]) {
-            (Atom::Num(a), Atom::Num(b)) => Atom::Num(a * b),
+            (Atom::Num(a), Atom::Num(b)) => Atom::Num(numeric_mul(a, b)),
             _ => f64_to_atom(atom_as_f64(&args[0], "*")? * atom_as_f64(&args[1], "*")?),
         }))
     });
@@ -119,7 +189,9 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
     funcs.insert_native("%", 2, |args, _| {
         expect_n_args(args, 2, "%")?;
         Ok(NDet::single(match (&args[0], &args[1]) {
-            (Atom::Num(a), Atom::Num(b)) => Atom::Num(a % b),
+            (Atom::Num(a), Atom::Num(b)) => numeric_rem(a, b)
+                    .map(Atom::Num)
+                    .unwrap_or_else(|e| Atom::sym(&e)),
             _ => f64_to_atom(atom_as_f64(&args[0], "%")? % atom_as_f64(&args[1], "%")?),
         }))
     });
@@ -127,33 +199,37 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
 
     funcs.insert_native("<", 2, |args, _| {
         expect_n_args(args, 2, "<")?;
-        let lhs = atom_as_f64(&args[0], "<")?;
-        let rhs = atom_as_f64(&args[1], "<")?;
-        Ok(NDet::single(crate::builtins::boolean::bool_atom(lhs < rhs)))
+        Ok(NDet::single(crate::builtins::boolean::bool_atom(match (&args[0], &args[1]) {
+            (Atom::Num(a), Atom::Num(b)) => numeric_cmp(a, b) == std::cmp::Ordering::Less,
+            _ => atom_as_f64(&args[0], "<")? < atom_as_f64(&args[1], "<")?,
+        })))
     });
     funcs.mark_pure("<", 2);
 
     funcs.insert_native(">", 2, |args, _| {
         expect_n_args(args, 2, ">")?;
-        let lhs = atom_as_f64(&args[0], ">")?;
-        let rhs = atom_as_f64(&args[1], ">")?;
-        Ok(NDet::single(crate::builtins::boolean::bool_atom(lhs > rhs)))
+        Ok(NDet::single(crate::builtins::boolean::bool_atom(match (&args[0], &args[1]) {
+            (Atom::Num(a), Atom::Num(b)) => numeric_cmp(a, b) == std::cmp::Ordering::Greater,
+            _ => atom_as_f64(&args[0], ">")? > atom_as_f64(&args[1], ">")?,
+        })))
     });
     funcs.mark_pure(">", 2);
 
     funcs.insert_native("<=", 2, |args, _| {
         expect_n_args(args, 2, "<=")?;
-        let lhs = atom_as_f64(&args[0], "<=")?;
-        let rhs = atom_as_f64(&args[1], "<=")?;
-        Ok(NDet::single(crate::builtins::boolean::bool_atom(lhs <= rhs)))
+        Ok(NDet::single(crate::builtins::boolean::bool_atom(match (&args[0], &args[1]) {
+            (Atom::Num(a), Atom::Num(b)) => numeric_cmp(a, b) != std::cmp::Ordering::Greater,
+            _ => atom_as_f64(&args[0], "<=")? <= atom_as_f64(&args[1], "<=")?,
+        })))
     });
     funcs.mark_pure("<=", 2);
 
     funcs.insert_native(">=", 2, |args, _| {
         expect_n_args(args, 2, ">=")?;
-        let lhs = atom_as_f64(&args[0], ">=")?;
-        let rhs = atom_as_f64(&args[1], ">=")?;
-        Ok(NDet::single(crate::builtins::boolean::bool_atom(lhs >= rhs)))
+        Ok(NDet::single(crate::builtins::boolean::bool_atom(match (&args[0], &args[1]) {
+            (Atom::Num(a), Atom::Num(b)) => numeric_cmp(a, b) != std::cmp::Ordering::Less,
+            _ => atom_as_f64(&args[0], ">=")? >= atom_as_f64(&args[1], ">=")?,
+        })))
     });
     funcs.mark_pure(">=", 2);
 

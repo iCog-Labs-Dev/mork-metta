@@ -95,7 +95,7 @@ pub(crate) fn dispatch_expr(
 ) -> Result<(), String> {
     match expr {
         Expr::Number(number) => {
-            vals.push(plain(vec![crate::atom::Atom::Num(*number)]));
+            vals.push(plain(vec![crate::atom::Atom::Num(number.clone())]));
             Ok(())
         }
         Expr::Symbol(symbol) => {

@@ -35,7 +35,7 @@ impl Pattern {
             Expr::Symbol(s) if s.starts_with('$') => Pattern::Var(s.clone()),
             Expr::Symbol(s) => Pattern::Exact(Atom::sym(s)),
             Expr::Str(s) => Pattern::Exact(Atom::str_val(s)),
-            Expr::Number(n) => Pattern::Exact(Atom::Num(*n)),
+            Expr::Number(n) => Pattern::Exact(Atom::Num(n.clone())),
             Expr::List(items) => Pattern::Expr(items.iter().map(Self::from_expr).collect()),
         }
     }
@@ -217,8 +217,8 @@ fn varname(i: u8) -> Atom {
 fn symbol_to_atom(s: &str) -> Atom {
     let digits = s.strip_prefix('-').unwrap_or(s);
     if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
-        if let Ok(n) = s.parse::<i128>() {
-            return Atom::Num(n);
+        if let Ok(n) = s.parse::<dashu::Integer>() {
+            return Atom::Num(crate::atom::Numeric::Int(n));
         }
     }
     Atom::sym(s)
@@ -425,10 +425,10 @@ fn parse_value(chars: &[char], pos: &mut usize) -> Result<Atom, String> {
                 *pos += 1;
             }
             let num_str: String = chars[start..*pos].iter().collect();
-            let n: i128 = num_str
+            let n: dashu::Integer = num_str
                 .parse()
                 .map_err(|_| format!("invalid number: {}", num_str))?;
-            Ok(Atom::Num(n))
+            Ok(Atom::Num(crate::atom::Numeric::Int(n)))
         }
         c if c.is_alphanumeric() || "$!?<>=+-*/_".contains(c) => {
             let start = *pos;
