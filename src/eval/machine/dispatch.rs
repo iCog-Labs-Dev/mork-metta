@@ -398,6 +398,28 @@ pub(crate) fn dispatch_expr(
                                 vals.push(Vec::new());
                                 return Ok(());
                             }
+                            // Parallel path: each element gets its own run_rs instance
+                            // when none of them mutate space.
+                            if n > 1 && elems.iter().all(|e| funcs.is_parallelizable_expr(e)) {
+                                use rayon::prelude::*;
+                                let flat = elems
+                                    .par_iter()
+                                    .map(|e| {
+                                        super::step::run_rs(
+                                            Arc::new(e.clone()),
+                                            env.clone(),
+                                            funcs,
+                                            &mut None,
+                                        )
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?
+                                    .into_iter()
+                                    .flatten()
+                                    .collect();
+                                vals.push(flat);
+                                return Ok(());
+                            }
+                            // Sequential fallback.
                             work.push(Task::Apply(Frame::Gather { n }));
                             for elem in elems.iter().rev() {
                                 work.push(Task::Eval {

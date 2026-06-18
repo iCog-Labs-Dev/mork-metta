@@ -390,6 +390,11 @@ impl FnTable {
             .map(|e| e != Effect::SpaceMutate)
             .unwrap_or(false)
     }
+
+    /// True if the expression can be evaluated in parallel (no space mutation).
+    pub fn is_parallelizable_expr(&self, expr: &crate::parser::Expr) -> bool {
+        is_pure_expr_inner(expr, self, None) != Effect::SpaceMutate
+    }
 }
 
 fn is_pure_expr_assuming(expr: &crate::parser::Expr, funcs: &FnTable, self_name: &str) -> Effect {
