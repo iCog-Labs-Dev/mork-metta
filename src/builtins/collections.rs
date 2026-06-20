@@ -9,6 +9,19 @@ fn expect(args: &[Atom], n: usize, name: &str) -> Result<(), String> {
     crate::builtins::arithmetic::expect_n_args(args, n, name)
 }
 
+fn decons_impl(args: &[Atom], _: &FnTable) -> Result<NDet, String> {
+    expect(args, 1, "decons")?;
+    match &args[0] {
+        Atom::Expr(items) if !items.is_empty() => {
+            let head = items[0].clone();
+            let rest = Atom::Expr(Arc::from(&items[1..]));
+            Ok(NDet::single(Atom::Expr(Arc::from([head, rest]))))
+        }
+        Atom::Expr(_) => Err("decons: empty list".into()),
+        other => Err(format!("decons: expected list, got {}", other.to_sexpr_string())),
+    }
+}
+
 /// Register collection builtins.
 pub fn register_collection_builtins(funcs: &FnTable) {
     funcs.insert_native("size-atom", 1, |args, _| {
@@ -93,32 +106,10 @@ pub fn register_collection_builtins(funcs: &FnTable) {
     });
     funcs.mark_pure("cons", 2);
 
-    funcs.insert_native("decons-atom", 1, |args, _| {
-        expect(args, 1, "decons-atom")?;
-        match &args[0] {
-            Atom::Expr(items) if !items.is_empty() => {
-                let head = items[0].clone();
-                let rest = Atom::Expr(Arc::from(&items[1..]));
-                Ok(NDet::single(Atom::Expr(Arc::from([head, rest]))))
-            }
-            Atom::Expr(_) => Err("decons-atom: empty list".into()),
-            other => Err(format!("decons-atom: expected list, got {}", other.to_sexpr_string())),
-        }
-    });
+    funcs.insert_native("decons-atom", 1, decons_impl);
     funcs.mark_pure("decons-atom", 1);
 
-    funcs.insert_native("decons", 1, |args, _| {
-        expect(args, 1, "decons")?;
-        match &args[0] {
-            Atom::Expr(items) if !items.is_empty() => {
-                let head = items[0].clone();
-                let rest = Atom::Expr(Arc::from(&items[1..]));
-                Ok(NDet::single(Atom::Expr(Arc::from([head, rest]))))
-            }
-            Atom::Expr(_) => Err("decons: empty list".into()),
-            other => Err(format!("decons: expected list, got {}", other.to_sexpr_string())),
-        }
-    });
+    funcs.insert_native("decons", 1, decons_impl);
     funcs.mark_pure("decons", 1);
 
     funcs.insert_native("append", 2, |args, _| {
