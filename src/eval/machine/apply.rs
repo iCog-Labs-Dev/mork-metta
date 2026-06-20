@@ -1014,20 +1014,28 @@ pub(crate) fn apply_frame(
                     }
                     // Parallel path: pure/SpaceRead functions with multiple matched bodies.
                     if bodies.len() > 1 && funcs.is_parallelizable(&name, arity as u8) {
-                        let merged: Vec<Atom> = bodies
+                        let merged: Vec<(Atom, Env)> = bodies
                             .into_par_iter()
                             .map(|(body, body_env, _)| {
-                                super::step::run_rs(body, body_env, funcs, &mut None)
-                                    .map(|rs| rs.into_iter().map(|(a, _)| a).collect::<Vec<_>>())
+                                let be = body_env;
+                                super::step::run_rs(body, be.clone(), funcs, &mut None)
+                                    .map(|rs| {
+                                        rs.into_iter().map(move |(a, result_env)| {
+                                            let merged = crate::eval::shared::pattern::prepend_env(
+                                                be.clone(), &result_env);
+                                            (a, merged)
+                                        }).collect::<Vec<_>>()
+                                    })
                             })
                             .collect::<Result<Vec<_>, _>>()?
                             .into_iter()
                             .flatten()
                             .collect();
                         if let Some(key) = memo_key {
-                            funcs.memo_set(key, merged.clone());
+                            let atoms_only: Vec<Atom> = merged.iter().map(|(a, _)| a.clone()).collect();
+                            funcs.memo_set(key, atoms_only);
                         }
-                        vals.push(plain(merged));
+                        vals.push(merged);
                         return Ok(());
                     }
                     // Sequential path: impure or single-body.
