@@ -8,7 +8,7 @@ use super::frame::Frame;
 use super::state::Transition;
 use super::task::Task;
 use crate::atom::Atom;
-use crate::env::Env;
+use crate::env::{Env, EnvNode};
 use crate::func::FnTable;
 use crate::parser::Expr;
 use rayon::prelude::*;
@@ -42,6 +42,27 @@ pub(crate) fn cartesian_product(options: &[Vec<Atom>]) -> Vec<Vec<Atom>> {
         result = next;
     }
     result
+}
+
+
+/// PeTTa semantics: variables are single-assignment — reject bindings that
+/// would shadow a variable already present in the outer environment.
+fn has_shadowing(new_env: &Env, outer_env: &Env) -> bool {
+    if outer_env.is_empty_env() {
+        return false;
+    }
+    let mut current = new_env;
+    loop {
+        match current.inner() {
+            EnvNode::Empty => return false,
+            EnvNode::Cons { name, value: _, next } => {
+                if outer_env.get(name).is_some() {
+                    return true;
+                }
+                current = next;
+            }
+        }
+    }
 }
 
 /// Lazy cartesian product: visits every combination via callback without
@@ -214,11 +235,26 @@ pub(crate) fn apply_frame(
 
             let mut branches: Vec<(Arc<Expr>, Env)> = Vec::new();
             for (value, _) in &value_rs {
-                if let Ok(Some(matched)) =
-                    crate::eval::shared::pattern::try_match_one(&pattern, value, &Env::new(), funcs)
+                match crate::eval::shared::pattern::try_match_one(&pattern, value, &Env::new(), funcs)
                 {
-                    let body_env = crate::eval::shared::env::prepend_chain(matched, &env);
-                    branches.push((Arc::clone(&body), body_env));
+                    Ok(Some(matched)) => {
+                        if has_shadowing(&matched, &env) {
+                            eprintln!("warn: let pattern variable shadows outer binding — rejecting match");
+                        } else {
+                            let body_env = crate::eval::shared::env::prepend_chain(matched, &env);
+                            branches.push((Arc::clone(&body), body_env));
+                        }
+                    }
+                    Ok(None) => {
+                        eprintln!(
+                            "warn: let pattern {} does not match value {}",
+                            pattern.to_string(),
+                            value.to_sexpr_string(),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("warn: let pattern match error: {}", e);
+                    }
                 }
             }
             if branches.is_empty() {
@@ -403,22 +439,37 @@ pub(crate) fn apply_frame(
             }
             let mut branches = Vec::new();
             for (value, _) in &value_rs {
-                if let Ok(Some(matched)) =
-                    crate::eval::shared::pattern::try_match_one(pattern, value, &Env::new(), funcs)
+                match crate::eval::shared::pattern::try_match_one(pattern, value, &Env::new(), funcs)
                 {
-                    let next_env = crate::eval::shared::env::prepend_chain(matched, &env);
-                    if bind_index + 1 < bindings.len() {
-                        let (_, value_expr) = crate::eval::forms::control::let_star_binding(
-                            &bindings,
-                            bind_index + 1,
-                        )?;
-                        branches.push(Branch::Next {
-                            next_index: bind_index + 1,
-                            value_expr: value_expr.clone(),
-                            env: next_env,
-                        });
-                    } else {
-                        branches.push(Branch::Final { env: next_env });
+                    Ok(Some(matched)) => {
+                        if has_shadowing(&matched, &env) {
+                            eprintln!("warn: let* pattern variable shadows outer binding — rejecting match");
+                            continue;
+                        }
+                        let next_env = crate::eval::shared::env::prepend_chain(matched, &env);
+                        if bind_index + 1 < bindings.len() {
+                            let (_, value_expr) = crate::eval::forms::control::let_star_binding(
+                                &bindings,
+                                bind_index + 1,
+                            )?;
+                            branches.push(Branch::Next {
+                                next_index: bind_index + 1,
+                                value_expr: value_expr.clone(),
+                                env: next_env,
+                            });
+                        } else {
+                            branches.push(Branch::Final { env: next_env });
+                        }
+                    }
+                    Ok(None) => {
+                        eprintln!(
+                            "warn: let* pattern {} does not match value {}",
+                            pattern.to_string(),
+                            value.to_sexpr_string(),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("warn: let* pattern match error: {}", e);
                     }
                 }
             }
