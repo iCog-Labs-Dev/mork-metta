@@ -3,11 +3,11 @@
 use crate::atom::Atom;
 use crate::func::FnTable;
 use crate::space::Space;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
 static NAMED_MUTEXES: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    LazyLock::new(|| Mutex::new(HashMap::default()));
 
 /// Snapshot of mutable evaluator-backed state.
 pub struct TransactionSnapshot {
@@ -167,7 +167,7 @@ pub fn restore_transaction_state(
 
     *funcs.space.write().unwrap() = rebuild_space(&self_atoms)?;
 
-    let mut named_spaces = HashMap::new();
+    let mut named_spaces = HashMap::default();
     for (name, atoms) in named_space_atoms {
         named_spaces.insert(name, rebuild_space(&atoms)?);
     }

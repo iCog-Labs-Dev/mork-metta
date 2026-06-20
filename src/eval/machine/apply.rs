@@ -100,6 +100,13 @@ pub(crate) fn apply_frame(
             let mut out = Vec::new();
             for result_set in pop_n(vals, n) {
                 out.extend(result_set);
+                if out.len() > 1_000_000 {
+                    return Err(
+                        "result set exceeded 1 000 000 entries — possible infinite recursion \
+                         (hint: replace `(range 0 inf)` loops with direct tail recursion)"
+                            .into(),
+                    );
+                }
             }
             vals.push(out);
             Ok(())
@@ -298,6 +305,49 @@ pub(crate) fn apply_frame(
             let atoms = crate::eval::io::load_metta_file(&resolved, &env, funcs)?;
             *funcs.import_dir.lock().unwrap() = prev_dir;
             vals.push(super::budget::plain(atoms));
+            Ok(())
+        }
+        Frame::PythonImport { path, env } => {
+            let space_rs = pop_n(vals, 1).pop().unwrap();
+            let _space_ref = space_rs
+                .into_iter()
+                .next()
+                .map(|(a, _)| a)
+                .unwrap_or_else(|| crate::atom::Atom::sym("&self"));
+            let import_dir = funcs.import_dir.lock().unwrap().clone();
+            // Try as-is and with .py extension
+            let py_path = std::path::Path::new(&path);
+            let resolved = if py_path.exists() {
+                Some(py_path.to_path_buf())
+            } else {
+                let with_ext = format!("{}.py", path);
+                let py_ext = std::path::Path::new(&with_ext);
+                if py_ext.exists() {
+                    Some(py_ext.to_path_buf())
+                } else {
+                    // Search import dir
+                    let in_dir = import_dir.join(&path);
+                    if in_dir.exists() {
+                        Some(in_dir)
+                    } else {
+                        let in_dir_ext = import_dir.join(&with_ext);
+                        if in_dir_ext.exists() {
+                            Some(in_dir_ext)
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+            .ok_or_else(|| {
+                format!(
+                    "import!: cannot find Python file '{}' (searched CWD and '{}')",
+                    path,
+                    import_dir.display()
+                )
+            })?;
+            crate::eval::python::eval_py_import_library(&resolved)?;
+            vals.push(super::budget::plain(vec![crate::atom::Atom::sym("true")]));
             Ok(())
         }
         Frame::FoldlAtom { items, index, acc, func } => {

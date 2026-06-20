@@ -252,14 +252,41 @@ pub(crate) fn dispatch_expr(
                         if args.len() != 2 {
                             return Err(format!("import!: expected 2 args, got {}", args.len()));
                         }
+                        // Check for (library name.py) syntax — Python file import
+                        if let Expr::List(lib_items) = &args[1] {
+                            if lib_items.len() == 2 {
+                                if let Expr::Symbol(head) = &lib_items[0] {
+                                    if head == "library" {
+                                        if let Expr::Symbol(py_path) = &lib_items[1] {
+                                            work.push(Task::Apply(Frame::PythonImport {
+                                                path: py_path.clone(),
+                                                env: env.clone(),
+                                            }));
+                                            work.push(Task::Eval {
+                                                expr: Arc::new(args[0].clone()),
+                                                env: env.clone(),
+                                            });
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         let path = match &args[1] {
                             Expr::Symbol(s) => s.clone(),
                             _ => return Err("import!: path must be a symbol".into()),
                         };
-                        work.push(Task::Apply(Frame::ImportFile {
-                            path,
-                            env: env.clone(),
-                        }));
+                        if path.ends_with(".py") {
+                            work.push(Task::Apply(Frame::PythonImport {
+                                path,
+                                env: env.clone(),
+                            }));
+                        } else {
+                            work.push(Task::Apply(Frame::ImportFile {
+                                path,
+                                env: env.clone(),
+                            }));
+                        }
                         work.push(Task::Eval {
                             expr: Arc::new(args[0].clone()),
                             env: env.clone(),
@@ -271,6 +298,30 @@ pub(crate) fn dispatch_expr(
                         let nd = crate::eval::io::eval_import_rs(args, env, funcs)?;
                         vals.push(plain(nd.collect()));
                         return Ok(());
+                    }
+                    "py-call" => {
+                        if args.len() != 1 {
+                            return Err(format!(
+                                "py-call: expected 1 arg (a Python expression), got {}",
+                                args.len()
+                            ));
+                        }
+                        match crate::eval::python::eval_py_call(args, env, funcs) {
+                            Ok(nd) => {
+                                vals.push(plain(nd.collect()));
+                                return Ok(());
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    "py-eval" => {
+                        match crate::eval::python::eval_py_eval(args, env, funcs) {
+                            Ok(nd) => {
+                                vals.push(plain(nd.collect()));
+                                return Ok(());
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                     "println!" => {
                         if args.len() != 1 {

@@ -46,6 +46,15 @@ pub(crate) fn run_rs(
     let mut vals: Vec<ResultSet> = Vec::with_capacity(32);
 
     while let Some(task) = work.pop() {
+        if work.len() + vals.len() > 2_000_000 {
+            return Err(format!(
+                "evaluation stack overflow: {} pending tasks, {} result sets — \
+                 possible infinite recursion (hint: use direct tail recursion \
+                 instead of `(range 0 inf)` style loops)",
+                work.len(),
+                vals.len()
+            ));
+        }
         match task {
             super::task::Task::Eval { expr, env } => {
                 super::dispatch::dispatch_expr(&expr, &env, funcs, &mut work, &mut vals)?;

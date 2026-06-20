@@ -148,6 +148,14 @@ pub(crate) enum Frame {
         path: String,
         env: Env,
     },
+
+    /// Import a Python file as a module (from `(library ...)` syntax).
+    PythonImport {
+        /// Path to the .py file.
+        path: String,
+        /// Environment for resolving the space reference.
+        env: Env,
+    },
     /// One step of foldl-atom: apply result as new acc, continue fold.
     FoldlAtom {
         /// All items in the list being folded.

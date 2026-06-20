@@ -1,7 +1,7 @@
 use crate::atom::Atom;
 use crate::parser::Expr;
 use crate::space::Space;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 /// Function dispatch table.
@@ -139,29 +139,29 @@ pub struct FnTable {
 impl FnTable {
     pub fn new() -> Self {
         FnTable {
-            map: RwLock::new(HashMap::new()),
+            map: RwLock::new(HashMap::default()),
             space: RwLock::new(Box::new(crate::space::MorkSpace::new())),
-            named_spaces: RwLock::new(HashMap::new()),
-            fn_cache: RwLock::new(HashMap::new()),
-            fn_effect: RwLock::new(HashMap::new()),
-            state: Mutex::new(HashMap::new()),
+            named_spaces: RwLock::new(HashMap::default()),
+            fn_cache: RwLock::new(HashMap::default()),
+            fn_effect: RwLock::new(HashMap::default()),
+            state: Mutex::new(HashMap::default()),
             import_dir: Mutex::new(PathBuf::from(".")),
             memo_stamp: AtomicU64::new(0),
-            memo_cache: RwLock::new(HashMap::new()),
+            memo_cache: RwLock::new(HashMap::default()),
         }
     }
 
     pub fn with_space(space: Box<dyn Space + Send>) -> Self {
         FnTable {
-            map: RwLock::new(HashMap::new()),
+            map: RwLock::new(HashMap::default()),
             space: RwLock::new(space),
-            named_spaces: RwLock::new(HashMap::new()),
-            fn_cache: RwLock::new(HashMap::new()),
-            fn_effect: RwLock::new(HashMap::new()),
-            state: Mutex::new(HashMap::new()),
+            named_spaces: RwLock::new(HashMap::default()),
+            fn_cache: RwLock::new(HashMap::default()),
+            fn_effect: RwLock::new(HashMap::default()),
+            state: Mutex::new(HashMap::default()),
             import_dir: Mutex::new(PathBuf::from(".")),
             memo_stamp: AtomicU64::new(0),
-            memo_cache: RwLock::new(HashMap::new()),
+            memo_cache: RwLock::new(HashMap::default()),
         }
     }
 
@@ -173,7 +173,7 @@ impl FnTable {
             .write()
             .unwrap()
             .entry(name.to_string())
-            .or_insert_with(HashMap::new)
+            .or_insert_with(HashMap::default)
             .insert(
                 arity,
                 Arc::new(Function {
@@ -260,7 +260,7 @@ impl FnTable {
             let mut cache = self.fn_cache.write().unwrap();
             let clauses = cache
                 .entry(name.to_string())
-                .or_insert_with(HashMap::new)
+                .or_insert_with(HashMap::default)
                 .entry(arity)
                 .or_insert_with(Vec::new);
             // Idempotent: the trie gives `(= head body)` set semantics, so the
@@ -277,7 +277,7 @@ impl FnTable {
         let mut effects = self.fn_effect.write().unwrap();
         let entry = effects
             .entry(name.to_string())
-            .or_insert_with(HashMap::new)
+            .or_insert_with(HashMap::default)
             .entry(arity)
             .or_insert(Effect::Pure);
         *entry = entry.max(clause_effect);
@@ -429,7 +429,7 @@ fn is_pure_expr_inner(
                     // SpaceMutate: ADDATOM/REMATOM in spec, forced re-eval, or IO.
                     "eval" | "call" | "reduce" | "assert" | "transform" | "add-atom"
                     | "remove-atom" | "with_mutex" | "transaction" | "import!"
-                    | "foldall" | "map-atom" | "forall" | "within" | "py-call"
+                    | "foldall" | "map-atom" | "forall" | "within" | "py-call" | "py-eval"
                     | "import-rs!" => Effect::SpaceMutate,
                     _ => {
                         // Registered natives: look up their declared Effect.

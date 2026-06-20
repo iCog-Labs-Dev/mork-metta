@@ -265,6 +265,11 @@ fn decode_one(b: &[u8], pos: &mut usize, var_count: &mut u8) -> Option<Atom> {
             *pos += 1;
             Some(varname(idx))
         }
+        Tag::LongVarRef => {
+            *pos += 2;
+            let i = b[*pos - 1];
+            Some(varname(i))
+        }
         Tag::VarRef(i) => {
             *pos += 1;
             Some(varname(i))
