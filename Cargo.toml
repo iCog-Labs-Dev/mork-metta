@@ -1,8 +1,10 @@
+
 [package]
 name = "mork-metta"
 version = "0.1.0"
 edition = "2024"
-
+[profile.release]
+debug = true
 [features]
 default = []
 trace = []
@@ -15,3 +17,5 @@ pathmap = { workspace = true }
 pyo3 = { workspace = true, optional = true, features = ["auto-initialize"] }
 libloading = { version = "0.8", optional = true }
 rayon = "1"
+dashu = "0.4"
+rustc-hash = "2.1.2"
