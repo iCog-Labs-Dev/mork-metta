@@ -39,4 +39,19 @@ pub fn register_type_builtins(funcs: &FnTable) {
         Ok(NDet::single(Atom::sym(kind)))
     });
     funcs.mark_pure("get-metatype", 1);
+
+    funcs.insert_native("is-ground", 1, |args, _| {
+        crate::builtins::arithmetic::expect_n_args(args, 1, "is-ground")?;
+        let is_ground = is_ground_rec(&args[0]);
+        Ok(NDet::single(crate::builtins::boolean::bool_atom(is_ground)))
+    });
+    funcs.mark_pure("is-ground", 1);
+}
+
+fn is_ground_rec(atom: &Atom) -> bool {
+    match atom {
+        Atom::Sym(symbol) => !symbol.starts_with('$'),
+        Atom::Expr(expr) => expr.iter().all(is_ground_rec),
+        _ => true,
+    }
 }
