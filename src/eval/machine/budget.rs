@@ -25,16 +25,11 @@ pub(crate) fn atoms_of(results: &ResultSet) -> Vec<Atom> {
         .collect()
 }
 
-/// Calculate the structural cost of an atom.
+/// monotone (larger terms cost more). Charging for immediate children only is a
 pub fn calculate_cost(atom: &Atom) -> Option<i64> {
     match atom {
-        Atom::Sym(_) | Atom::Str(_) => Some(1),
-        Atom::Num(_) => Some(1),
-        Atom::Expr(items) => {
-            let base_cost = (items.len() as i64) * 2;
-            let recursive_cost: i64 = items.iter().filter_map(calculate_cost).sum();
-            Some(base_cost + recursive_cost)
-        }
+        Atom::Sym(_) | Atom::Str(_) | Atom::Num(_) => Some(1),
+        Atom::Expr(items) => Some(items.len() as i64 + 1),
         Atom::Closure(_) => Some(5),
     }
 }

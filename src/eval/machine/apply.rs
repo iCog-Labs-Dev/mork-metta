@@ -1104,8 +1104,7 @@ pub(crate) fn apply_frame(
                             env: body_env,
                         });
                         // debit query and substitution cost prior to body evaluation
-                        let body_atom = crate::parser::expr_to_atom(&body);
-                        let body_cost = crate::eval::machine::budget::calculate_cost(&body_atom).unwrap_or(0);
+                        let body_cost = crate::eval::machine::budget::calculate_expr_cost(&body);
                         work.push(Task::Transition(Transition::Query {
                             cost: subst_cost + body_cost,
                         }));

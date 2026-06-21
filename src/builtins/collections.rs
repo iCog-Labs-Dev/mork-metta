@@ -507,6 +507,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
         }
         Ok(NDet::single(Atom::Expr(results.into())))
     });
+
     funcs.insert_native("maplist", 2, |args, table| {
         expect(args, 2, "maplist")?;
         let items: Vec<Atom> = match &args[1] { Atom::Expr(v) => v.to_vec(), other => vec![other.clone()] };

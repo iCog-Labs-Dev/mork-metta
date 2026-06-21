@@ -134,6 +134,9 @@ pub struct FnTable {
     pub memo_stamp: AtomicU64,
     /// Memo cache for pure user-defined functions: (name, args) → (stamp, results).
     pub memo_cache: RwLock<HashMap<(String, Vec<Atom>), (u64, Vec<Atom>)>>,
+    /// Lazy-arg mask cache: (name, arity) → Vec<bool>. Populated on first call,
+    /// invalidated on cache_fn (add-atom / redefinition).
+    pub lazy_mask_cache: RwLock<HashMap<(String, u8), Vec<bool>>>,
 }
 
 impl FnTable {
@@ -148,6 +151,7 @@ impl FnTable {
             import_dir: Mutex::new(PathBuf::from(".")),
             memo_stamp: AtomicU64::new(0),
             memo_cache: RwLock::new(HashMap::default()),
+            lazy_mask_cache: RwLock::new(HashMap::default()),
         }
     }
 
@@ -162,6 +166,7 @@ impl FnTable {
             import_dir: Mutex::new(PathBuf::from(".")),
             memo_stamp: AtomicU64::new(0),
             memo_cache: RwLock::new(HashMap::default()),
+            lazy_mask_cache: RwLock::new(HashMap::default()),
         }
     }
 
@@ -284,7 +289,28 @@ impl FnTable {
         }
     }
 
+    /// Get or compute the lazy-arg mask for a user function (cached per name+arity).
+    pub fn get_lazy_mask(&self, name: &str, arity: u8) -> Vec<bool> {
+        let key = (name.to_string(), arity);
+        if let Some(mask) = self.lazy_mask_cache.read().unwrap().get(&key) {
+            return mask.clone();
+        }
+        let mask = if let Some(clauses) = self.fn_cache.read().unwrap()
+            .get(name).and_then(|m| m.get(&arity))
+        {
+            let slice: Vec<(&[crate::parser::Expr], &crate::parser::Expr)> =
+                clauses.iter().map(|c| (c.patterns.as_slice(), &c.body)).collect();
+            crate::eval::shared::closure::lazy_user_arg_mask(&slice)
+        } else {
+            vec![]
+        };
+        self.lazy_mask_cache.write().unwrap().insert(key, mask.clone());
+        mask
+    }
+
     pub fn cache_fn(&self, name: &str, arity: u8, clause: Clause) {
+        // Invalidate lazy mask when clauses change.
+        self.lazy_mask_cache.write().unwrap().remove(&(name.to_string(), arity));
         // Compute space-free purity BEFORE taking the cache write lock: the
         // analysis reads fn_cache/fn_effect, so locking first would deadlock.
         // Self-recursion is optimistically pure, so directly recursive pure

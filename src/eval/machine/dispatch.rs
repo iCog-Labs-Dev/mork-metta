@@ -448,27 +448,35 @@ pub(crate) fn dispatch_expr(
                                 return Ok(());
                             }
                             // Parallel path: each element gets its own run_rs instance
-                            // when none of them mutate space.
-                            if n > 1
+                            // Threshold scales with thread count: rayon idle-spin overhead
+                            // per invocation ≈ k * num_threads. Only parallelize when total
+                            // work comfortably exceeds that. join() is lower-overhead for n=2.
+                            let nthreads = rayon::current_num_threads();
+                            let par_threshold = 10 * nthreads;
+                            let weights: usize = elems.iter().map(|e| funcs.expr_weight(e)).sum();
+                            if n >= 2
+                                && weights >= par_threshold
                                 && elems.iter().all(|e| funcs.is_parallelizable_expr(e))
-                                && elems.iter().map(|e| funcs.expr_weight(e)).sum::<usize>() >= 15
                             {
-                                use rayon::prelude::*;
-                                let flat = elems
-                                    .par_iter()
-                                    .map(|e| {
-                                        super::step::run_rs(
-                                            Arc::new(e.clone()),
-                                            env.clone(),
-                                            funcs,
-                                            &mut None,
-                                        )
-                                    })
-                                    .collect::<Result<Vec<_>, _>>()?
-                                    .into_iter()
-                                    .flatten()
-                                    .collect();
-                                vals.push(flat);
+                                if n == 2 {
+                                    // join() has lower overhead than par_iter for exactly 2 tasks.
+                                    let (r0, r1) = rayon::join(
+                                        || super::step::run_rs(Arc::new(elems[0].clone()), env.clone(), funcs, &mut None),
+                                        || super::step::run_rs(Arc::new(elems[1].clone()), env.clone(), funcs, &mut None),
+                                    );
+                                    let flat = r0?.into_iter().chain(r1?.into_iter()).collect();
+                                    vals.push(flat);
+                                } else {
+                                    use rayon::prelude::*;
+                                    let flat = elems
+                                        .par_iter()
+                                        .map(|e| super::step::run_rs(Arc::new(e.clone()), env.clone(), funcs, &mut None))
+                                        .collect::<Result<Vec<_>, _>>()?
+                                        .into_iter()
+                                        .flatten()
+                                        .collect();
+                                    vals.push(flat);
+                                }
                                 return Ok(());
                             }
                             // Sequential fallback.
@@ -703,10 +711,12 @@ pub(crate) fn dispatch_expr(
                             let mut eager_indices: Vec<usize> = (0..args.len()).collect();
 
                             // parallel argument evaluation for pure/read-only native calls
-                            if eager_indices.len() > 1
+                            let par_threshold = 10 * rayon::current_num_threads();
+                            let arg_weights: usize = eager_indices.iter().map(|&idx| funcs.expr_weight(&args[idx])).sum();
+                            if eager_indices.len() >= 2
                                 && function.effect != crate::func::Effect::SpaceMutate
+                                && arg_weights >= par_threshold
                                 && eager_indices.iter().all(|&idx| funcs.is_parallelizable_expr(&args[idx]))
-                                && eager_indices.iter().map(|&idx| funcs.expr_weight(&args[idx])).sum::<usize>() >= 15
                             {
                                 use rayon::prelude::*;
                                 let parallel_results: Result<Vec<super::budget::ResultSet>, String> = eager_indices
@@ -747,10 +757,7 @@ pub(crate) fn dispatch_expr(
                 if let Some(clauses) =
                     crate::eval::forms::query::lookup_user_clauses(head, args.len() as u8, funcs)
                 {
-                    let clause_slice: Vec<(&[Expr], &Expr)> =
-                        clauses.iter().map(|(p, b)| (p.as_slice(), b)).collect();
-                    let lazy_mask =
-                        crate::eval::shared::closure::lazy_user_arg_mask(&clause_slice);
+                    let lazy_mask = funcs.get_lazy_mask(head, args.len() as u8);
                     let clause_refs: Vec<(Vec<Expr>, Expr)> = clauses;
                     let mut prebound_args = Vec::with_capacity(args.len());
                     let mut eager_indices = Vec::new();
@@ -774,10 +781,12 @@ pub(crate) fn dispatch_expr(
                     }
 
                     // parallel argument evaluation for pure/read-only user calls
-                    if eager_indices.len() > 1
+                    let par_threshold = 10 * rayon::current_num_threads();
+                    let arg_weights: usize = eager_indices.iter().map(|&idx| funcs.expr_weight(&args[idx])).sum();
+                    if eager_indices.len() >= 2
                         && funcs.is_parallelizable(head, args.len() as u8)
+                        && arg_weights >= par_threshold
                         && eager_indices.iter().all(|&idx| funcs.is_parallelizable_expr(&args[idx]))
-                        && eager_indices.iter().map(|&idx| funcs.expr_weight(&args[idx])).sum::<usize>() >= 15
                     {
                         use rayon::prelude::*;
                         let parallel_results: Result<Vec<super::budget::ResultSet>, String> = eager_indices

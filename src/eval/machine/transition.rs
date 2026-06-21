@@ -7,6 +7,7 @@ use crate::func::FnTable;
 // Deduct structural cost of `atom` from `budget` per spec Section 6.
 // Returns Err("Budget exhausted for <op>") when insufficient.
 fn debit_budget(atom: &Atom, budget: &mut Option<i64>, op: &str) -> Result<(), String> {
+    if budget.is_none() { return Ok(()); }
     if let Some(c) = calculate_cost(atom) {
         if let Some(b) = budget {
             if *b <= c {
