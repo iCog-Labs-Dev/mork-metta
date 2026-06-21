@@ -29,6 +29,11 @@ pub(crate) enum EnvNode {
         value: Atom,
         next: Env,
     },
+    /// A link node prepending one environment chain onto another.
+    Link {
+        prefix: Env,
+        base: Env,
+    },
 }
 
 impl PartialEq for EnvNode {
@@ -39,6 +44,10 @@ impl PartialEq for EnvNode {
                 EnvNode::Cons { name: n1, value: v1, next: nx1 },
                 EnvNode::Cons { name: n2, value: v2, next: nx2 },
             ) => n1 == n2 && v1 == v2 && nx1 == nx2,
+            (
+                EnvNode::Link { prefix: p1, base: b1 },
+                EnvNode::Link { prefix: p2, base: b2 },
+            ) => p1 == p2 && b1 == b2,
             _ => false,
         }
     }
@@ -92,16 +101,17 @@ impl Env {
     /// # Assumptions
     /// - Variable name includes the `$` prefix, e.g. `"$x"`.
     pub fn get(&self, name: &str) -> Option<Atom> {
-        let mut current = self;
-        loop {
-            match current.inner() {
-                EnvNode::Empty => return None,
-                EnvNode::Cons { name: n, value, next } => {
-                    if &**n == name {
-                        return Some(value.clone());
-                    }
-                    current = next;
+        match self.inner() {
+            EnvNode::Empty => None,
+            EnvNode::Cons { name: n, value, next } => {
+                if &**n == name {
+                    Some(value.clone())
+                } else {
+                    next.get(name)
                 }
+            }
+            EnvNode::Link { prefix, base } => {
+                prefix.get(name).or_else(|| base.get(name))
             }
         }
     }
