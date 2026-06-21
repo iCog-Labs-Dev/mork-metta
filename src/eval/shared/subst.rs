@@ -47,3 +47,22 @@ pub(crate) fn subst_expr_vars(expr: &Expr, env: &Env) -> Expr {
         _ => expr.clone(),
     }
 }
+
+pub(crate) fn subst_atom(atom: &Atom, env: &Env) -> Atom {
+    match atom {
+        Atom::Sym(symbol) if symbol.starts_with('$') => {
+            if let Some(bound) = crate::eval::shared::env::lookup(env, symbol) {
+                match &bound {
+                    Atom::Sym(b) if b.as_ref() != symbol.as_ref() => subst_atom(&bound, env),
+                    _ => bound.clone(),
+                }
+            } else {
+                atom.clone()
+            }
+        }
+        Atom::Expr(items) => {
+            Atom::Expr(items.iter().map(|item| subst_atom(item, env)).collect())
+        }
+        _ => atom.clone(),
+    }
+}

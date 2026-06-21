@@ -19,7 +19,10 @@ pub(crate) fn plain(atoms: Vec<Atom>) -> ResultSet {
 
 /// Extract the result atoms from a result set in evaluation order.
 pub(crate) fn atoms_of(results: &ResultSet) -> Vec<Atom> {
-    results.iter().map(|(atom, _)| atom.clone()).collect()
+    results
+        .iter()
+        .map(|(atom, env)| crate::eval::shared::subst::subst_atom(atom, env))
+        .collect()
 }
 
 /// Calculate the structural cost of an atom.

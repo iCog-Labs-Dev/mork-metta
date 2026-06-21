@@ -695,37 +695,32 @@ pub(crate) fn apply_frame(
         }
         Frame::DataListWithHead { head, n_tail } => {
             let tail_rs = pop_n(vals, n_tail);
-            let tail_atoms: Vec<Vec<Atom>> = tail_rs.iter().map(atoms_of).collect();
-            if tail_atoms.iter().any(|element| element.is_empty()) {
-                vals.push(Vec::new());
-                return Ok(());
-            }
+            let mut sets = vec![plain(vec![head])];
+            sets.extend(tail_rs);
+            let combos = threaded_combinations(&sets);
             let mut lists = Vec::new();
-            let mut buf = Vec::new();
-            cartesian_product_apply(&tail_atoms, &mut buf, &mut |combo: &[Atom]| {
-                let mut atoms = Vec::with_capacity(combo.len() + 1);
-                atoms.push(head.clone());
-                atoms.extend_from_slice(combo);
-                lists.push(Atom::Expr(atoms.into()));
-                Ok::<(), String>(())
-            })?;
-            vals.push(plain(lists));
+            for (combo, combo_env) in combos {
+                let substituted: Vec<Atom> = combo
+                    .iter()
+                    .map(|a| crate::eval::shared::subst::subst_atom(a, &combo_env))
+                    .collect();
+                lists.push((Atom::Expr(Arc::from(substituted)), combo_env));
+            }
+            vals.push(lists);
             Ok(())
         }
         Frame::DataList { n } => {
             let per_elem_rs = pop_n(vals, n);
-            let per_elem: Vec<Vec<Atom>> = per_elem_rs.iter().map(atoms_of).collect();
-            if per_elem.iter().any(|element| element.is_empty()) {
-                vals.push(Vec::new());
-                return Ok(());
-            }
+            let combos = threaded_combinations(&per_elem_rs);
             let mut lists = Vec::new();
-            let mut buf = Vec::new();
-            cartesian_product_apply(&per_elem, &mut buf, &mut |combo: &[Atom]| {
-                lists.push(Atom::Expr(Arc::from(combo)));
-                Ok::<(), String>(())
-            })?;
-            vals.push(plain(lists));
+            for (combo, combo_env) in combos {
+                let substituted: Vec<Atom> = combo
+                    .iter()
+                    .map(|a| crate::eval::shared::subst::subst_atom(a, &combo_env))
+                    .collect();
+                lists.push((Atom::Expr(Arc::from(substituted)), combo_env));
+            }
+            vals.push(lists);
             Ok(())
         }
         Frame::ApplyHead { arity, env } => {
@@ -898,22 +893,18 @@ pub(crate) fn apply_frame(
                 }
             }
             // Fallback: construct as data list
-            let per_elem: Vec<Vec<Atom>> = arg_sets.iter().map(atoms_of).collect();
-            if per_elem.iter().any(|e| e.is_empty()) {
-                vals.push(Vec::new());
-                return Ok(());
-            }
-            // Include head in data list
-            let all_atoms: Vec<Vec<Atom>> = std::iter::once(
-                head_rs.into_iter().map(|(a, _)| a).collect()
-            ).chain(per_elem).collect();
+            let mut sets = vec![head_rs];
+            sets.extend(arg_sets);
+            let combos = threaded_combinations(&sets);
             let mut lists = Vec::new();
-            let mut buf = Vec::new();
-            cartesian_product_apply(&all_atoms, &mut buf, &mut |combo: &[Atom]| {
-                lists.push(Atom::Expr(Arc::from(combo)));
-                Ok::<(), String>(())
-            })?;
-            vals.push(plain(lists));
+            for (combo, combo_env) in combos {
+                let substituted: Vec<Atom> = combo
+                    .iter()
+                    .map(|a| crate::eval::shared::subst::subst_atom(a, &combo_env))
+                    .collect();
+                lists.push((Atom::Expr(Arc::from(substituted)), combo_env));
+            }
+            vals.push(lists);
             Ok(())
         }
         Frame::SpaceMatchStream { mut remaining } => {
