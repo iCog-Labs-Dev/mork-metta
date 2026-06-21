@@ -431,6 +431,37 @@ impl FnTable {
     pub fn is_parallelizable_expr(&self, expr: &crate::parser::Expr) -> bool {
         is_pure_expr_inner(expr, self, None) != Effect::SpaceMutate
     }
+
+    /// Estimate the computational weight of an expression.
+    pub fn expr_weight(&self, expr: &crate::parser::Expr) -> usize {
+        use crate::parser::Expr;
+        match expr {
+            Expr::Number(_) | Expr::Symbol(_) | Expr::Str(_) => 0,
+            Expr::List(items) => {
+                if items.is_empty() {
+                    return 0;
+                }
+                let mut weight = 1;
+                for item in items.iter() {
+                    weight += self.expr_weight(item);
+                }
+                if let Expr::Symbol(head) = &items[0] {
+                    match head.as_str() {
+                        "quote" | "|->" | "empty" => {}
+                        "if" | "progn" | "prog1" | "let" | "let*" | "chain" | "collapse" | "once" | "superpose" => {
+                            weight += 10;
+                        }
+                        _ => {
+                            weight += 15;
+                        }
+                    }
+                } else {
+                    weight += 15;
+                }
+                weight
+            }
+        }
+    }
 }
 
 fn is_pure_expr_assuming(expr: &crate::parser::Expr, funcs: &FnTable, self_name: &str) -> Effect {

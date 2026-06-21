@@ -49,6 +49,7 @@ pub(crate) fn subst_expr_vars(expr: &Expr, env: &Env) -> Expr {
 }
 
 pub(crate) fn subst_atom(atom: &Atom, env: &Env) -> Atom {
+    if env.is_empty_env() { return atom.clone(); }
     match atom {
         Atom::Sym(symbol) if symbol.starts_with('$') => {
             if let Some(bound) = crate::eval::shared::env::lookup(env, symbol) {

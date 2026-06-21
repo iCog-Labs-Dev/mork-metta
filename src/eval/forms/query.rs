@@ -54,9 +54,6 @@ pub(crate) fn match_clause(
         return None;
     }
 
-    let args_str: Vec<String> = args.iter().map(|a| a.to_sexpr_string()).collect();
-    let pats_str: Vec<String> = patterns.iter().map(|p| format!("{:?}", p)).collect();
-
     let mut unification_env = Env::new();
     for (i, (pattern, arg)) in patterns.iter().zip(args.iter()).enumerate() {
         match crate::eval::shared::pattern::try_match_one(pattern, arg, &unification_env, funcs) {
@@ -64,7 +61,7 @@ pub(crate) fn match_clause(
             Ok(None) => {
                 return None;
             }
-            Err(e) => {
+            Err(_) => {
                 return None;
             }
         }

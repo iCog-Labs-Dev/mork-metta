@@ -449,7 +449,10 @@ pub(crate) fn dispatch_expr(
                             }
                             // Parallel path: each element gets its own run_rs instance
                             // when none of them mutate space.
-                            if n > 1 && elems.iter().all(|e| funcs.is_parallelizable_expr(e)) {
+                            if n > 1
+                                && elems.iter().all(|e| funcs.is_parallelizable_expr(e))
+                                && elems.iter().map(|e| funcs.expr_weight(e)).sum::<usize>() >= 15
+                            {
                                 use rayon::prelude::*;
                                 let flat = elems
                                     .par_iter()
@@ -703,6 +706,7 @@ pub(crate) fn dispatch_expr(
                             if eager_indices.len() > 1
                                 && function.effect != crate::func::Effect::SpaceMutate
                                 && eager_indices.iter().all(|&idx| funcs.is_parallelizable_expr(&args[idx]))
+                                && eager_indices.iter().map(|&idx| funcs.expr_weight(&args[idx])).sum::<usize>() >= 15
                             {
                                 use rayon::prelude::*;
                                 let parallel_results: Result<Vec<super::budget::ResultSet>, String> = eager_indices
@@ -773,6 +777,7 @@ pub(crate) fn dispatch_expr(
                     if eager_indices.len() > 1
                         && funcs.is_parallelizable(head, args.len() as u8)
                         && eager_indices.iter().all(|&idx| funcs.is_parallelizable_expr(&args[idx]))
+                        && eager_indices.iter().map(|&idx| funcs.expr_weight(&args[idx])).sum::<usize>() >= 15
                     {
                         use rayon::prelude::*;
                         let parallel_results: Result<Vec<super::budget::ResultSet>, String> = eager_indices

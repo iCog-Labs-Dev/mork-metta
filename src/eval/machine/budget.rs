@@ -38,3 +38,16 @@ pub fn calculate_cost(atom: &Atom) -> Option<i64> {
         Atom::Closure(_) => Some(5),
     }
 }
+
+/// Calculate the structural cost of an Expr directly without allocating an Atom.
+pub fn calculate_expr_cost(expr: &crate::parser::Expr) -> i64 {
+    use crate::parser::Expr;
+    match expr {
+        Expr::Number(_) | Expr::Symbol(_) | Expr::Str(_) => 1,
+        Expr::List(items) => {
+            let base_cost = (items.len() as i64) * 2;
+            let recursive_cost: i64 = items.iter().map(calculate_expr_cost).sum();
+            base_cost + recursive_cost
+        }
+    }
+}
