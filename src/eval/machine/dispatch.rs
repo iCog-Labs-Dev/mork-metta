@@ -4,10 +4,42 @@ use super::budget::plain;
 use super::frame::Frame;
 use super::state::Transition;
 use super::task::{Head, Task};
+use crate::atom::Atom;
 use crate::env::Env;
 use crate::func::{FnTable, FunctionKind};
 use crate::parser::Expr;
 use std::sync::Arc;
+
+/// Dispatch `and`/`or` sequentially: evaluate arg1, propagate truthy bindings into arg2.
+/// Falls through to truth table for simple args (variables, literals).
+fn dispatch_binary_bool(
+    op: &str, args: &[Expr], env: &Env,
+    funcs: &FnTable, work: &mut Vec<Task>, vals: &mut Vec<super::budget::ResultSet>,
+) -> Result<(), String> {
+    let arg1_rs = super::step::run_rs(Arc::new(args[0].clone()), env.clone(), funcs, &mut None)?;
+    let mut branches = Vec::with_capacity(arg1_rs.len());
+    for (atom, atom_env) in &arg1_rs {
+        let t = crate::eval::forms::control::is_truthy(atom);
+        let eval_arg2 = (op == "and") == t;
+        if eval_arg2 {
+            branches.push((
+                Arc::new(args[1].clone()),
+                crate::eval::shared::pattern::prepend_env(atom_env.clone(), env),
+            ));
+        } else {
+            branches.push((
+                Arc::new(Expr::Symbol(if t { "True" } else { "False" }.into())),
+                atom_env.clone(),
+            ));
+        }
+    }
+    if branches.is_empty() { vals.push(Vec::new()); return Ok(()); }
+    work.push(Task::Apply(Frame::Gather { n: branches.len() }));
+    for (expr, be) in branches.into_iter().rev() {
+        work.push(Task::Eval { expr, env: be });
+    }
+    Ok(())
+}
 
 /// Schedule evaluation for a unary form resumed by a frame.
 pub(crate) fn push_unary(
@@ -617,6 +649,14 @@ pub(crate) fn dispatch_expr(
                             env: env.clone(),
                         });
                         return Ok(());
+                    }
+                    "and" | "or" => {
+                        if args.len() == 2
+                            && matches!(&args[0], Expr::List(_))
+                            && matches!(&args[1], Expr::List(_))
+                        {
+                            return dispatch_binary_bool(head, args, env, funcs, work, vals);
+                        }
                     }
                     _ => {}
                 }
