@@ -661,6 +661,21 @@ pub(crate) fn dispatch_expr(
                             return dispatch_binary_bool(head, args, env, funcs, work, vals);
                         }
                     }
+                    // (unify pattern value then else): structural pattern match with variable binding.
+                    // pattern and then/else are lazy; value is evaluated eagerly.
+                    "unify" if args.len() == 4 => {
+                        work.push(Task::Apply(Frame::UnifyMatch {
+                            pattern: args[0].clone(),
+                            then_: Arc::new(args[2].clone()),
+                            else_: Arc::new(args[3].clone()),
+                            env: env.clone(),
+                        }));
+                        work.push(Task::Eval {
+                            expr: Arc::new(args[1].clone()),
+                            env: env.clone(),
+                        });
+                        return Ok(());
+                    }
                     // 3-arg (map-atom list $var body): list evaluated eagerly, pattern+body lazy.
                     "map-atom" if args.len() == 3 => {
                         work.push(Task::Apply(Frame::MapAtomBody {
@@ -820,9 +835,20 @@ pub(crate) fn dispatch_expr(
                 }
             }
 
-            // Head is a $var bound to a closure — apply it as a user function
+            // Head is a $var — look up and dispatch dynamically
             if let Expr::Symbol(head_sym) = &items[0] {
                 if head_sym.starts_with('$') {
+                    // $var bound to a plain symbol → re-dispatch as (fname args...)
+                    if let Some(crate::atom::Atom::Sym(fname)) =
+                        crate::eval::shared::env::lookup(env, head_sym.as_str())
+                    {
+                        let new_items: Vec<Expr> = std::iter::once(Expr::Symbol(fname.to_string()))
+                            .chain(items[1..].iter().cloned())
+                            .collect();
+                        let new_expr = Expr::List(Arc::from(new_items.as_slice()));
+                        work.push(Task::Eval { expr: Arc::new(new_expr), env: env.clone() });
+                        return Ok(());
+                    }
                     if let Some(crate::atom::Atom::Closure(c)) =
                         crate::eval::shared::env::lookup(env, head_sym.as_str())
                     {

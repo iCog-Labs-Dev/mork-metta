@@ -276,12 +276,28 @@ fn expr_to_py<'py>(
                     }
                     _ => {
                         // Normal function call: (func arg1 arg2 ...)
-                        // First evaluate the head (function)
-                        let func_obj = expr_to_py(&items[0], env, funcs, py)?;
-                        // Evaluate arguments
+                        // A string head like ("random.random" ...) means dotted Python name.
+                        let func_obj = if let crate::parser::Expr::Str(name) = &items[0] {
+                            resolve_python_name(name, py)?
+                        } else {
+                            expr_to_py(&items[0], env, funcs, py)?
+                        };
+                        // Evaluate each arg as MeTTa first, then convert to Python.
+                        // This handles cases like (/ $w ...) embedded in py-call args.
                         let mut args: Vec<pyo3::Bound<'_, pyo3::types::PyAny>> = Vec::new();
                         for arg in &items[1..] {
-                            args.push(expr_to_py(arg, env, funcs, py)?);
+                            let atom = crate::eval::machine::step::run_rs(
+                                std::sync::Arc::new(arg.clone()),
+                                env.clone(),
+                                funcs,
+                                &mut None,
+                            )
+                            .map_err(|e| format!("py-call: failed to evaluate arg: {}", e))?
+                            .into_iter()
+                            .next()
+                            .map(|(a, _)| a)
+                            .unwrap_or_else(|| crate::atom::Atom::sym("()"));
+                            args.push(atom_to_py(&atom, py)?);
                         }
                         let args_tuple = pyo3::types::PyTuple::new(py, args.as_slice())
                             .map_err(|e| format!("py-call: failed to create args tuple: {}", e))?;

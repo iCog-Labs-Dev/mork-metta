@@ -132,6 +132,13 @@ pub(crate) enum Frame {
         body: Arc<Expr>,
         env: Env,
     },
+    /// (unify pattern value then else): value is evaluated, pattern/then/else are lazy.
+    UnifyMatch {
+        pattern: Expr,
+        then_: Arc<Expr>,
+        else_: Arc<Expr>,
+        env: Env,
+    },
     /// Collect 3 evaluated args (list, acc, func) and start a fold loop.
     FoldlInit,
     /// Print the evaluated argument, return it.
