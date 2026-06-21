@@ -326,10 +326,10 @@ pub(crate) fn apply_frame(
                     return Ok(());
                 }
             };
-            match crate::eval::shared::pattern::try_match_one(&pattern, &value, &Env::new(), funcs)? {
+            // Use outer env so already-bound variables are checked against value.
+            match crate::eval::shared::pattern::try_match_one(&pattern, &value, &env, funcs)? {
                 Some(matched_env) => {
-                    let body_env = crate::eval::shared::env::prepend_chain(matched_env, &env);
-                    work.push(Task::Eval { expr: then_, env: body_env });
+                    work.push(Task::Eval { expr: then_, env: matched_env });
                 }
                 None => {
                     work.push(Task::Eval { expr: else_, env });

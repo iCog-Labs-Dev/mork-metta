@@ -662,8 +662,9 @@ pub(crate) fn dispatch_expr(
                         }
                     }
                     // (unify pattern value then else): structural pattern match with variable binding.
-                    // pattern and then/else are lazy; value is evaluated eagerly.
-                    "unify" if args.len() == 4 => {
+                    // Only intercept when arg[0] is NOT a space ref — space-match unify (&self ...) falls through.
+                    "unify" if args.len() == 4
+                        && !matches!(&args[0], Expr::Symbol(s) if s.starts_with('&')) => {
                         work.push(Task::Apply(Frame::UnifyMatch {
                             pattern: args[0].clone(),
                             then_: Arc::new(args[2].clone()),
