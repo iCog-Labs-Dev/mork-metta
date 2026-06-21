@@ -20,42 +20,55 @@ fn debit_budget(atom: &Atom, budget: &mut Option<i64>, op: &str) -> Result<(), S
 
 
 
-/// Execute one machine transition and return its produced result set.
+/// Execute one machine transition and return its produced result set, if any.
 pub(crate) fn apply_transition(
     transition: Transition,
     funcs: &FnTable,
     budget: &mut Option<i64>,
-) -> Result<ResultSet, String> {
+) -> Result<Option<ResultSet>, String> {
     match transition {
-        Transition::Query | Transition::Chain | Transition::Output => Ok(Vec::new()),
+        Transition::Query { cost } | Transition::Chain { cost } => {
+            // debit cost of query / chain transition
+            if let Some(b) = budget {
+                if *b <= cost {
+                    return Err("Budget exhausted".to_string());
+                }
+                *b -= cost;
+            }
+            Ok(None)
+        }
+        Transition::Output => Ok(None),
         Transition::Transform {
             pattern,
             replacement,
         } => {
             let out = crate::space::query::transform_matches(funcs, &pattern, &replacement)?;
-            Ok(plain(out))
+            Ok(Some(plain(out)))
         }
         Transition::AddAtom { space_ref, atom } => {
             debit_budget(&atom, budget, "addAtom")?;
             crate::space::mutate::add_atom(funcs, &space_ref, &atom)?;
-            Ok(plain(vec![Atom::sym("true")]))
+            Ok(Some(plain(vec![Atom::sym("true")])))
         }
         Transition::RemAtom { space_ref, atom } => {
             debit_budget(&atom, budget, "remAtom")?;
             let removed = crate::space::mutate::remove_atom(funcs, &space_ref, &atom)?;
-            Ok(plain(vec![if removed {
+            Ok(Some(plain(vec![if removed {
                 Atom::sym("true")
             } else {
                 Atom::sym("")
-            }]))
+            }])))
         }
         Transition::WithMutex {
             mutex_name,
             body,
             env,
-        } => crate::space::mutate::with_named_mutex(&mutex_name, || {
-            super::step::run_rs(body, env, funcs, budget)
-        }),
+        } => {
+            let res = crate::space::mutate::with_named_mutex(&mutex_name, || {
+                super::step::run_rs(body, env, funcs, budget)
+            })?;
+            Ok(Some(res))
+        }
         Transition::Transaction { body, env } => {
             let snapshot = crate::space::mutate::snapshot_transaction_state(funcs);
             match super::step::run_rs(body, env, funcs, budget) {
@@ -64,7 +77,7 @@ pub(crate) fn apply_transition(
                         crate::space::mutate::restore_transaction_state(snapshot, funcs)
                             .map_err(|err| format!("transaction: rollback failed: {err}"))?;
                     }
-                    Ok(out)
+                    Ok(Some(out))
                 }
                 Err(err) => {
                     crate::space::mutate::restore_transaction_state(snapshot, funcs).map_err(

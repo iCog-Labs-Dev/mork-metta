@@ -63,8 +63,11 @@ pub(crate) fn run_rs(
                 super::apply::apply_frame(frame, funcs, &mut work, &mut vals)?;
             }
             super::task::Task::Transition(transition) => {
-                let result_set = super::transition::apply_transition(transition, funcs, budget)?;
-                vals.push(result_set);
+                if let Some(result_set) =
+                    super::transition::apply_transition(transition, funcs, budget)?
+                {
+                    vals.push(result_set);
+                }
             }
         }
     }

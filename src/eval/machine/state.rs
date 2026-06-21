@@ -14,9 +14,9 @@ use std::sync::Arc;
 /// A direct machine transition.
 pub enum Transition {
     /// Reduce the next query term against the current knowledge state.
-    Query,
+    Query { cost: i64 },
     /// Continue a chain-style reduction using the current workspace.
-    Chain,
+    Chain { cost: i64 },
     /// Rewrite atoms matching a pattern in the default space.
     Transform { pattern: Atom, replacement: Atom },
     /// Add an atom to a resolved target space.

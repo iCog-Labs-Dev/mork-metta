@@ -1043,12 +1043,18 @@ pub(crate) fn apply_frame(
                         work.push(Task::Apply(Frame::MemoStore { key }));
                     }
                     work.push(Task::Apply(Frame::Gather { n: bodies.len() }));
-                    for (body, body_env, _) in bodies.into_iter().rev() {
+                    for (body, body_env, subst_cost) in bodies.into_iter().rev() {
                         work.push(Task::Apply(Frame::MergeEnv { env: body_env.clone() }));
                         work.push(Task::Eval {
-                            expr: body,
+                            expr: body.clone(),
                             env: body_env,
                         });
+                        // debit query and substitution cost prior to body evaluation
+                        let body_atom = crate::parser::expr_to_atom(&body);
+                        let body_cost = crate::eval::machine::budget::calculate_cost(&body_atom).unwrap_or(0);
+                        work.push(Task::Transition(Transition::Query {
+                            cost: subst_cost + body_cost,
+                        }));
                     }
                     Ok(())
                 }
