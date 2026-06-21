@@ -36,7 +36,7 @@ pub(crate) fn eval_import(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<N
     }
     // Evaluate space reference
     let mut space_results = eval_scope(&args[0], env, funcs)?;
-    let _space_ref = space_results
+    let space_ref = space_results
         .next()
         .ok_or_else(|| "import!: space expression produced no results".to_string())?;
     // Extract path string
@@ -60,7 +60,7 @@ pub(crate) fn eval_import(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<N
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
     let prev_dir = std::mem::replace(&mut *funcs.import_dir.lock().unwrap(), new_dir);
-    let result = load_metta_file(&resolved, env, funcs);
+    let result = load_metta_file(&resolved, &space_ref, env, funcs);
     *funcs.import_dir.lock().unwrap() = prev_dir;
     result?;
     Ok(NDet::single(Atom::sym("true")))
@@ -172,7 +172,7 @@ pub(crate) fn resolve_import_path(path_str: &str, import_dir: &Path) -> Option<P
 /// `Atom` via `parse_atom_bytes` and inserted with no intermediate allocation.
 /// Slow path: runnables and `(= ...)` definitions still use `process_form` →
 /// `Expr` → `compile_definition` so the fn_cache is populated correctly.
-pub fn load_metta_file(path: &Path, env: &Env, funcs: &FnTable) -> Result<Vec<Atom>, String> {
+pub fn load_metta_file(path: &Path, space_ref: &Atom, env: &Env, funcs: &FnTable) -> Result<Vec<Atom>, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot open '{}': {}", path.display(), e))?;
     let bytes = content.as_bytes();
@@ -212,11 +212,7 @@ pub fn load_metta_file(path: &Path, env: &Env, funcs: &FnTable) -> Result<Vec<At
             // Safe for non-'=' forms — compile_definition is a no-op for these.
             let atom = crate::parser::parse_atom_bytes(&content, &mut pos, &mut line_no)
                 .map_err(|e| format!("{} (in '{}' near line {})", e, path.display(), start_line))?;
-            funcs
-                .space
-                .write()
-                .unwrap()
-                .add_atom(&atom)
+            crate::space::mutate::add_atom(funcs, space_ref, &atom)
                 .map_err(|e| {
                     format!("add_atom: {} (in '{}' near line {})", e, path.display(), start_line)
                 })?;
@@ -281,7 +277,7 @@ pub fn load_metta_file(path: &Path, env: &Env, funcs: &FnTable) -> Result<Vec<At
                 ));
             }
             let form_str = &content[form_start..pos];
-            if let Some(result) = process_form(form_str, saw_bang, env, funcs)
+            if let Some(result) = process_form(form_str, saw_bang, space_ref, env, funcs)
                 .map_err(|e| format!("{} (in '{}' near line {})", e, path.display(), start_line))?
             {
                 results.push(result);
@@ -337,6 +333,7 @@ fn is_data_form(bytes: &[u8], pos: usize) -> bool {
 fn process_form(
     form: &str,
     is_runnable: bool,
+    space_ref: &Atom,
     env: &Env,
     funcs: &FnTable,
 ) -> Result<Option<Atom>, String> {
@@ -349,7 +346,7 @@ fn process_form(
     };
     let mut last = None;
     for top_form in crate::parser::parse_forms(src)? {
-        last = process_top_form(top_form, env, funcs)?;
+        last = process_top_form(top_form, space_ref, env, funcs)?;
     }
     Ok(last)
 }
@@ -357,29 +354,14 @@ fn process_form(
 /// Process a single top-level form: store+compile definitions, eval runnables.
 pub(crate) fn process_top_form(
     form: TopForm,
+    space_ref: &Atom,
     env: &Env,
     funcs: &FnTable,
 ) -> Result<Option<Atom>, String> {
     match form {
         TopForm::Definition(expr) => {
             let atom = crate::parser::expr_to_atom(&expr);
-            funcs
-                .space
-                .write()
-                .unwrap()
-                .add_atom(&atom)
-                .map_err(|e| format!("add_atom: {}", e))?;
-            if let Ok((name, clause)) = crate::compile::compile_definition(&expr) {
-                // Also store the BARE HEAD atom so `match` can find premise atoms
-                if let crate::parser::Expr::List(items) = &expr {
-                    if items.len() == 3 {
-                        let head_atom = crate::parser::expr_to_atom(&items[1]);
-                        funcs.space.write().unwrap().add_atom(&head_atom)?;
-                    }
-                }
-                // Populate fn_cache for fast concurrent dispatch
-                funcs.cache_fn(&name, clause.patterns.len() as u8, clause);
-            }
+            crate::space::mutate::add_atom(funcs, space_ref, &atom)?;
             Ok(None)
         }
         TopForm::Runnable(expr) => {

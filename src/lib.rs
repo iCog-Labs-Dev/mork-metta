@@ -77,6 +77,6 @@ impl Runtime {
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
         *self.funcs.import_dir.lock().unwrap() = dir.to_path_buf();
         let env = crate::env::Env::new();
-        crate::eval::io::load_metta_file(path, &env, &self.funcs)
+        crate::eval::io::load_metta_file(path, &crate::atom::Atom::sym("&self"), &env, &self.funcs)
     }
 }

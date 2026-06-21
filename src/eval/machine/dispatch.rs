@@ -252,24 +252,27 @@ pub(crate) fn dispatch_expr(
                             if lib_items.len() == 2 {
                                 if let Expr::Symbol(head) = &lib_items[0] {
                                     if head == "library" {
-                                        if let Expr::Symbol(py_path) = &lib_items[1] {
-                                            work.push(Task::Apply(Frame::PythonImport {
-                                                path: py_path.clone(),
-                                                env: env.clone(),
-                                            }));
-                                            work.push(Task::Eval {
-                                                expr: Arc::new(args[0].clone()),
-                                                env: env.clone(),
-                                            });
-                                            return Ok(());
+                                        match &lib_items[1] {
+                                            Expr::Symbol(py_path) | Expr::Str(py_path) => {
+                                                work.push(Task::Apply(Frame::PythonImport {
+                                                    path: py_path.clone(),
+                                                    env: env.clone(),
+                                                }));
+                                                work.push(Task::Eval {
+                                                    expr: Arc::new(args[0].clone()),
+                                                    env: env.clone(),
+                                                });
+                                                return Ok(());
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
                             }
                         }
                         let path = match &args[1] {
-                            Expr::Symbol(s) => s.clone(),
-                            _ => return Err("import!: path must be a symbol".into()),
+                            Expr::Symbol(s) | Expr::Str(s) => s.clone(),
+                            _ => return Err("import!: path must be a symbol or string".into()),
                         };
                         if path.ends_with(".py") {
                             work.push(Task::Apply(Frame::PythonImport {

@@ -337,7 +337,7 @@ pub(crate) fn apply_frame(
         }
         Frame::ImportFile { path, env } => {
             let space_rs = pop_n(vals, 1).pop().unwrap();
-            let _space_ref = space_rs
+            let space_ref = space_rs
                 .into_iter()
                 .next()
                 .map(|(a, _)| a)
@@ -356,7 +356,7 @@ pub(crate) fn apply_frame(
                 .unwrap_or(std::path::Path::new("."))
                 .to_path_buf();
             let prev_dir = std::mem::replace(&mut *funcs.import_dir.lock().unwrap(), new_dir);
-            let atoms = crate::eval::io::load_metta_file(&resolved, &env, funcs)?;
+            let atoms = crate::eval::io::load_metta_file(&resolved, &space_ref, &env, funcs)?;
             *funcs.import_dir.lock().unwrap() = prev_dir;
             vals.push(super::budget::plain(atoms));
             Ok(())

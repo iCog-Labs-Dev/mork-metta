@@ -31,10 +31,10 @@ pub fn add_atom(funcs: &FnTable, space_ref: &Atom, atom: &Atom) -> Result<(), St
     funcs.bump_memo_stamp();
     if matches!(space_ref, Atom::Sym(name) if name.as_ref() == "&self") {
         maybe_cache_definition_atom(atom, funcs);
-        // Also store bare head atom for match premise lookup
-        if let Some((head, _)) = definition_parts(atom) {
-            let _ = funcs.space.write().unwrap().add_atom(head);
-        }
+    }
+    // Also store bare head atom for match premise lookup in the target space
+    if let Some((head, _)) = definition_parts(atom) {
+        let _ = funcs.with_resolved_space(space_ref, |space| space.add_atom(head));
     }
     Ok(())
 }
@@ -47,21 +47,22 @@ pub fn remove_atom(funcs: &FnTable, space_ref: &Atom, atom: &Atom) -> Result<boo
     if removed {
         funcs.bump_memo_stamp();
     }
-    if removed && matches!(space_ref, Atom::Sym(name) if name.as_ref() == "&self") {
-        maybe_uncache_definition_atom(atom, funcs);
-        // Only remove head shadow if no other definition with same head remains
+    if removed {
+        if matches!(space_ref, Atom::Sym(name) if name.as_ref() == "&self") {
+            maybe_uncache_definition_atom(atom, funcs);
+        }
+        // Only remove head shadow if no other definition with same head remains in this space
         if let Some((head, _)) = definition_parts(atom) {
-            let keep_shadow = {
-                let space = funcs.space.read().unwrap();
-                space.get_atoms().iter().any(|existing| match existing {
+            let keep_shadow = funcs.with_resolved_space(space_ref, |space| {
+                Ok(space.get_atoms().iter().any(|existing| match existing {
                     Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("=") => {
                         items.get(1) == Some(head)
                     }
                     _ => false,
-                })
-            };
+                }))
+            })?;
             if !keep_shadow {
-                let _ = funcs.space.write().unwrap().remove_atom(head);
+                let _ = funcs.with_resolved_space(space_ref, |space| space.remove_atom(head));
             }
         }
     }
