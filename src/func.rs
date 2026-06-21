@@ -208,12 +208,44 @@ impl FnTable {
     }
 
     pub fn get(&self, name: &str, arity: u8) -> Option<Arc<Function>> {
-        self.map
+        // thread-local 4-element LRU cache to bypass costly RwLock read locks during recursive dispatch
+        thread_local! {
+            static CACHE: std::cell::RefCell<Vec<(String, u8, Option<Arc<Function>>)>> = std::cell::RefCell::new(Vec::with_capacity(4));
+        }
+
+        let cached = CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            if let Some(pos) = cache.iter().position(|(n, a, _)| n == name && *a == arity) {
+                let entry = cache[pos].clone();
+                if pos > 0 {
+                    cache.remove(pos);
+                    cache.insert(0, entry.clone());
+                }
+                return Some(entry.2);
+            }
+            None
+        });
+
+        if let Some(res) = cached {
+            return res;
+        }
+
+        let res = self.map
             .read()
             .unwrap()
             .get(name)
             .and_then(|inner| inner.get(&arity))
-            .cloned()
+            .cloned();
+
+        CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            if cache.len() >= 4 {
+                cache.pop();
+            }
+            cache.insert(0, (name.to_string(), arity, res.clone()));
+        });
+
+        res
     }
 
     pub fn with_resolved_space<R>(

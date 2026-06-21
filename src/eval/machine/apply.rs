@@ -29,6 +29,15 @@ pub(crate) fn cartesian_product(options: &[Vec<Atom>]) -> Vec<Vec<Atom>> {
         return vec![Vec::new()];
     }
 
+    // ponytail: fast path for all-singleton option sets (no redundant vector clones)
+    if options.iter().all(|o| o.len() == 1) {
+        let mut combination = Vec::with_capacity(options.len());
+        for option in options {
+            combination.push(option[0].clone());
+        }
+        return vec![combination];
+    }
+
     let mut result = vec![Vec::new()];
     for option in options {
         let mut next = Vec::with_capacity(result.len() * option.len());
@@ -51,16 +60,13 @@ fn has_shadowing(new_env: &Env, outer_env: &Env) -> bool {
     if outer_env.is_empty_env() {
         return false;
     }
-    let mut current = new_env;
-    loop {
-        match current.inner() {
-            EnvNode::Empty => return false,
-            EnvNode::Cons { name, value: _, next } => {
-                if outer_env.get(name).is_some() {
-                    return true;
-                }
-                current = next;
-            }
+    match new_env.inner() {
+        EnvNode::Empty => false,
+        EnvNode::Cons { name, value: _, next } => {
+            outer_env.get(name).is_some() || has_shadowing(next, outer_env)
+        }
+        EnvNode::Link { prefix, base } => {
+            has_shadowing(prefix, outer_env) || has_shadowing(base, outer_env)
         }
     }
 }
@@ -93,6 +99,18 @@ fn cartesian_product_apply<E>(
 /// This is what enables relational (Prolog-like) behaviour where bindings
 /// discovered in one argument are visible in subsequent arguments.
 fn threaded_combinations(sets: &[ResultSet]) -> Vec<(Vec<Atom>, Env)> {
+    // ponytail: fast path for all-singleton result sets (bypasses redundant environment merging and prefix cloning)
+    if sets.iter().all(|s| s.len() == 1) {
+        let mut atoms = Vec::with_capacity(sets.len());
+        let mut acc_env = Env::new();
+        for rs in sets {
+            let (atom, env) = &rs[0];
+            atoms.push(atom.clone());
+            acc_env = crate::eval::shared::pattern::prepend_env(env.clone(), &acc_env);
+        }
+        return vec![(atoms, acc_env)];
+    }
+
     let mut combos = vec![(Vec::new(), Env::new())];
     for rs in sets {
         let mut next = Vec::new();

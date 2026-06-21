@@ -21,14 +21,12 @@ pub fn bind_all(env: &Env, bindings: &[(String, Atom)]) -> Env {
 
 /// Prepend one environment chain onto another environment.
 pub fn prepend_chain(prefix: Env, base: &Env) -> Env {
-    match prefix.inner() {
-        EnvNode::Empty => base.clone(),
-        EnvNode::Cons { name, value, next } => {
-            Env(Arc::new(EnvNode::Cons {
-                name: name.clone(),
-                value: value.clone(),
-                next: prepend_chain(next.clone(), base),
-            }))
-        }
+    // use Link node to link environments in O(1) time/memory without copying
+    if prefix.is_empty_env() {
+        base.clone()
+    } else if base.is_empty_env() {
+        prefix
+    } else {
+        Env(Arc::new(EnvNode::Link { prefix, base: base.clone() }))
     }
 }

@@ -34,6 +34,9 @@ pub(crate) fn env_binding_cost(env: &Env) -> i64 {
             crate::eval::machine::budget::calculate_cost(value).unwrap_or(0)
                 + env_binding_cost(next)
         }
+        crate::env::EnvNode::Link { prefix, base } => {
+            env_binding_cost(prefix) + env_binding_cost(base)
+        }
     }
 }
 
