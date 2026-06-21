@@ -207,6 +207,10 @@ impl FnTable {
             .map_or(false, |inner| inner.contains_key(&arity))
     }
 
+    pub fn is_registered(&self, name: &str) -> bool {
+        self.map.read().unwrap().contains_key(name) || self.fn_cache.read().unwrap().contains_key(name)
+    }
+
     pub fn get(&self, name: &str, arity: u8) -> Option<Arc<Function>> {
         // thread-local 4-element LRU cache to bypass costly RwLock read locks during recursive dispatch
         thread_local! {

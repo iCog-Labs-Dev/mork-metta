@@ -28,11 +28,18 @@ pub fn register_type_builtins(funcs: &FnTable) {
     });
     funcs.mark_pure("is-space", 1);
 
-    funcs.insert_native("get-metatype", 1, |args, _| {
+    funcs.insert_native("get-metatype", 1, |args, table| {
         crate::builtins::arithmetic::expect_n_args(args, 1, "get-metatype")?;
         let kind = match &args[0] {
             Atom::Sym(symbol) if symbol.starts_with('$') => "Variable",
-            Atom::Sym(_) | Atom::Num(_) | Atom::Str(_) => "Grounded",
+            Atom::Sym(symbol) => {
+                if table.is_registered(symbol) {
+                    "Grounded"
+                } else {
+                    "Symbol"
+                }
+            }
+            Atom::Num(_) | Atom::Str(_) => "Grounded",
             Atom::Expr(_) => "Expression",
             Atom::Closure(_) => "Grounded",
         };
