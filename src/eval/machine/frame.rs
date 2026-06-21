@@ -126,6 +126,12 @@ pub(crate) enum Frame {
         body: Arc<Expr>,
         env: Env,
     },
+    /// 3-arg (map-atom list $var body): list is evaluated, pattern + body are lazy.
+    MapAtomBody {
+        var_pattern: Expr,
+        body: Arc<Expr>,
+        env: Env,
+    },
     /// Collect 3 evaluated args (list, acc, func) and start a fold loop.
     FoldlInit,
     /// Print the evaluated argument, return it.

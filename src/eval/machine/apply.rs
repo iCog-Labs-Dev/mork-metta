@@ -288,6 +288,37 @@ pub(crate) fn apply_frame(
             }
             Ok(())
         }
+        Frame::MapAtomBody { var_pattern, body, env } => {
+            let list_rs = pop_n(vals, 1).pop().unwrap();
+            let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                Some(Atom::Expr(v)) => v.to_vec(),
+                Some(other) => vec![other],
+                None => {
+                    vals.push(super::budget::plain(vec![Atom::Expr(Arc::from([]))]));
+                    return Ok(());
+                }
+            };
+            let mut results = Vec::with_capacity(items.len());
+            for item in &items {
+                let matched = crate::eval::shared::pattern::try_match_one(
+                    &var_pattern, item, &Env::new(), funcs,
+                )?;
+                if let Some(matched_env) = matched {
+                    let body_env = crate::eval::shared::env::prepend_chain(matched_env, &env);
+                    let body_rs = super::step::run_rs(
+                        Arc::clone(&body),
+                        body_env,
+                        funcs,
+                        &mut None,
+                    )?;
+                    if let Some((val, _)) = body_rs.into_iter().next() {
+                        results.push(val);
+                    }
+                }
+            }
+            vals.push(super::budget::plain(vec![Atom::Expr(Arc::from(results.as_slice()))]));
+            Ok(())
+        }
         Frame::FoldlInit => {
             // Pop 3 result sets: list_rs, acc_rs, func_rs (pushed in reverse)
             let mut three = pop_n(vals, 3);

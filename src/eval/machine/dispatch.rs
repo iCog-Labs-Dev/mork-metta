@@ -661,6 +661,19 @@ pub(crate) fn dispatch_expr(
                             return dispatch_binary_bool(head, args, env, funcs, work, vals);
                         }
                     }
+                    // 3-arg (map-atom list $var body): list evaluated eagerly, pattern+body lazy.
+                    "map-atom" if args.len() == 3 => {
+                        work.push(Task::Apply(Frame::MapAtomBody {
+                            var_pattern: args[1].clone(),
+                            body: Arc::new(args[2].clone()),
+                            env: env.clone(),
+                        }));
+                        work.push(Task::Eval {
+                            expr: Arc::new(args[0].clone()),
+                            env: env.clone(),
+                        });
+                        return Ok(());
+                    }
                     _ => {}
                 }
 
