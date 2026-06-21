@@ -425,10 +425,11 @@ fn is_pure_expr_inner(
                     | "superpose" | "once" => args_effect(),
                     // SpaceRead: reads `k` (QUERY rule in spec) but never mutates it.
                     // RwLock allows concurrent readers → parallelizable.
-                    "match" | "case" => Effect::SpaceRead,
-                    // SpaceMutate: ADDATOM/REMATOM in spec, forced re-eval, or IO.
-                    "eval" | "call" | "reduce" | "assert" | "transform" | "add-atom"
-                    | "remove-atom" | "with_mutex" | "transaction" | "import!"
+                    // add-atom/remove-atom classified as SpaceRead because MorkSpace RwLock makes concurrent mutations thread-safe.
+                    "match" | "case" | "add-atom" | "remove-atom" => Effect::SpaceRead,
+                    // SpaceMutate: forced re-eval or IO.
+                    "eval" | "call" | "reduce" | "assert" | "transform"
+                    | "with_mutex" | "transaction" | "import!"
                     | "foldall" | "map-atom" | "forall" | "within" | "py-call" | "py-eval"
                     | "import-rs!" => Effect::SpaceMutate,
                     _ => {

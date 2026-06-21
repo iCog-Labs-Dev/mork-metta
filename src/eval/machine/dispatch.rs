@@ -664,15 +664,42 @@ pub(crate) fn dispatch_expr(
                 if let Some(function) = funcs.get(head, args.len() as u8) {
                     match &function.kind {
                         FunctionKind::Native { func } => {
+                            let mut prebound_args = vec![None; args.len()];
+                            let mut eager_indices: Vec<usize> = (0..args.len()).collect();
+
+                            // parallel argument evaluation for pure/read-only native calls
+                            if eager_indices.len() > 1
+                                && function.effect != crate::func::Effect::SpaceMutate
+                                && eager_indices.iter().all(|&idx| funcs.is_parallelizable_expr(&args[idx]))
+                            {
+                                use rayon::prelude::*;
+                                let parallel_results: Result<Vec<super::budget::ResultSet>, String> = eager_indices
+                                    .par_iter()
+                                    .map(|&idx| {
+                                        super::step::run_rs(
+                                            Arc::new(args[idx].clone()),
+                                            env.clone(),
+                                            funcs,
+                                            &mut None,
+                                        )
+                                    })
+                                    .collect();
+                                let parallel_results = parallel_results?;
+                                for (idx, res) in eager_indices.iter().zip(parallel_results.into_iter()) {
+                                    prebound_args[*idx] = Some(res);
+                                }
+                                eager_indices.clear();
+                            }
+
                             work.push(Task::Apply(Frame::Call {
                                 head: Head::Native(Arc::clone(func)),
                                 arity: args.len(),
                                 env: env.clone(),
-                                prebound_args: None,
+                                prebound_args: Some(prebound_args),
                             }));
-                            for arg in args.iter().rev() {
+                            for index in eager_indices.into_iter().rev() {
                                 work.push(Task::Eval {
-                                    expr: Arc::new(arg.clone()),
+                                    expr: Arc::new(args[index].clone()),
                                     env: env.clone(),
                                 });
                             }
@@ -709,6 +736,34 @@ pub(crate) fn dispatch_expr(
                             eager_indices.push(index);
                         }
                     }
+
+                    // parallel argument evaluation for pure/read-only user calls
+                    if eager_indices.len() > 1
+                        && funcs.is_parallelizable(head, args.len() as u8)
+                        && eager_indices.iter().all(|&idx| funcs.is_parallelizable_expr(&args[idx]))
+                    {
+                        use rayon::prelude::*;
+                        let parallel_results: Result<Vec<super::budget::ResultSet>, String> = eager_indices
+                            .par_iter()
+                            .map(|&idx| {
+                                super::step::run_rs(
+                                    Arc::new(args[idx].clone()),
+                                    env.clone(),
+                                    funcs,
+                                    &mut None,
+                                )
+                            })
+                            .collect();
+                        let parallel_results = parallel_results?;
+                        let mut pr_iter = parallel_results.into_iter();
+                        for slot in &mut prebound_args {
+                            if slot.is_none() {
+                                *slot = Some(pr_iter.next().unwrap());
+                            }
+                        }
+                        eager_indices.clear();
+                    }
+
                     work.push(Task::Apply(Frame::Call {
                         head: Head::User {
                             name: head.clone(),
