@@ -68,7 +68,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
         expect(args, 1, "cdr-atom")?;
         match &args[0] {
             Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(Atom::Expr(Arc::from(&items[1..])))),
-            Atom::Expr(_) => Err("cdr-atom: empty list".into()),
+            Atom::Expr(_) => Ok(NDet::Single(None)),
             other => Err(format!("cdr-atom: expected list, got {}", other.to_sexpr_string())),
         }
     });
