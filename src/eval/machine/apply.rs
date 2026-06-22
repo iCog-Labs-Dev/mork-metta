@@ -18,6 +18,14 @@ use std::sync::Arc;
 ///
 /// The returned result sets preserve push order, with the oldest of the popped
 /// entries appearing first.
+fn bind_vars_into_env(names: &[String], values: &[crate::atom::Atom], base: &crate::env::Env) -> crate::env::Env {
+    let mut env = base.clone();
+    for (name, value) in names.iter().zip(values.iter()) {
+        env = env.extend(name, value.clone());
+    }
+    env
+}
+
 pub(crate) fn pop_n(values: &mut Vec<ResultSet>, n: usize) -> Vec<ResultSet> {
     let split_at = values.len() - n;
     values.split_off(split_at)
@@ -482,6 +490,54 @@ pub(crate) fn apply_frame(
                 expr: Arc::new(call),
                 env: crate::env::Env::new(),
             });
+            Ok(())
+        }
+        Frame::FoldlInitLambda { var_names, body, env } => {
+            let mut two = pop_n(vals, 2);
+            let acc_rs = two.pop().unwrap();
+            let list_rs = two.pop().unwrap();
+            let acc = acc_rs.into_iter().next().map(|(a, _)| a)
+                .ok_or_else(|| "foldl-atom: acc arg produced no result".to_string())?;
+            let items: Vec<crate::atom::Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                Some(crate::atom::Atom::Expr(v)) => v.to_vec(),
+                Some(other) => vec![other],
+                None => return Err("foldl-atom: list arg produced no result".to_string()),
+            };
+            if items.is_empty() {
+                vals.push(super::budget::plain(vec![acc]));
+                return Ok(());
+            }
+            let elem = items[0].clone();
+            let step_env = bind_vars_into_env(&var_names, &[acc.clone(), elem], &env);
+            work.push(Task::Apply(Frame::FoldlAtomLambda {
+                items: Arc::new(items),
+                index: 1,
+                acc,
+                var_names,
+                body: body.clone(),
+                env,
+            }));
+            work.push(Task::Eval { expr: body, env: step_env });
+            Ok(())
+        }
+        Frame::FoldlAtomLambda { items, index, acc, var_names, body, env } => {
+            let step_rs = pop_n(vals, 1).pop().unwrap();
+            let new_acc = step_rs.into_iter().next().map(|(a, _)| a).unwrap_or(acc);
+            if index >= items.len() {
+                vals.push(super::budget::plain(vec![new_acc]));
+                return Ok(());
+            }
+            let elem = items[index].clone();
+            let step_env = bind_vars_into_env(&var_names, &[new_acc.clone(), elem], &env);
+            work.push(Task::Apply(Frame::FoldlAtomLambda {
+                items,
+                index: index + 1,
+                acc: new_acc,
+                var_names,
+                body: body.clone(),
+                env,
+            }));
+            work.push(Task::Eval { expr: body, env: step_env });
             Ok(())
         }
         Frame::LetStarBind {

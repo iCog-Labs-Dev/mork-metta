@@ -418,15 +418,41 @@ pub(crate) fn dispatch_expr(
                         return Ok(());
                     }
                     "foldl-atom" => {
-                        if args.len() != 3 {
-                            return Err(format!("foldl-atom: expected 3 args, got {}", args.len()));
-                        }
-                        work.push(Task::Apply(Frame::FoldlInit));
-                        for arg in args.iter().rev() {
-                            work.push(Task::Eval {
-                                expr: Arc::new((*arg).clone()),
+                        let n = args.len();
+                        if n == 3 {
+                            work.push(Task::Apply(Frame::FoldlInit));
+                            for arg in args.iter().rev() {
+                                work.push(Task::Eval {
+                                    expr: Arc::new((*arg).clone()),
+                                    env: env.clone(),
+                                });
+                            }
+                        } else if n >= 4 {
+                            // (foldl-atom list acc $v0 ... $vk body)
+                            // args[2..n-1] = variable names, args[n-1] = body
+                            let mut var_names = Vec::with_capacity(n - 3);
+                            for a in &args[2..n - 1] {
+                                match a {
+                                    crate::parser::Expr::Symbol(s) => {
+                                        var_names.push(s.clone());
+                                    }
+                                    _ => return Err(format!(
+                                        "foldl-atom: expected variable, got {}",
+                                        crate::parser::expr_to_atom(a).to_sexpr_string()
+                                    )),
+                                }
+                            }
+                            let body = Arc::new(args[n - 1].clone());
+                            work.push(Task::Apply(Frame::FoldlInitLambda {
+                                var_names,
+                                body,
                                 env: env.clone(),
-                            });
+                            }));
+                            // eval acc then list (reverse push: list runs first)
+                            work.push(Task::Eval { expr: Arc::new(args[1].clone()), env: env.clone() });
+                            work.push(Task::Eval { expr: Arc::new(args[0].clone()), env: env.clone() });
+                        } else {
+                            return Err(format!("foldl-atom: expected 3+ args, got {n}"));
                         }
                         return Ok(());
                     }

@@ -180,6 +180,23 @@ pub(crate) enum Frame {
         /// Function atom (symbol) applied each step.
         func: Atom,
     },
+    /// Collect 2 evaluated args (list, acc) then start an inline-lambda fold.
+    /// General form: (foldl-atom list acc $v0 $v1 ... body)
+    /// var_names holds stripped names (no $), body is the last arg unevaluated.
+    FoldlInitLambda {
+        var_names: Vec<String>,
+        body: Arc<Expr>,
+        env: Env,
+    },
+    /// One step of inline-lambda foldl-atom.
+    FoldlAtomLambda {
+        items: Arc<Vec<Atom>>,
+        index: usize,
+        acc: Atom,
+        var_names: Vec<String>,
+        body: Arc<Expr>,
+        env: Env,
+    },
     /// Sequential evaluation: evaluate N args, return the last result.
     Progn { n: usize },
     /// Sequential evaluation: evaluate N args, return the first result.
