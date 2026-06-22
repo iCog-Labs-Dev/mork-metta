@@ -363,7 +363,7 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
             pairs.push((atom_as_f64(item, "sort-math")?, item.clone()));
         }
         pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(NDet::single(Atom::Expr(pairs.into_iter().map(|(_, a)| a).collect())))
+        Ok(NDet::single(Atom::expr(pairs.into_iter().map(|(_, a)| a).collect::<Vec<_>>())))
     });
     funcs.mark_pure("sort-math", 1);
 

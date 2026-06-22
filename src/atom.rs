@@ -75,6 +75,52 @@ pub struct ClosureData {
     pub env: Env,
 }
 
+/// Backing store for an `Atom::Expr` node.
+///
+/// `has_var` is a precomputed bit: true iff any free `$`-variable appears
+/// anywhere in `items`. It lets substitution short-circuit closed (ground)
+/// subtrees in O(1) instead of re-walking them. The bit is derived from
+/// `items` at construction (O(arity) — children already carry their own bit),
+/// so it never participates in equality or hashing.
+///
+/// Derefs to `[Atom]` so existing slice-style read sites compile unchanged.
+#[derive(Debug)]
+pub struct ExprData {
+    has_var: bool,
+    items: Box<[Atom]>,
+}
+
+impl ExprData {
+    fn new(items: Vec<Atom>) -> Self {
+        let has_var = items.iter().any(Atom::is_open);
+        ExprData { has_var, items: items.into_boxed_slice() }
+    }
+    /// True if any free `$`-variable appears anywhere below this node.
+    #[inline]
+    pub fn has_var(&self) -> bool {
+        self.has_var
+    }
+}
+
+impl std::ops::Deref for ExprData {
+    type Target = [Atom];
+    #[inline]
+    fn deref(&self) -> &[Atom] {
+        &self.items
+    }
+}
+
+/// Build an `Arc<ExprData>` from anything convertible to `Vec<Atom>`.
+///
+/// Drop-in replacement for the old `Arc::from(items)` at `Atom::Expr(..)`
+/// construction sites — the orphan rule forbids `impl From<Vec<Atom>> for
+/// Arc<ExprData>`, so this free fn fills the gap while computing `has_var`.
+#[inline]
+pub fn expr_data<T: Into<Vec<Atom>>>(items: T) -> Arc<ExprData> {
+    Arc::new(ExprData::new(items.into()))
+}
+
+
 #[derive(Clone, Debug)]
 pub enum Atom {
     /// A symbolic name: function names, variable names (with $ prefix), data symbols.
@@ -86,7 +132,8 @@ pub enum Atom {
     /// An arbitrary-precision integer or decimal.
     Num(Numeric),
     /// An S-expression — ordered list of atoms. Arc-shared so clone is O(1).
-    Expr(Arc<[Atom]>),
+    /// Carries a precomputed `has_var` bit (see `ExprData`).
+    Expr(Arc<ExprData>),
     /// An anonymous function created by `|->`. Boxed to keep Atom at 32 bytes.
     Closure(Box<ClosureData>),
 }
@@ -97,7 +144,7 @@ impl PartialEq for Atom {
             (Atom::Sym(a), Atom::Sym(b)) => a == b,
             (Atom::Str(a), Atom::Str(b)) => a == b,
             (Atom::Num(a), Atom::Num(b)) => a == b, // delegates to Numeric::PartialEq
-            (Atom::Expr(a), Atom::Expr(b)) => Arc::ptr_eq(a, b) || a == b,
+            (Atom::Expr(a), Atom::Expr(b)) => Arc::ptr_eq(a, b) || a.items == b.items,
             (Atom::Closure(a), Atom::Closure(b)) => a == b,
             _ => false,
         }
@@ -176,9 +223,30 @@ impl Atom {
             .map_err(|e| format!("invalid decimal '{}': {}", s, e))
     }
 
-    /// Convenience: create an expression atom.
-    pub fn expr(items: Vec<Atom>) -> Self {
-        Atom::Expr(Arc::from(items))
+    /// Convenience: create an expression atom. Accepts anything convertible to
+    /// `Vec<Atom>` (a `Vec`, an array, or a slice) so call sites that previously
+    /// built `Arc::from(..)` can route through here. The `has_var` bit is
+    /// computed here, once.
+    pub fn expr<T: Into<Vec<Atom>>>(items: T) -> Self {
+        Atom::Expr(Arc::new(ExprData::new(items.into())))
+    }
+
+    /// Rewrap an existing `ExprData` Arc as an atom (O(1), shares the node).
+    #[inline]
+    pub fn expr_arc(items: Arc<ExprData>) -> Self {
+        Atom::Expr(items)
+    }
+
+    /// True if this atom is an open term — a free `$`-variable, or an
+    /// expression that contains one. Closures are opaque to substitution and
+    /// count as closed. Used to short-circuit substitution over ground terms.
+    #[inline]
+    pub fn is_open(&self) -> bool {
+        match self {
+            Atom::Sym(s) => s.starts_with('$'),
+            Atom::Expr(e) => e.has_var(),
+            _ => false,
+        }
     }
 
     /// Extract the integer value as i128. Fails if the number is a decimal or
@@ -234,7 +302,7 @@ impl Atom {
     /// Returns an error description if the atom is not an expression.
     pub fn as_expr(&self) -> Result<&[Atom], String> {
         match self {
-            Atom::Expr(items) => Ok(items.as_ref()),
+            Atom::Expr(items) => Ok(&items[..]),
             other => Err(format!(
                 "expected expression, got {}",
                 other.to_sexpr_string()

@@ -18,7 +18,7 @@ pub(crate) fn subst_and_atomize(expr: &Expr, env: &Env) -> Atom {
         Expr::Symbol(symbol) if symbol.starts_with('$') => {
             crate::eval::shared::env::lookup(env, symbol).unwrap_or_else(|| Atom::sym(symbol))
         }
-        Expr::List(items) => Atom::Expr(items.iter().map(|item| subst_and_atomize(item, env)).collect()),
+        Expr::List(items) => Atom::expr(items.iter().map(|item| subst_and_atomize(item, env)).collect::<Vec<_>>()),
         Expr::Symbol(symbol) => Atom::sym(symbol),
     }
 }
@@ -65,6 +65,9 @@ fn subst_atom_opt(atom: &Atom, env: &Env) -> Option<Atom> {
                 }
             })
         }
+        // Closed (ground) expression — no free variable anywhere below, so
+        // substitution is a no-op. O(1) short-circuit, skips the whole subtree.
+        Atom::Expr(items) if !items.has_var() => None,
         Atom::Expr(items) => {
             // Phase 1: scan for first changed child (no allocation).
             let first_change = items.iter().enumerate().find_map(|(i, item)| {
@@ -80,7 +83,7 @@ fn subst_atom_opt(atom: &Atom, env: &Env) -> Option<Atom> {
                     for item in &items[change_idx + 1..] {
                         result.push(subst_atom_opt(item, env).unwrap_or_else(|| item.clone()));
                     }
-                    Some(Atom::Expr(result.into()))
+                    Some(Atom::Expr(crate::atom::expr_data(result)))
                 }
             }
         }

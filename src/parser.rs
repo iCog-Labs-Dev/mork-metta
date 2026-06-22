@@ -72,7 +72,7 @@ pub fn expr_to_atom(expr: &Expr) -> Atom {
         Expr::Symbol(s) => Atom::sym(s),
         Expr::Str(s) => Atom::str_val(s),
         Expr::Number(n) => Atom::Num(n.clone()),
-        Expr::List(items) => Atom::Expr(items.iter().map(expr_to_atom).collect()),
+        Expr::List(items) => Atom::expr(items.iter().map(expr_to_atom).collect::<Vec<_>>()),
     }
 }
 
@@ -320,7 +320,7 @@ pub fn parse_atom_bytes(
         match bytes[*pos] {
             b')' => {
                 *pos += 1;
-                return Ok(Atom::Expr(items.into()));
+                return Ok(Atom::Expr(crate::atom::expr_data(items)));
             }
             b'(' => {
                 items.push(parse_atom_bytes(content, pos, line_no)?);

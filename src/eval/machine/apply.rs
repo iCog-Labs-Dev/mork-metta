@@ -166,7 +166,7 @@ pub(crate) fn apply_frame(
             let result = match out.len() {
                 0 => Vec::new(),
                 1 => plain(out),
-                _ if had_bindings => plain(vec![Atom::Expr(out.into())]),
+                _ if had_bindings => plain(vec![Atom::Expr(crate::atom::expr_data(out))]),
                 _ => plain(out),
             };
             vals.push(result);
@@ -300,7 +300,7 @@ pub(crate) fn apply_frame(
                 Some(Atom::Expr(v)) => v.to_vec(),
                 Some(other) => vec![other],
                 None => {
-                    vals.push(super::budget::plain(vec![Atom::Expr(Arc::from([]))]));
+                    vals.push(super::budget::plain(vec![Atom::Expr(crate::atom::expr_data([]))]));
                     return Ok(());
                 }
             };
@@ -322,7 +322,7 @@ pub(crate) fn apply_frame(
                     }
                 }
             }
-            vals.push(super::budget::plain(vec![Atom::Expr(Arc::from(results.as_slice()))]));
+            vals.push(super::budget::plain(vec![Atom::Expr(crate::atom::expr_data(results.as_slice()))]));
             Ok(())
         }
         Frame::UnifyDispatch { a_expr, b_expr, then_, else_, env } => {
@@ -751,13 +751,13 @@ pub(crate) fn apply_frame(
             if atoms.is_empty() {
                 return Err("within: expression produced no results".into());
             }
-            let wrapped = Atom::Expr(std::iter::once(Atom::sym("within")).chain(atoms).collect());
+            let wrapped = Atom::expr(std::iter::once(Atom::sym("within")).chain(atoms).collect::<Vec<_>>());
             vals.push(plain(vec![wrapped]));
             Ok(())
         }
         Frame::CollapseGather => {
             let result_set = pop_n(vals, 1).pop().unwrap();
-            vals.push(plain(vec![Atom::Expr(Arc::from(atoms_of(&result_set)))]));
+            vals.push(plain(vec![Atom::Expr(crate::atom::expr_data(atoms_of(&result_set)))]));
             Ok(())
         }
         Frame::OnceCut => {
@@ -848,7 +848,7 @@ pub(crate) fn apply_frame(
                     .iter()
                     .map(|a| crate::eval::shared::subst::subst_atom(a, &combo_env))
                     .collect();
-                lists.push((Atom::Expr(Arc::from(substituted)), combo_env));
+                lists.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env));
             }
             vals.push(lists);
             Ok(())
@@ -862,7 +862,7 @@ pub(crate) fn apply_frame(
                     .iter()
                     .map(|a| crate::eval::shared::subst::subst_atom(a, &combo_env))
                     .collect();
-                lists.push((Atom::Expr(Arc::from(substituted)), combo_env));
+                lists.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env));
             }
             vals.push(lists);
             Ok(())
@@ -956,10 +956,10 @@ pub(crate) fn apply_frame(
                         if funcs.has_higher_arity(name, arity) {
                             let partial_args: Vec<Atom> = arg_options.into_iter().flatten().collect();
                             vals.push(plain(vec![
-                                Atom::Expr(Arc::from([
+                                Atom::Expr(crate::atom::expr_data([
                                     Atom::sym("partial"),
                                     Atom::Sym(name.clone()),
-                                    Atom::Expr(Arc::from(partial_args)),
+                                    Atom::Expr(crate::atom::expr_data(partial_args)),
                                 ]))
                             ]));
                             return Ok(());
@@ -1046,7 +1046,7 @@ pub(crate) fn apply_frame(
                     .iter()
                     .map(|a| crate::eval::shared::subst::subst_atom(a, &combo_env))
                     .collect();
-                lists.push((Atom::Expr(Arc::from(substituted)), combo_env));
+                lists.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env));
             }
             vals.push(lists);
             Ok(())

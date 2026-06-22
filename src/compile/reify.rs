@@ -10,7 +10,7 @@ pub fn expr_to_atom(expr: &Expr) -> Atom {
         Expr::Symbol(symbol) => Atom::sym(symbol),
         Expr::Str(s) => Atom::str_val(s),
         Expr::Number(number) => Atom::Num(number.clone()),
-        Expr::List(items) => Atom::Expr(items.iter().map(expr_to_atom).collect()),
+        Expr::List(items) => Atom::expr(items.iter().map(expr_to_atom).collect::<Vec<_>>()),
     }
 }
 

@@ -260,7 +260,7 @@ fn parse_plugin_atom(input: &str) -> Result<Atom, String> {
                 items.push(parse_plugin_atom(token)?);
             }
         }
-        return Ok(Atom::Expr(items.into()));
+        return Ok(Atom::Expr(crate::atom::expr_data(items)));
     }
     if let Ok(n) = input.parse::<i128>() {
         return Ok(Atom::num(n));

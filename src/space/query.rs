@@ -125,7 +125,7 @@ pub fn collect_match_results(
                 return Ok(results
                     .into_iter()
                     .map(|bindings| MatchResult {
-                        atom: Atom::Expr(Arc::from([Atom::sym(",")])),
+                        atom: Atom::Expr(crate::atom::expr_data([Atom::sym(",")])),
                         bindings,
                     })
                     .collect());
@@ -159,7 +159,7 @@ pub fn transform_matches(
                 .cloned()
                 .unwrap_or_else(|| atom.clone()),
             Atom::Expr(items) => {
-                Atom::Expr(items.iter().map(|item| apply_subst(item, subst)).collect())
+                Atom::expr(items.iter().map(|item| apply_subst(item, subst)).collect::<Vec<_>>())
             }
             _ => atom.clone(),
         }

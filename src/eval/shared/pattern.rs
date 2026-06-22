@@ -118,7 +118,7 @@ pub(crate) fn try_match_one(
                         else {
                             return Ok(None);
                         };
-                        let tail = Atom::Expr(Arc::from(&elements[1..]));
+                        let tail = Atom::Expr(crate::atom::expr_data(&elements[1..]));
                         try_match_one(&items[2], &tail, &head_env, funcs)
                     }
                     _ => Ok(None),

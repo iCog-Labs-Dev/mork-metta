@@ -70,7 +70,7 @@ fn sread_parse(input: &str) -> Result<Atom, String> {
     if input.starts_with('(') && input.ends_with(')') {
         let inner = input[1..input.len() - 1].trim();
         if inner.is_empty() {
-            return Ok(Atom::Expr(Arc::from([])));
+            return Ok(Atom::Expr(crate::atom::expr_data([])));
         }
         let mut items = Vec::new();
         let mut depth = 0i32;
@@ -97,7 +97,7 @@ fn sread_parse(input: &str) -> Result<Atom, String> {
                 items.push(sread_parse(token)?);
             }
         }
-        return Ok(Atom::Expr(items.into()));
+        return Ok(Atom::Expr(crate::atom::expr_data(items)));
     }
     if let Ok(n) = input.parse::<i128>() {
         return Ok(Atom::num(n));

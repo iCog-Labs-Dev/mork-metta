@@ -392,13 +392,13 @@ pub(crate) fn eval_readln(_args: &[Expr], _env: &Env, _funcs: &FnTable) -> Resul
                 if items.len() == 1 {
                     Ok(NDet::single(crate::parser::expr_to_atom(&items[0])))
                 } else if items.is_empty() {
-                    Ok(NDet::single(crate::atom::Atom::Expr(Arc::from([]))))
+                    Ok(NDet::single(crate::atom::Atom::Expr(crate::atom::expr_data([]))))
                 } else {
-                    Ok(NDet::single(crate::atom::Atom::Expr(
+                    Ok(NDet::single(crate::atom::Atom::expr(
                         items
                             .into_iter()
                             .map(|e| crate::parser::expr_to_atom(&e))
-                            .collect(),
+                            .collect::<Vec<_>>(),
                     )))
                 }
             } else {

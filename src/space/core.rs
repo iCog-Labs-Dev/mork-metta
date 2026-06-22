@@ -27,7 +27,7 @@ impl Pattern {
                 .iter()
                 .map(|p| p.as_ground_atom())
                 .collect::<Option<Vec<_>>>()
-                .map(|v| Atom::Expr(v.into())),
+                .map(|v| Atom::Expr(crate::atom::expr_data(v))),
         }
     }
 
@@ -301,7 +301,7 @@ fn decode_children(b: &[u8], pos: &mut usize, var_count: &mut u8, n: usize) -> O
     for _ in 0..n {
         items.push(decode_one(b, pos, var_count)?);
     }
-    Some(Atom::Expr(items.into()))
+    Some(Atom::Expr(crate::atom::expr_data(items)))
 }
 
 fn match_one(pattern: &Pattern, atom: &Atom) -> Option<MatchResult> {
@@ -372,12 +372,11 @@ fn substitute_stored(atom: &Atom, bindings: &[(String, Atom)]) -> Atom {
             .find(|(name, _)| name.as_str() == s.as_ref())
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| atom.clone()),
-        Atom::Expr(items) => Atom::Expr(
+        Atom::Expr(items) => Atom::expr(
             items
                 .iter()
                 .map(|a| substitute_stored(a, bindings))
-                .collect::<Vec<_>>()
-                .into(),
+                .collect::<Vec<_>>(),
         ),
         _ => atom.clone(),
     }
@@ -388,7 +387,7 @@ fn pattern_to_atom(pattern: &Pattern) -> Atom {
         Pattern::Any => Atom::sym("_"),
         Pattern::Var(name) => Atom::sym(name),
         Pattern::Exact(a) => a.clone(),
-        Pattern::Expr(pats) => Atom::Expr(pats.iter().map(pattern_to_atom).collect()),
+        Pattern::Expr(pats) => Atom::expr(pats.iter().map(pattern_to_atom).collect::<Vec<_>>()),
     }
 }
 
@@ -433,7 +432,7 @@ fn parse_value(chars: &[char], pos: &mut usize) -> Result<Atom, String> {
                 }
                 if chars[*pos] == ')' {
                     *pos += 1;
-                    return Ok(Atom::Expr(items.into()));
+                    return Ok(Atom::Expr(crate::atom::expr_data(items)));
                 }
                 items.push(parse_value(chars, pos)?);
             }

@@ -14,8 +14,8 @@ fn decons_impl(args: &[Atom], _: &FnTable) -> Result<NDet, String> {
     match &args[0] {
         Atom::Expr(items) if !items.is_empty() => {
             let head = items[0].clone();
-            let rest = Atom::Expr(Arc::from(&items[1..]));
-            Ok(NDet::single(Atom::Expr(Arc::from([head, rest]))))
+            let rest = Atom::Expr(crate::atom::expr_data(&items[1..]));
+            Ok(NDet::single(Atom::Expr(crate::atom::expr_data([head, rest]))))
         }
         Atom::Expr(_) => Err("decons: empty list".into()),
         other => Err(format!("decons: expected list, got {}", other.to_sexpr_string())),
@@ -67,7 +67,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
     funcs.insert_native("cdr-atom", 1, |args, _| {
         expect(args, 1, "cdr-atom")?;
         match &args[0] {
-            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(Atom::Expr(Arc::from(&items[1..])))),
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(Atom::Expr(crate::atom::expr_data(&items[1..])))),
             Atom::Expr(_) => Ok(NDet::Single(None)),
             other => Err(format!("cdr-atom: expected list, got {}", other.to_sexpr_string())),
         }
@@ -77,7 +77,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
     funcs.insert_native("cdr", 1, |args, _| {
         expect(args, 1, "cdr")?;
         match &args[0] {
-            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(Atom::Expr(Arc::from(&items[1..])))),
+            Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(Atom::Expr(crate::atom::expr_data(&items[1..])))),
             Atom::Expr(_) => Err("cdr: empty list".into()),
             other => Err(format!("cdr: expected list, got {}", other.to_sexpr_string())),
         }
@@ -91,7 +91,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
             Atom::Expr(items) => out.extend(items.iter().cloned()),
             other => out.push(other.clone()),
         }
-        Ok(NDet::single(Atom::Expr(out.into())))
+        Ok(NDet::single(Atom::Expr(crate::atom::expr_data(out))))
     });
     funcs.mark_pure("cons-atom", 2);
 
@@ -102,7 +102,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
             Atom::Expr(items) => out.extend(items.iter().cloned()),
             other => out.push(other.clone()),
         }
-        Ok(NDet::single(Atom::Expr(out.into())))
+        Ok(NDet::single(Atom::Expr(crate::atom::expr_data(out))))
     });
     funcs.mark_pure("cons", 2);
 
@@ -122,7 +122,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
             Atom::Expr(items) => out.extend(items.iter().cloned()),
             other => out.push(other.clone()),
         }
-        Ok(NDet::single(Atom::Expr(out.into())))
+        Ok(NDet::single(Atom::Expr(crate::atom::expr_data(out))))
     });
     funcs.mark_pure("append", 2);
 
@@ -132,7 +132,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
             Atom::Expr(items) => {
                 let mut rev = items.to_vec();
                 rev.reverse();
-                Ok(NDet::single(Atom::Expr(rev.into())))
+                Ok(NDet::single(Atom::Expr(crate::atom::expr_data(rev))))
             }
             other => Err(format!("reverse: expected list, got {}", other.to_sexpr_string())),
         }
@@ -218,7 +218,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
             a => vec![a.clone()],
         };
         items.sort_by(|a, b| a.to_sexpr_string().cmp(&b.to_sexpr_string()));
-        Ok(NDet::single(Atom::Expr(items.into())))
+        Ok(NDet::single(Atom::Expr(crate::atom::expr_data(items))))
     });
     funcs.mark_pure("msort", 1);
 
@@ -230,7 +230,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
         };
         items.sort_by(|a, b| a.to_sexpr_string().cmp(&b.to_sexpr_string()));
         items.dedup();
-        Ok(NDet::single(Atom::Expr(items.into())))
+        Ok(NDet::single(Atom::Expr(crate::atom::expr_data(items))))
     });
     funcs.mark_pure("sort", 1);
 
@@ -241,7 +241,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
             a => vec![a.clone()],
         };
         items.sort_by(|a, b| a.to_sexpr_string().cmp(&b.to_sexpr_string()));
-        Ok(NDet::single(Atom::Expr(items.into())))
+        Ok(NDet::single(Atom::Expr(crate::atom::expr_data(items))))
     });
     funcs.mark_pure("sort-atom", 1);
 
@@ -260,11 +260,11 @@ pub fn register_collection_builtins(funcs: &FnTable) {
         match &args[1] {
             Atom::Expr(items) => {
                 let filtered: Vec<Atom> = items.iter().filter(|x| **x != args[0]).cloned().collect();
-                Ok(NDet::single(Atom::Expr(filtered.into())))
+                Ok(NDet::single(Atom::Expr(crate::atom::expr_data(filtered))))
             }
             other => {
                 if *other == args[0] {
-                    Ok(NDet::single(Atom::Expr(Arc::from([]))))
+                    Ok(NDet::single(Atom::Expr(crate::atom::expr_data([]))))
                 } else {
                     Ok(NDet::single(other.clone()))
                 }
@@ -285,7 +285,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
                         deduped.push(item.clone());
                     }
                 }
-                Ok(NDet::single(Atom::Expr(deduped.into())))
+                Ok(NDet::single(Atom::Expr(crate::atom::expr_data(deduped))))
             }
             other => Ok(NDet::single(other.clone())),
         }
@@ -307,7 +307,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
                     }
                     deduped.push(item.clone());
                 }
-                Ok(NDet::single(Atom::Expr(deduped.into())))
+                Ok(NDet::single(Atom::Expr(crate::atom::expr_data(deduped))))
             }
             other => Ok(NDet::single(other.clone())),
         }
@@ -319,7 +319,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
         let mut items1 = match &args[0] { Atom::Expr(v) => v.to_vec(), other => vec![other.clone()] };
         let items2: Vec<Atom> = match &args[1] { Atom::Expr(v) => v.to_vec(), other => vec![other.clone()] };
         items1.extend(items2);
-        Ok(NDet::single(Atom::Expr(items1.into())))
+        Ok(NDet::single(Atom::Expr(crate::atom::expr_data(items1))))
     });
     funcs.mark_pure("union-atom", 2);
 
@@ -340,7 +340,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
                 }
             }
         }
-        Ok(NDet::single(Atom::Expr(result.into())))
+        Ok(NDet::single(Atom::Expr(crate::atom::expr_data(result))))
     });
     funcs.mark_pure("intersection-atom", 2);
 
@@ -365,7 +365,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
                 result.push(item);
             }
         }
-        Ok(NDet::single(Atom::Expr(result.into())))
+        Ok(NDet::single(Atom::Expr(crate::atom::expr_data(result))))
     });
     funcs.mark_pure("subtraction-atom", 2);
 
@@ -381,7 +381,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
                         deduped.push(item.clone());
                     }
                 }
-                Ok(NDet::single(Atom::Expr(deduped.into())))
+                Ok(NDet::single(Atom::Expr(crate::atom::expr_data(deduped))))
             }
             other => Ok(NDet::single(other.clone())),
         }
@@ -429,7 +429,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
                             })?;
                             results.push(val);
                         }
-                        return Ok(NDet::single(Atom::Expr(results.into())));
+                        return Ok(NDet::single(Atom::Expr(crate::atom::expr_data(results))));
                     }
                 }
                 // Fallback for user-defined functions
@@ -505,7 +505,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
                 }
             }
         }
-        Ok(NDet::single(Atom::Expr(results.into())))
+        Ok(NDet::single(Atom::Expr(crate::atom::expr_data(results))))
     });
 
     funcs.insert_native("maplist", 2, |args, table| {
@@ -525,7 +525,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
             let val = result.next().ok_or_else(|| format!("maplist: function produced no results for item {}", item.to_sexpr_string()))?;
             results.push(val);
         }
-        Ok(NDet::single(Atom::Expr(results.into())))
+        Ok(NDet::single(Atom::Expr(crate::atom::expr_data(results))))
     });
 
     funcs.insert_native("filter-atom", 2, |args, table| {
@@ -546,7 +546,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
                 if val == Atom::sym("True") { results.push(item.clone()); }
             }
         }
-        Ok(NDet::single(Atom::Expr(results.into())))
+        Ok(NDet::single(Atom::Expr(crate::atom::expr_data(results))))
     });
 
     funcs.insert_native("concat", 2, |args, _| {
@@ -555,7 +555,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
             (Atom::Expr(a), Atom::Expr(b)) => {
                 let mut out = a.to_vec();
                 out.extend(b.iter().cloned());
-                Ok(NDet::single(Atom::Expr(out.into())))
+                Ok(NDet::single(Atom::Expr(crate::atom::expr_data(out))))
             }
             (Atom::Sym(a), Atom::Sym(b)) => Ok(NDet::single(Atom::sym(&format!("{a}{b}")))),
             _ => Ok(NDet::single(Atom::sym(&format!("{}{}", args[0].to_sexpr_string(), args[1].to_sexpr_string())))),
@@ -572,7 +572,7 @@ pub fn register_collection_builtins(funcs: &FnTable) {
     funcs.insert_native("atom_chars", 1, |args, _| {
         expect(args, 1, "atom_chars")?;
         let chars: Vec<Atom> = args[0].to_sexpr_string().chars().map(|c| Atom::sym(&c.to_string())).collect();
-        Ok(NDet::single(Atom::Expr(chars.into())))
+        Ok(NDet::single(Atom::Expr(crate::atom::expr_data(chars))))
     });
     funcs.mark_pure("atom_chars", 1);
 
