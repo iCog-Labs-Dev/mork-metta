@@ -414,7 +414,14 @@ fn atom_to_py<'py>(
                 }
             }
         }
-        // For compound atoms, represent as Python string for now
+        Atom::Expr(items) => {
+            use pyo3::types::PyListMethods;
+            let list = pyo3::types::PyList::empty(py);
+            for item in items.iter() {
+                list.append(atom_to_py(item, py)?).map_err(|e| e.to_string())?;
+            }
+            Ok(list.into_any())
+        }
         a => {
             let py_s: pyo3::Bound<'_, pyo3::types::PyString> = pyo3::types::PyString::new(py, &a.to_sexpr_string());
             Ok(py_s.into_any())
