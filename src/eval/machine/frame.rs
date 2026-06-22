@@ -180,6 +180,16 @@ pub(crate) enum Frame {
         /// Function atom (symbol) applied each step.
         func: Atom,
     },
+    /// Evaluate arg0 of `(unify arg0 pattern then else)` then dispatch:
+    /// - space atom → space query (a_expr is the space-query pattern)
+    /// - other       → term unification (a_expr is the match pattern, b_expr is the value)
+    UnifyDispatch {
+        a_expr: Expr,     // original arg0 expression (pattern for term unify)
+        b_expr: Expr,     // arg1 expression (pattern for space query / value for term unify)
+        then_: Arc<Expr>,
+        else_: Arc<Expr>,
+        env: Env,
+    },
     /// Collect 2 evaluated args (list, acc) then start an inline-lambda fold.
     /// General form: (foldl-atom list acc $v0 $v1 ... body)
     /// var_names holds stripped names (no $), body is the last arg unevaluated.

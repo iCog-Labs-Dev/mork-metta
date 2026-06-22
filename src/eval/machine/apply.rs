@@ -325,6 +325,49 @@ pub(crate) fn apply_frame(
             vals.push(super::budget::plain(vec![Atom::Expr(Arc::from(results.as_slice()))]));
             Ok(())
         }
+        Frame::UnifyDispatch { a_expr, b_expr, then_, else_, env } => {
+            let arg0_rs = pop_n(vals, 1).pop().unwrap();
+            match arg0_rs.into_iter().next().map(|(a, _)| a) {
+                Some(space_ref) if matches!(&space_ref, Atom::Sym(s) if s.starts_with('&')) => {
+                    // Space query: arg0 is a space, arg1 (b_expr) is the pattern
+                    let body = crate::eval::shared::subst::subst_expr_vars(&then_, &env);
+                    let matches = crate::space::query::collect_match_results(
+                        funcs, &space_ref, &b_expr, &env,
+                    )?;
+                    if matches.is_empty() {
+                        work.push(Task::Eval { expr: else_, env });
+                    } else {
+                        let n = matches.len();
+                        let mut branches: Vec<_> = matches
+                            .into_iter()
+                            .map(|m| {
+                                let body_env = crate::eval::shared::env::bind_all(&env, &m.bindings);
+                                (Arc::new(body.clone()), body_env)
+                            })
+                            .rev()
+                            .collect();
+                        let (first_expr, first_env) = branches.pop().unwrap();
+                        work.push(Task::Apply(Frame::Gather { n }));
+                        if !branches.is_empty() {
+                            work.push(Task::Apply(Frame::SpaceMatchStream { remaining: branches }));
+                        }
+                        work.push(Task::Eval { expr: first_expr, env: first_env });
+                    }
+                }
+                Some(_) => {
+                    // Term unification: a_expr is the pattern, b_expr is the value to evaluate
+                    work.push(Task::Apply(Frame::UnifyMatch {
+                        pattern: a_expr,
+                        then_,
+                        else_,
+                        env: env.clone(),
+                    }));
+                    work.push(Task::Eval { expr: Arc::new(b_expr), env });
+                }
+                None => work.push(Task::Eval { expr: else_, env }),
+            }
+            Ok(())
+        }
         Frame::UnifyMatch { pattern, then_, else_, env } => {
             let value_rs = pop_n(vals, 1).pop().unwrap();
             let value = match value_rs.into_iter().next().map(|(a, _)| a) {
@@ -1059,9 +1102,12 @@ pub(crate) fn apply_frame(
             let arg_options: Vec<Vec<Atom>> = arg_sets.iter().map(atoms_of).collect();
 
             match head {
-                super::task::Head::Native(f) => {
-                    if arg_options.iter().any(|values| values.is_empty()) {
-                        return Err("argument produced no results".to_string());
+                super::task::Head::Native(name, f) => {
+                    if let Some(i) = arg_options.iter().position(|v| v.is_empty()) {
+                        return Err(format!(
+                            "{name}: argument {} produced no results",
+                            i + 1
+                        ));
                     }
                     let mut results = Vec::new();
                     let mut last_err = None;

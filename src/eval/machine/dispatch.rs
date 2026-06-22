@@ -160,9 +160,9 @@ pub(crate) fn dispatch_expr(
                         if let Some(gather_idx) = work.iter().rposition(|t| {
                             matches!(t, super::task::Task::Apply(Frame::Gather { .. } | Frame::IfGather { .. }))
                         }) {
-                            let current = work.len().saturating_sub(1);
-                            if current > gather_idx + 1 {
-                                work.drain(gather_idx + 1 .. current);
+                    let current = work.len().saturating_sub(1);
+                    if current > gather_idx + 1 {
+                        work.drain(gather_idx + 1 .. current);
                             }
                             if let Some(super::task::Task::Apply(frame)) = work.get_mut(gather_idx) {
                                 match frame {
@@ -622,7 +622,26 @@ pub(crate) fn dispatch_expr(
                         });
                         return Ok(());
                     }
-                    "transform" => {
+                    // foldall func expr init
+                    // = (foldl-atom (collapse expr) init func)
+                    "foldall" => {
+                        if args.len() != 3 {
+                            return Err(format!("foldall: expected 3 args, got {}", args.len()));
+                        }
+                        let collapsed = Expr::List(Arc::from([
+                            Expr::Symbol("collapse".to_string()),
+                            args[1].clone(),
+                        ]));
+                        let expanded = Expr::List(Arc::from([
+                            Expr::Symbol("foldl-atom".to_string()),
+                            collapsed,
+                            args[2].clone(),
+                            args[0].clone(),
+                        ]));
+                        work.push(Task::Eval { expr: Arc::new(expanded), env: env.clone() });
+                        return Ok(());
+                    }
+                    "transform-check" => {
                         if args.len() != 2 {
                             return Err(format!("transform: expected 2 args, got {}", args.len()));
                         }
@@ -700,16 +719,17 @@ pub(crate) fn dispatch_expr(
                     }
                     // (unify pattern value then else): structural pattern match with variable binding.
                     // Only intercept when arg[0] is NOT a space ref — space-match unify (&self ...) falls through.
-                    "unify" if args.len() == 4
-                        && !matches!(&args[0], Expr::Symbol(s) if s.starts_with('&')) => {
-                        work.push(Task::Apply(Frame::UnifyMatch {
-                            pattern: args[0].clone(),
+                    "unify" if args.len() == 4 => {
+                        // Evaluate arg0; apply handler decides space-query vs term-unify.
+                        work.push(Task::Apply(Frame::UnifyDispatch {
+                            a_expr: args[0].clone(),
+                            b_expr: args[1].clone(),
                             then_: Arc::new(args[2].clone()),
                             else_: Arc::new(args[3].clone()),
                             env: env.clone(),
                         }));
                         work.push(Task::Eval {
-                            expr: Arc::new(args[1].clone()),
+                            expr: Arc::new(args[0].clone()),
                             env: env.clone(),
                         });
                         return Ok(());
@@ -764,7 +784,7 @@ pub(crate) fn dispatch_expr(
                             }
 
                             work.push(Task::Apply(Frame::Call {
-                                head: Head::Native(Arc::clone(func)),
+                                head: Head::Native(head.to_string(), Arc::clone(func)),
                                 arity: args.len(),
                                 env: env.clone(),
                                 prebound_args: Some(prebound_args),

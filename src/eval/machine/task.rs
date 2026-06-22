@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// The callable head selected for a function application.
 pub(crate) enum Head {
     /// A native Rust function registered in the evaluator.
-    Native(Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static>),
+    Native(String, Arc<dyn Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static>),
     /// A user-defined function represented by its clause bodies and lazy slots.
     User {
         /// The surface name of the function.

@@ -521,7 +521,7 @@ fn is_pure_expr_inner(
                     // add-atom/remove-atom classified as SpaceRead because MorkSpace RwLock makes concurrent mutations thread-safe.
                     "match" | "case" | "add-atom" | "remove-atom" => Effect::SpaceRead,
                     // SpaceMutate: forced re-eval or IO.
-                    "eval" | "call" | "reduce" | "assert" | "transform"
+                    "eval" | "call" | "reduce" | "assert" | "transform-check"
                     | "with_mutex" | "transaction" | "import!"
                     | "foldall" | "map-atom" | "forall" | "within" | "py-call" | "py-eval"
                     | "import-rs!" => Effect::SpaceMutate,
