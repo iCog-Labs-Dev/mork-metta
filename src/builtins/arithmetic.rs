@@ -366,4 +366,41 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
         Ok(NDet::single(Atom::Expr(pairs.into_iter().map(|(_, a)| a).collect())))
     });
     funcs.mark_pure("sort-math", 1);
+
+    // random-int Min Max → integer in [Min, Max] inclusive
+    // random-int &rng Min Max → same (rng arg ignored, stateless thread_rng)
+    funcs.insert_native("random-int", 2, |args, _| {
+        let (min, max) = (atom_as_f64(&args[0], "random-int")? as i64,
+                         atom_as_f64(&args[1], "random-int")? as i64);
+        if min > max { return Err(format!("random-int: min {min} > max {max}")); }
+        use rand::Rng;
+        let n = rand::thread_rng().gen_range(min..=max);
+        Ok(NDet::single(Atom::Num(Numeric::Int(dashu::Integer::from(n)))))
+    });
+
+    funcs.insert_native("random-int", 3, |args, _| {
+        // args[0] may be &rng symbol — skip it, use args[1]/args[2]
+        let (min, max) = (atom_as_f64(&args[1], "random-int")? as i64,
+                         atom_as_f64(&args[2], "random-int")? as i64);
+        if min > max { return Err(format!("random-int: min {min} > max {max}")); }
+        use rand::Rng;
+        let n = rand::thread_rng().gen_range(min..=max);
+        Ok(NDet::single(Atom::Num(Numeric::Int(dashu::Integer::from(n)))))
+    });
+
+    // random-float Min Max → float in [Min, Max)
+    // random-float &rng Min Max → same
+    funcs.insert_native("random-float", 2, |args, _| {
+        let (min, max) = (atom_as_f64(&args[0], "random-float")?,
+                         atom_as_f64(&args[1], "random-float")?);
+        let r: f64 = rand::random();
+        Ok(NDet::single(f64_to_atom(min + r * (max - min))))
+    });
+
+    funcs.insert_native("random-float", 3, |args, _| {
+        let (min, max) = (atom_as_f64(&args[1], "random-float")?,
+                         atom_as_f64(&args[2], "random-float")?);
+        let r: f64 = rand::random();
+        Ok(NDet::single(f64_to_atom(min + r * (max - min))))
+    });
 }
