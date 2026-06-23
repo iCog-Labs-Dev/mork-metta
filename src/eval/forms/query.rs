@@ -85,17 +85,146 @@ pub(crate) fn collect_clause_refs<'a>(
 }
 
 /// Look up cached user-function clauses by name and arity.
+///
+/// Authoritative path: the derived `fn_cache`. In debug builds this also
+/// shadow-runs the homoiconic space-backed lookup (`lookup_user_clauses_via_space`)
+/// and asserts the two agree (α-equivalent, order-insensitive). The space path
+/// is not yet on the hot path — this is the differential-verification gate
+/// before it takes over (migration phases 1–2).
 pub(crate) fn lookup_user_clauses(
     name: &str,
     arity: u8,
     funcs: &FnTable,
 ) -> Option<Vec<(Vec<Expr>, Expr)>> {
-    let cache = funcs.fn_cache.read().unwrap();
-    let clauses: &Vec<Clause> = cache.get(name)?.get(&arity)?;
-    Some(
+    let from_cache: Vec<(Vec<Expr>, Expr)> = {
+        let cache = funcs.fn_cache.read().unwrap();
+        let clauses: &Vec<Clause> = cache.get(name)?.get(&arity)?;
         clauses
             .iter()
             .map(|clause| (clause.patterns.clone(), clause.body.clone()))
-            .collect(),
-    )
+            .collect()
+    };
+
+    #[cfg(debug_assertions)]
+    {
+        let from_space = lookup_user_clauses_via_space(name, arity, funcs).unwrap_or_default();
+        let mut a: Vec<String> = from_cache.iter().map(canon_clause).collect();
+        let mut b: Vec<String> = from_space.iter().map(canon_clause).collect();
+        a.sort();
+        b.sort();
+        debug_assert_eq!(
+            a, b,
+            "clause-lookup divergence (fn_cache vs space) for {}/{}",
+            name, arity
+        );
+    }
+
+    Some(from_cache)
+}
+
+/// Phase 1: clause lookup via the homoiconic space — a parallel implementation
+/// to the `fn_cache` path. Queries the trie for `(= (name $..) $body)` atoms and
+/// reconstructs `(patterns, body)`. Used for shadow verification today; destined
+/// to replace the `fn_cache` lookup once verified and the trie match traversal
+/// is made variable-aware (migration phases 3–5).
+pub(crate) fn lookup_user_clauses_via_space(
+    name: &str,
+    arity: u8,
+    funcs: &FnTable,
+) -> Option<Vec<(Vec<Expr>, Expr)>> {
+    use crate::space::Pattern;
+
+    // Pattern: (= (name $ $ ... $) $body)  with `arity` argument slots.
+    let mut head_pats = Vec::with_capacity(arity as usize + 1);
+    head_pats.push(Pattern::Exact(Atom::sym(name)));
+    for _ in 0..arity {
+        head_pats.push(Pattern::Any);
+    }
+    let pat = Pattern::Expr(vec![
+        Pattern::Exact(Atom::sym("=")),
+        Pattern::Expr(head_pats),
+        Pattern::Any,
+    ]);
+
+    let results = funcs.space.read().unwrap().match_atoms(&pat);
+    let mut clauses = Vec::new();
+    for mr in results {
+        // mr.atom == (= (name p1 .. pN) body)
+        let items = match &mr.atom {
+            Atom::Expr(items) if items.len() == 3 => items,
+            _ => continue,
+        };
+        if !matches!(&items[0], Atom::Sym(s) if s.as_ref() == "=") {
+            continue;
+        }
+        let head = match &items[1] {
+            Atom::Expr(h) if h.len() == arity as usize + 1 => h,
+            _ => continue,
+        };
+        if !matches!(&head[0], Atom::Sym(s) if s.as_ref() == name) {
+            continue;
+        }
+        let patterns: Result<Vec<Expr>, _> =
+            head[1..].iter().map(crate::parser::atom_to_expr).collect();
+        let body = crate::parser::atom_to_expr(&items[2]);
+        if let (Ok(patterns), Ok(body)) = (patterns, body) {
+            clauses.push((patterns, body));
+        }
+    }
+    if clauses.is_empty() {
+        None
+    } else {
+        Some(clauses)
+    }
+}
+
+/// Canonicalize a clause to an α-equivalence-invariant string: variables are
+/// renamed to `$0,$1,…` by first-occurrence order across patterns then body.
+/// Lets the shadow check compare clause sets regardless of variable naming.
+#[cfg(debug_assertions)]
+fn canon_clause(clause: &(Vec<Expr>, Expr)) -> String {
+    let mut map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out = String::new();
+    for p in &clause.0 {
+        canon_expr(p, &mut map, &mut out);
+        out.push(' ');
+    }
+    out.push_str("=> ");
+    canon_expr(&clause.1, &mut map, &mut out);
+    out
+}
+
+#[cfg(debug_assertions)]
+fn canon_expr(e: &Expr, map: &mut std::collections::HashMap<String, usize>, out: &mut String) {
+    match e {
+        Expr::Symbol(s) if s.starts_with('$') => {
+            let n = map.len();
+            let id = *map.entry(s.clone()).or_insert(n);
+            out.push('$');
+            out.push_str(&id.to_string());
+        }
+        // The mork encoder normalizes boolean literals to lowercase when an
+        // atom round-trips through the space; fn_cache keeps source case. Fold
+        // that known normalization so only structural divergences surface.
+        Expr::Symbol(s) if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") => {
+            out.push_str(&s.to_ascii_lowercase())
+        }
+        Expr::Symbol(s) => out.push_str(s),
+        Expr::Str(s) => {
+            out.push('"');
+            out.push_str(s);
+            out.push('"');
+        }
+        Expr::Number(n) => out.push_str(&n.to_string()),
+        Expr::List(items) => {
+            out.push('(');
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                canon_expr(it, map, out);
+            }
+            out.push(')');
+        }
+    }
 }
