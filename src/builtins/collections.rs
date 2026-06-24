@@ -54,7 +54,12 @@ pub fn register_collection_builtins(funcs: &FnTable) {
             });
             Ok(NDet::stream(std::iter::empty()))
         }
-            other => Err(format!("car-atom: expected list, got {}", other.to_sexpr_string())),
+        other => {
+            crate::eval::shared::debug::logical_failure(|| {
+                format!("warn: car-atom: expected list, got {}", other.to_sexpr_string())
+            });
+            Ok(NDet::stream(std::iter::empty()))
+        }
         }
     });
     funcs.mark_pure("car-atom", 1);
@@ -73,8 +78,18 @@ pub fn register_collection_builtins(funcs: &FnTable) {
         expect(args, 1, "cdr-atom")?;
         match &args[0] {
             Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(Atom::Expr(crate::atom::expr_data(&items[1..])))),
-            Atom::Expr(_) => Ok(NDet::Single(None)),
-            other => Err(format!("cdr-atom: expected list, got {}", other.to_sexpr_string())),
+        Atom::Expr(_) => {
+            crate::eval::shared::debug::logical_failure(|| {
+                "warn: cdr-atom on empty list".to_string()
+            });
+            Ok(NDet::stream(std::iter::empty()))
+        }
+        other => {
+            crate::eval::shared::debug::logical_failure(|| {
+                format!("warn: cdr-atom: expected list, got {}", other.to_sexpr_string())
+            });
+            Ok(NDet::stream(std::iter::empty()))
+        }
         }
     });
     funcs.mark_pure("cdr-atom", 1);
