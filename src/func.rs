@@ -391,6 +391,12 @@ impl FnTable {
 
     /// Store a memoized result tagged with the current mutation stamp.
     pub fn memo_set(&self, key: (String, Vec<Atom>), result: Vec<Atom>) {
+        if result
+            .iter()
+            .any(crate::eval::shared::fresh::contains_fresh_vars)
+        {
+            return;
+        }
         let stamp = self.memo_stamp.load(Ordering::Relaxed);
         self.memo_cache.write().unwrap().insert(key, (stamp, result));
     }

@@ -298,14 +298,18 @@ pub(crate) fn apply_frame(
                         }
                     }
                     Ok(None) => {
-                        eprintln!(
-                            "warn: let pattern {} does not match value {}",
-                            pattern.to_string(),
-                            value.to_sexpr_string(),
-                        );
+                        crate::eval::shared::debug::logical_failure(|| {
+                            format!(
+                                "warn: let pattern {} does not match value {}",
+                                pattern.to_string(),
+                                value.to_sexpr_string(),
+                            )
+                        });
                     }
                     Err(e) => {
-                        eprintln!("warn: let pattern match error: {}", e);
+                        crate::eval::shared::debug::logical_failure(|| {
+                            format!("warn: let pattern match error: {}", e)
+                        });
                     }
                 }
             }
@@ -649,14 +653,18 @@ pub(crate) fn apply_frame(
                         }
                     }
                     Ok(None) => {
-                        eprintln!(
-                            "warn: let* pattern {} does not match value {}",
-                            pattern.to_string(),
-                            value.to_sexpr_string(),
-                        );
+                        crate::eval::shared::debug::logical_failure(|| {
+                            format!(
+                                "warn: let* pattern {} does not match value {}",
+                                pattern.to_string(),
+                                value.to_sexpr_string(),
+                            )
+                        });
                     }
                     Err(e) => {
-                        eprintln!("warn: let* pattern match error: {}", e);
+                        crate::eval::shared::debug::logical_failure(|| {
+                            format!("warn: let* pattern match error: {}", e)
+                        });
                     }
                 }
             }
@@ -883,7 +891,8 @@ pub(crate) fn apply_frame(
                 match head_atom {
                     Atom::Sym(name) => {
                         // Dispatch as a named function call
-                        let arg_options: Vec<Vec<Atom>> = arg_sets.iter().map(atoms_of).collect();
+                    let arg_options: Vec<Vec<Atom>> = arg_sets.iter().map(atoms_of).collect();
+                    let debug_vars = std::env::var_os("MORK_DEBUG_VARCALLS").is_some();
                         if arg_options.iter().any(|values| values.is_empty()) {
                             vals.push(Vec::new());
                             return Ok(());
@@ -1016,20 +1025,53 @@ pub(crate) fn apply_frame(
                             }
                         }
                     }
-                    Atom::Closure(c) => {
-                        let clauses: Vec<(Vec<Expr>, Expr)> =
-                            vec![(c.params.clone(), c.body.clone())];
-                        let combos_with_envs = threaded_combinations(&arg_sets);
+                Atom::Closure(c) => {
+                    let clauses: Vec<(Vec<Expr>, Expr)> =
+                        vec![(c.params.clone(), c.body.clone())];
+                    let combos_with_envs = threaded_combinations(&arg_sets);
+                    let debug_vars = std::env::var_os("MORK_DEBUG_VARCALLS").is_some();
+                    if debug_vars {
+                        let rendered: Vec<String> = combos_with_envs
+                            .iter()
+                            .map(|(combo, _)| {
+                                    combo.iter()
+                                        .map(|a| format!("{}[open={}]", a.to_sexpr_string(), a.is_open()))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .collect();
+                        eprintln!(
+                            "debug[varcalls]: call {} arity={} combos={} clauses={} args={}",
+                            "<closure>",
+                            arity,
+                            combos_with_envs.len(),
+                            clauses.len(),
+                            rendered.join(" || ")
+                            );
+                        }
                         let mut bodies: Vec<(Arc<Expr>, Env, i64)> = Vec::new();
                         for (combo, combo_env) in &combos_with_envs {
                             for (patterns, body) in &clauses {
                                 if let Some((body_env, subst_cost)) =
                                     crate::eval::forms::query::match_clause(patterns, combo, combo_env, funcs)
                                 {
-                                    bodies.push((Arc::new(body.clone()), body_env, subst_cost));
+                                    let body =
+                                        crate::eval::shared::fresh::rename_apart_unbound_vars(
+                                            body,
+                                            &body_env,
+                                        );
+                                    bodies.push((Arc::new(body), body_env, subst_cost));
                                 }
                             }
                         }
+                    if debug_vars {
+                        eprintln!(
+                            "debug[varcalls]: call {} produced {} matching bodies",
+                            "<closure>",
+                            bodies.len()
+                        );
+                    }
+
                         if !bodies.is_empty() {
                             let mut out = Vec::new();
                             for (body, body_env, _) in bodies {
@@ -1167,9 +1209,14 @@ pub(crate) fn apply_frame(
                                     combo_env,
                                     funcs,
                                 )
-                            {
-                                bodies.push((Arc::new(body.clone()), body_env, subst_cost));
-                            }
+                                {
+                                    let body =
+                                        crate::eval::shared::fresh::rename_apart_unbound_vars(
+                                            body,
+                                            &body_env,
+                                        );
+                                    bodies.push((Arc::new(body), body_env, subst_cost));
+                                }
                         }
                     }
                     if bodies.is_empty() {

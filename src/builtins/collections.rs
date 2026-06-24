@@ -48,7 +48,12 @@ pub fn register_collection_builtins(funcs: &FnTable) {
         expect(args, 1, "car-atom")?;
         match &args[0] {
             Atom::Expr(items) if !items.is_empty() => Ok(NDet::single(items[0].clone())),
-            Atom::Expr(_) => Err("car-atom: empty list".into()),
+        Atom::Expr(_) => {
+            crate::eval::shared::debug::logical_failure(|| {
+                "warn: car-atom on empty list".to_string()
+            });
+            Ok(NDet::stream(std::iter::empty()))
+        }
             other => Err(format!("car-atom: expected list, got {}", other.to_sexpr_string())),
         }
     });

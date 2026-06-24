@@ -50,24 +50,71 @@ pub(crate) fn match_clause(
     base_env: &Env,
     funcs: &FnTable,
 ) -> Option<(Env, i64)> {
+    let debug_vars = std::env::var_os("MORK_DEBUG_VARCALLS").is_some();
     if patterns.len() != args.len() {
+        if debug_vars {
+            eprintln!(
+                "debug[varcalls]: arity mismatch patterns={} args={}",
+                patterns.len(),
+                args.len()
+            );
+        }
         return None;
     }
 
     let mut unification_env = Env::new();
-    for (i, (pattern, arg)) in patterns.iter().zip(args.iter()).enumerate() {
+    for (pattern, arg) in patterns.iter().zip(args.iter()) {
         match crate::eval::shared::pattern::try_match_one(pattern, arg, &unification_env, funcs) {
-            Ok(Some(new_env)) => unification_env = new_env,
+            Ok(Some(new_env)) => {
+                if debug_vars {
+                    eprintln!(
+                        "debug[varcalls]: matched pat={} arg={} open_arg={}",
+                        crate::parser::expr_to_atom(pattern).to_sexpr_string(),
+                        arg.to_sexpr_string(),
+                        arg.is_open()
+                    );
+                }
+                unification_env = new_env;
+            }
             Ok(None) => {
+                if debug_vars {
+                    eprintln!(
+                        "debug[varcalls]: no-match pat={} arg={} open_arg={}",
+                        crate::parser::expr_to_atom(pattern).to_sexpr_string(),
+                        arg.to_sexpr_string(),
+                        arg.is_open()
+                    );
+                }
                 return None;
             }
-            Err(_) => {
+            Err(e) => {
+                if debug_vars {
+                    eprintln!(
+                        "debug[varcalls]: error pat={} arg={} err={}",
+                        crate::parser::expr_to_atom(pattern).to_sexpr_string(),
+                        arg.to_sexpr_string(),
+                        e
+                    );
+                }
                 return None;
             }
         }
     }
 
     let subst_cost = env_binding_cost(&unification_env);
+    if debug_vars {
+        let pats: Vec<String> = patterns
+            .iter()
+            .map(|p| crate::parser::expr_to_atom(p).to_sexpr_string())
+            .collect();
+        let vals: Vec<String> = args.iter().map(|a| a.to_sexpr_string()).collect();
+        eprintln!(
+            "debug[varcalls]: clause matched pats={} args={} subst_cost={}",
+            pats.join(" | "),
+            vals.join(" | "),
+            subst_cost
+        );
+    }
     Some((
         crate::eval::shared::pattern::prepend_env(unification_env, base_env),
         subst_cost,
