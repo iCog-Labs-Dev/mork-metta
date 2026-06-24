@@ -25,6 +25,16 @@ impl PartialEq for Numeric {
 }
 impl Eq for Numeric {}
 
+impl std::hash::Hash for Numeric {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Numeric::Int(n) => n.hash(state),
+            Numeric::Dec(d) => d.to_string().hash(state),
+        }
+    }
+}
+
 impl std::fmt::Display for Numeric {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -73,6 +83,13 @@ pub struct ClosureData {
     pub params: Vec<Expr>,
     pub body: Expr,
     pub env: Env,
+}
+
+impl std::hash::Hash for ClosureData {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.params.hash(state);
+        self.body.hash(state);
+    }
 }
 
 /// Backing store for an `Atom::Expr` node.
@@ -158,14 +175,14 @@ impl std::hash::Hash for Atom {
         match self {
             Atom::Sym(s) => s.hash(state),
             Atom::Str(s) => s.hash(state),
-            Atom::Num(n) => n.to_string().hash(state),
+            Atom::Num(n) => n.hash(state),
             Atom::Expr(items) => {
                 items.len().hash(state);
                 for a in items.iter() {
                     a.hash(state);
                 }
             }
-            Atom::Closure(c) => c.body.to_string().hash(state),
+            Atom::Closure(c) => c.hash(state),
         }
     }
 }

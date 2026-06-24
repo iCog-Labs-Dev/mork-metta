@@ -41,6 +41,8 @@ pub(crate) fn run_rs(
     funcs: &FnTable,
     budget: &mut Option<i64>,
 ) -> Result<ResultSet, String> {
+    let _profile = crate::profile::ProfileGuard::new("run_rs");
+    crate::env::clear_lookup_cache();
     // reuse vectors from thread-local pools to prevent the allocation storm of nested run_rs calls
     thread_local! {
         static WORK_POOL: std::cell::RefCell<Vec<Vec<super::task::Task>>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -93,12 +95,30 @@ fn run_rs_loop(
         }
         match task {
             super::task::Task::Eval { expr, env } => {
+                let _profile = crate::profile::ProfileGuard::new("run_rs::Eval");
                 super::dispatch::dispatch_expr(&expr, &env, funcs, work, vals)?;
             }
             super::task::Task::Apply(frame) => {
+                let name = match &frame {
+                    super::frame::Frame::Call { .. } => "run_rs::Apply::Call",
+                    super::frame::Frame::Gather { .. } => "run_rs::Apply::Gather",
+                    super::frame::Frame::MergeEnv { .. } => "run_rs::Apply::MergeEnv",
+                    super::frame::Frame::IfGather { .. } => "run_rs::Apply::IfGather",
+                    super::frame::Frame::LetStarBind { .. } => "run_rs::Apply::LetStarBind",
+                    super::frame::Frame::LetMatch { .. } => "run_rs::Apply::LetMatch",
+                    super::frame::Frame::ChainBind { .. } => "run_rs::Apply::ChainBind",
+                    super::frame::Frame::Progn { .. } => "run_rs::Apply::Progn",
+                    super::frame::Frame::Prog1 { .. } => "run_rs::Apply::Prog1",
+                    super::frame::Frame::Discard => "run_rs::Apply::Discard",
+                    super::frame::Frame::Forward(_) => "run_rs::Apply::Forward",
+                    super::frame::Frame::DataList { .. } | super::frame::Frame::DataListWithHead { .. } => "run_rs::Apply::DataList",
+                    _ => "run_rs::Apply::Other",
+                };
+                let _profile = crate::profile::ProfileGuard::new(name);
                 super::apply::apply_frame(frame, funcs, work, vals)?;
             }
             super::task::Task::Transition(transition) => {
+                let _profile = crate::profile::ProfileGuard::new("run_rs::Transition");
                 if let Some(result_set) =
                     super::transition::apply_transition(transition, funcs, budget)?
                 {

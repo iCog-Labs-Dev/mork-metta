@@ -131,6 +131,47 @@ pub(crate) fn dispatch_expr(
     work: &mut Vec<Task>,
     vals: &mut Vec<super::budget::ResultSet>,
 ) -> Result<(), String> {
+    let name = match expr {
+        Expr::Number(_) => "dispatch::Number",
+        Expr::Symbol(_) => "dispatch::Symbol",
+        Expr::Str(_) => "dispatch::Str",
+        Expr::List(items) => {
+            if items.is_empty() {
+                "dispatch::List::Empty"
+            } else if let Expr::Symbol(head) = &items[0] {
+                match head.as_str() {
+                    "cut" => "dispatch::List::cut",
+                    "quote" => "dispatch::List::quote",
+                    "call" | "reduce" => "dispatch::List::call_reduce",
+                    "eval" => "dispatch::List::eval",
+                    "|->" => "dispatch::List::lambda",
+                    "if" => "dispatch::List::if",
+                    "case" => "dispatch::List::case",
+                    "superpose" => "dispatch::List::superpose",
+                    "let" => "dispatch::List::let",
+                    "let*" => "dispatch::List::let*",
+                    "foldall" => "dispatch::List::foldall",
+                    "forall" => "dispatch::List::forall",
+                    "foldl-atom" => "dispatch::List::foldl_atom",
+                    _ => {
+                        let arity = (items.len() - 1) as u8;
+                        if let Some(function) = funcs.get(head, arity) {
+                            match &function.kind {
+                                crate::func::FunctionKind::Native { .. } => "dispatch::List::General::NativeCall",
+                            }
+                        } else if crate::eval::forms::query::lookup_user_clauses(head, arity, funcs).is_some() {
+                            "dispatch::List::General::UserCall"
+                        } else {
+                            "dispatch::List::General::NonFuncList"
+                        }
+                    }
+                }
+            } else {
+                "dispatch::List::General::NonFuncList"
+            }
+        }
+    };
+    let _profile = crate::profile::ProfileGuard::new(name);
     match expr {
         Expr::Number(number) => {
             vals.push(plain(vec![crate::atom::Atom::Num(number.clone())]));
@@ -772,17 +813,16 @@ pub(crate) fn dispatch_expr(
                 if let Some(function) = funcs.get(head, args.len() as u8) {
                     match &function.kind {
                         FunctionKind::Native { func } => {
-                            let mut prebound_args = vec![None; args.len()];
-                            let mut eager_indices: Vec<usize> = (0..args.len()).collect();
-
                             // parallel argument evaluation for pure/read-only native calls
                             let par_threshold = 10 * rayon::current_num_threads();
-                            let arg_weights: usize = eager_indices.iter().map(|&idx| funcs.expr_weight(&args[idx])).sum();
-                            if eager_indices.len() >= 2
+                            let arg_weights: usize = (0..args.len()).map(|idx| funcs.expr_weight(&args[idx])).sum();
+                            if args.len() >= 2
                                 && function.effect != crate::func::Effect::SpaceMutate
                                 && arg_weights >= par_threshold
-                                && eager_indices.iter().all(|&idx| funcs.is_parallelizable_expr(&args[idx]))
+                                && (0..args.len()).all(|idx| funcs.is_parallelizable_expr(&args[idx]))
                             {
+                                let mut prebound_args = vec![None; args.len()];
+                                let eager_indices: Vec<usize> = (0..args.len()).collect();
                                 use rayon::prelude::*;
                                 let parallel_results: Result<Vec<super::budget::ResultSet>, String> = eager_indices
                                     .par_iter()
@@ -799,20 +839,25 @@ pub(crate) fn dispatch_expr(
                                 for (idx, res) in eager_indices.iter().zip(parallel_results.into_iter()) {
                                     prebound_args[*idx] = Some(res);
                                 }
-                                eager_indices.clear();
-                            }
-
-                            work.push(Task::Apply(Frame::Call {
-                                head: Head::Native(head.to_string(), Arc::clone(func)),
-                                arity: args.len(),
-                                env: env.clone(),
-                                prebound_args: Some(prebound_args),
-                            }));
-                            for index in eager_indices.into_iter().rev() {
-                                work.push(Task::Eval {
-                                    expr: Arc::new(args[index].clone()),
+                                work.push(Task::Apply(Frame::Call {
+                                    head: Head::Native(head.to_string(), Arc::clone(func)),
+                                    arity: args.len(),
                                     env: env.clone(),
-                                });
+                                    prebound_args: Some(prebound_args),
+                                }));
+                            } else {
+                                work.push(Task::Apply(Frame::Call {
+                                    head: Head::Native(head.to_string(), Arc::clone(func)),
+                                    arity: args.len(),
+                                    env: env.clone(),
+                                    prebound_args: None,
+                                }));
+                                for arg in args.iter().rev() {
+                                    work.push(Task::Eval {
+                                        expr: Arc::new(arg.clone()),
+                                        env: env.clone(),
+                                    });
+                                }
                             }
                             return Ok(());
                         }

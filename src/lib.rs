@@ -10,6 +10,7 @@ pub mod parser;
 #[cfg(feature = "plugins")]
 pub mod plugin;
 pub mod space;
+pub mod profile;
 
 use crate::atom::Atom;
 use crate::builtins::register_builtins;

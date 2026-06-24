@@ -83,14 +83,14 @@ fn has_shadowing(new_env: &Env, outer_env: &Env) -> bool {
 /// materialising the full M^K intermediate Vec. Uses O(depth) stack memory.
 #[inline]
 fn cartesian_product_apply<E>(
-    options: &[Vec<Atom>],
+    options: &[ResultSet],
     buf: &mut Vec<Atom>,
     f: &mut impl FnMut(&[Atom]) -> Result<(), E>,
 ) -> Result<(), E> {
     if options.is_empty() {
         return f(buf);
     }
-    for atom in &options[0] {
+    for (atom, _) in &options[0] {
         buf.push(atom.clone());
         cartesian_product_apply(&options[1..], buf, f)?;
         buf.pop();
@@ -142,6 +142,7 @@ pub(crate) fn apply_frame(
     work: &mut Vec<Task>,
     vals: &mut Vec<ResultSet>,
 ) -> Result<(), String> {
+    let _profile = crate::profile::ProfileGuard::new("apply_frame");
     match frame {
         Frame::Forward(c) => {
             let mut rs = pop_n(vals, 1).pop().unwrap();
@@ -891,9 +892,8 @@ pub(crate) fn apply_frame(
                 match head_atom {
                     Atom::Sym(name) => {
                         // Dispatch as a named function call
-                    let arg_options: Vec<Vec<Atom>> = arg_sets.iter().map(atoms_of).collect();
                     let debug_vars = std::env::var_os("MORK_DEBUG_VARCALLS").is_some();
-                        if arg_options.iter().any(|values| values.is_empty()) {
+                        if arg_sets.iter().any(|values| values.is_empty()) {
                             vals.push(Vec::new());
                             return Ok(());
                         }
@@ -902,7 +902,7 @@ pub(crate) fn apply_frame(
                             if let crate::func::FunctionKind::Native { func } = &function.kind {
                                 let mut results = Vec::new();
                                 let mut buf = Vec::new();
-                                cartesian_product_apply(&arg_options, &mut buf, &mut |slice: &[Atom]| {
+                                cartesian_product_apply(&arg_sets, &mut buf, &mut |slice: &[Atom]| {
                                     match func(slice, funcs) {
                                         Ok(nd) => { results.extend(nd); Ok(()) }
                                         Err(e) => Err(e),
@@ -971,7 +971,7 @@ pub(crate) fn apply_frame(
                         }
                         // Partial application: function exists at higher arity
                         if funcs.has_higher_arity(name, arity) {
-                            let partial_args: Vec<Atom> = arg_options.into_iter().flatten().collect();
+                            let partial_args: Vec<Atom> = arg_sets.into_iter().flatten().map(|(a, _)| a).collect();
                             vals.push(plain(vec![
                                 Atom::Expr(crate::atom::expr_data([
                                     Atom::sym("partial"),
@@ -990,14 +990,13 @@ pub(crate) fn apply_frame(
                         {
                             if let Atom::Sym(fn_name) = &items[1] {
                                 if let Atom::Expr(old_args) = &items[2] {
-                                    let arg_options: Vec<Vec<Atom>> = arg_sets.iter().map(atoms_of).collect();
-                                    if arg_options.iter().any(|values| values.is_empty()) {
+                                    if arg_sets.iter().any(|values| values.is_empty()) {
                                         vals.push(Vec::new());
                                         return Ok(());
                                     }
                                     let mut results = Vec::new();
                                     let mut buf = Vec::new();
-                                    cartesian_product_apply(&arg_options, &mut buf, &mut |combo: &[Atom]| {
+                                    cartesian_product_apply(&arg_sets, &mut buf, &mut |combo: &[Atom]| {
                                         let mut all_args: Vec<Atom> = old_args.to_vec();
                                         all_args.extend_from_slice(combo);
                                         let fn_expr = crate::parser::atom_to_expr(&Atom::Sym(fn_name.clone()))
@@ -1058,7 +1057,7 @@ pub(crate) fn apply_frame(
                                     let body =
                                         crate::eval::shared::fresh::rename_apart_unbound_vars(
                                             body,
-                                            &body_env,
+                                            patterns,
                                         );
                                     bodies.push((Arc::new(body), body_env, subst_cost));
                                 }
@@ -1149,11 +1148,9 @@ pub(crate) fn apply_frame(
             } else {
                 pop_n(vals, arity)
             };
-            let arg_options: Vec<Vec<Atom>> = arg_sets.iter().map(atoms_of).collect();
-
             match head {
                 super::task::Head::Native(name, f) => {
-                    if let Some(i) = arg_options.iter().position(|v| v.is_empty()) {
+                    if let Some(i) = arg_sets.iter().position(|v| v.is_empty()) {
                         return Err(format!(
                             "{name}: argument {} produced no results",
                             i + 1
@@ -1162,7 +1159,7 @@ pub(crate) fn apply_frame(
                     let mut results = Vec::new();
                     let mut last_err = None;
                     let mut buf = Vec::new();
-                    cartesian_product_apply(&arg_options, &mut buf, &mut |slice: &[Atom]| {
+                    cartesian_product_apply(&arg_sets, &mut buf, &mut |slice: &[Atom]| {
                         match f(slice, funcs) {
                             Ok(nd) => { results.extend(nd); Ok::<(), String>(()) }
                             Err(err) => { last_err = Some(err); Ok(()) }
@@ -1213,7 +1210,7 @@ pub(crate) fn apply_frame(
                                     let body =
                                         crate::eval::shared::fresh::rename_apart_unbound_vars(
                                             body,
-                                            &body_env,
+                                            patterns,
                                         );
                                     bodies.push((Arc::new(body), body_env, subst_cost));
                                 }

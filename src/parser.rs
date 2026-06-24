@@ -41,6 +41,18 @@ pub enum Expr {
     List(Arc<[Expr]>),
 }
 
+impl std::hash::Hash for Expr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Expr::Symbol(s) => s.hash(state),
+            Expr::Str(s) => s.hash(state),
+            Expr::Number(n) => n.hash(state),
+            Expr::List(l) => l.hash(state),
+        }
+    }
+}
+
 impl Expr {
     /// Convert an `Expr` back to a display string (for error messages).
     pub fn to_string(&self) -> String {

@@ -74,6 +74,24 @@ impl Eq for Env {}
 
 static EMPTY_ENV: OnceLock<Env> = OnceLock::new();
 
+const CACHE_SIZE: usize = 512;
+
+thread_local! {
+    static LOOKUP_CACHE: RefCell<[Option<(usize, String, Option<Atom>)>; CACHE_SIZE]> = const { RefCell::new([const { None }; CACHE_SIZE]) };
+}
+
+/// Clear the thread-local environment lookup cache.
+pub fn clear_lookup_cache() {
+    LOOKUP_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        for slot in cache.iter_mut() {
+            *slot = None;
+        }
+    });
+}
+
+use std::cell::RefCell;
+
 impl Env {
     /// Create an empty environment. Returns the shared singleton (no allocation
     /// after first call — subsequent calls are a single Arc ref-count bump).
@@ -101,7 +119,29 @@ impl Env {
     /// # Assumptions
     /// - Variable name includes the `$` prefix, e.g. `"$x"`.
     pub fn get(&self, name: &str) -> Option<Atom> {
-        match self.inner() {
+        let _profile = crate::profile::ProfileGuard::new("Env::get");
+        let env_ptr = Arc::as_ptr(&self.0) as usize;
+        let mut hash = env_ptr;
+        for b in name.bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(b as usize);
+        }
+        let idx = hash % CACHE_SIZE;
+
+        let cached = LOOKUP_CACHE.with(|c| {
+            let cache = c.borrow();
+            if let Some((ptr, ref n, ref val)) = cache[idx] {
+                if ptr == env_ptr && n == name {
+                    return Some(val.clone());
+                }
+            }
+            None
+        });
+
+        if let Some(val) = cached {
+            return val;
+        }
+
+        let val = match self.inner() {
             EnvNode::Empty => None,
             EnvNode::Cons { name: n, value, next } => {
                 if &**n == name {
@@ -113,7 +153,13 @@ impl Env {
             EnvNode::Link { prefix, base } => {
                 prefix.get(name).or_else(|| base.get(name))
             }
-        }
+        };
+
+        LOOKUP_CACHE.with(|c| {
+            c.borrow_mut()[idx] = Some((env_ptr, name.to_string(), val.clone()));
+        });
+
+        val
     }
 
     /// Return a new environment with one additional binding prepended.

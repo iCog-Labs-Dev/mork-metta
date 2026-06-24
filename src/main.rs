@@ -36,6 +36,7 @@ fn main() {
             for result in results {
                 println!("{}", result.to_sexpr_string());
             }
+            mork_metta::profile::print_profile_summary();
             Ok(())
         })
         .expect("failed to spawn eval thread");
