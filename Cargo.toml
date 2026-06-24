@@ -13,9 +13,11 @@ plugins = ["dep:libloading"]
 [dependencies]
 mork = { workspace = true }
 mork-expr = { workspace = true }
+mork-frontend = { workspace = true }
 pathmap = { workspace = true }
 pyo3 = { workspace = true, optional = true, features = ["auto-initialize"] }
 libloading = { version = "0.8", optional = true }
 rayon = "1"
 dashu = "0.4"
+rand = "0.8"
 rustc-hash = "2.1.2"
