@@ -41,10 +41,34 @@ pub(crate) fn run_rs(
     funcs: &FnTable,
     budget: &mut Option<i64>,
 ) -> Result<ResultSet, String> {
-    let mut work = Vec::with_capacity(64);
-    work.push(super::task::Task::Eval { expr: root, env: root_env });
-    let mut vals: Vec<ResultSet> = Vec::with_capacity(32);
+    // reuse vectors from thread-local pools to prevent the allocation storm of nested run_rs calls
+    thread_local! {
+        static WORK_POOL: std::cell::RefCell<Vec<Vec<super::task::Task>>> = const { std::cell::RefCell::new(Vec::new()) };
+        static VALS_POOL: std::cell::RefCell<Vec<Vec<super::budget::ResultSet>>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
 
+    let mut work = WORK_POOL.with(|p| p.borrow_mut().pop()).unwrap_or_else(|| Vec::with_capacity(64));
+    let mut vals = VALS_POOL.with(|p| p.borrow_mut().pop()).unwrap_or_else(|| Vec::with_capacity(32));
+    work.clear();
+    vals.clear();
+
+    work.push(super::task::Task::Eval { expr: root, env: root_env });
+    let res = run_rs_loop(&mut work, &mut vals, funcs, budget);
+
+    work.clear();
+    vals.clear();
+    WORK_POOL.with(|p| p.borrow_mut().push(work));
+    VALS_POOL.with(|p| p.borrow_mut().push(vals));
+
+    res
+}
+
+fn run_rs_loop(
+    work: &mut Vec<super::task::Task>,
+    vals: &mut Vec<super::budget::ResultSet>,
+    funcs: &FnTable,
+    budget: &mut Option<i64>,
+) -> Result<ResultSet, String> {
     // Debug: set MORK_DEBUG_STACK=1 to log a work-stack histogram as it grows.
     static DEBUG_STACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let debug_stack = *DEBUG_STACK.get_or_init(|| std::env::var_os("MORK_DEBUG_STACK").is_some());
@@ -52,12 +76,12 @@ pub(crate) fn run_rs(
 
     while let Some(task) = work.pop() {
         if debug_stack && work.len() >= next_log {
-            eprintln!("[stack] work={} vals={} | {}", work.len(), vals.len(), stack_histogram(&work));
+            eprintln!("[stack] work={} vals={} | {}", work.len(), vals.len(), stack_histogram(work));
             next_log += 250_000;
         }
         if work.len() + vals.len() > 2_000_000 {
             if debug_stack {
-                eprintln!("[stack] OVERFLOW histogram: {}", stack_histogram(&work));
+                eprintln!("[stack] OVERFLOW histogram: {}", stack_histogram(work));
             }
             return Err(format!(
                 "evaluation stack overflow: {} pending tasks, {} result sets — \
@@ -69,10 +93,10 @@ pub(crate) fn run_rs(
         }
         match task {
             super::task::Task::Eval { expr, env } => {
-                super::dispatch::dispatch_expr(&expr, &env, funcs, &mut work, &mut vals)?;
+                super::dispatch::dispatch_expr(&expr, &env, funcs, work, vals)?;
             }
             super::task::Task::Apply(frame) => {
-                super::apply::apply_frame(frame, funcs, &mut work, &mut vals)?;
+                super::apply::apply_frame(frame, funcs, work, vals)?;
             }
             super::task::Task::Transition(transition) => {
                 if let Some(result_set) =
