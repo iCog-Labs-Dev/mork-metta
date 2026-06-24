@@ -7,6 +7,7 @@
 use crate::atom::Atom;
 use crate::parser::Expr;
 use std::sync::Arc;
+use mork_frontend::bytestring_parser::Parser;
 
 use pathmap::zipper::{ZipperAbsolutePath, ZipperIteration, ZipperMoving};
 
@@ -96,52 +97,171 @@ impl MorkSpace {
         Box::new(Self::new())
     }
 
-    fn encode_into(
-        buf: &mut Vec<u8>,
+    fn encode_atom_direct(
+        atom: &Atom,
         inner: &mut mork::space::Space<mork::weightedsweep::UnitHeader>,
-        sexpr: &str,
+        buf: &mut Vec<u8>,
     ) -> Result<usize, String> {
-        let cap = sexpr.len() * 8 + 64;
-        if cap > buf.len() {
+        let cap = approx_size(atom) + 64;
+        if buf.len() < cap {
             buf.resize(cap, 0);
         }
-        let (_expr, len) = inner
-            .parse_sexpr(sexpr.as_bytes(), buf.as_mut_ptr())
-            .map_err(|e| format!("mork parse: {:?}", e))?;
-        Ok(len)
+        let sym_table = inner.sym_table();
+        let mut pdp = mork::space::ParDataParser::new(&sym_table);
+        let mut ez = mork_expr::ExprZipper::new(mork_expr::Expr { ptr: buf.as_mut_ptr() });
+        let mut vars = Vec::new();
+        encode_atom_inner(atom, &mut pdp, &mut ez, &mut vars)?;
+        Ok(ez.loc)
     }
+
+    fn encode_pattern_direct(
+        pattern: &Pattern,
+        inner: &mut mork::space::Space<mork::weightedsweep::UnitHeader>,
+        buf: &mut Vec<u8>,
+    ) -> Result<usize, String> {
+        let cap = approx_pattern_size(pattern) + 64;
+        if buf.len() < cap {
+            buf.resize(cap, 0);
+        }
+        let sym_table = inner.sym_table();
+        let mut pdp = mork::space::ParDataParser::new(&sym_table);
+        let mut ez = mork_expr::ExprZipper::new(mork_expr::Expr { ptr: buf.as_mut_ptr() });
+        let mut vars = Vec::new();
+        encode_pattern_inner(pattern, &mut pdp, &mut ez, &mut vars)?;
+        Ok(ez.loc)
+    }
+}
+
+fn approx_size(atom: &Atom) -> usize {
+    match atom {
+        Atom::Sym(s) => s.len() + 2,
+        Atom::Str(s) => s.len() + 10,
+        Atom::Num(_) => 32,
+        Atom::Expr(items) => 2 + items.iter().map(approx_size).sum::<usize>(),
+        Atom::Closure(_) => 128,
+    }
+}
+
+fn approx_pattern_size(p: &Pattern) -> usize {
+    match p {
+        Pattern::Any | Pattern::Var(_) => 2,
+        Pattern::Exact(a) => approx_size(a),
+        Pattern::Expr(ps) => 2 + ps.iter().map(approx_pattern_size).sum::<usize>(),
+    }
+}
+
+fn encode_atom_inner(
+    atom: &Atom,
+    pdp: &mut mork::space::ParDataParser,
+    ez: &mut mork_expr::ExprZipper,
+    vars: &mut Vec<String>,
+) -> Result<(), String> {
+    match atom {
+        Atom::Sym(s) => {
+            if s.starts_with('$') {
+                if let Some(pos) = vars.iter().position(|v| v == s.as_ref()) {
+                    ez.write_var_ref(pos as u8);
+                    unsafe {
+                        ez.loc += mork_expr::var_ref_byte_count_at(ez.root.ptr.byte_add(ez.loc));
+                    }
+                } else {
+                    vars.push(s.to_string());
+                    ez.write_new_var();
+                    ez.loc += 1;
+                }
+            } else {
+                let token = pdp.tokenizer(s.as_bytes());
+                ez.write_symbol(token);
+                ez.loc += token.len() + 1;
+            }
+        }
+        Atom::Str(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            let quoted = format!("\"{}\"", escaped);
+            let token = pdp.tokenizer(quoted.as_bytes());
+            ez.write_symbol(token);
+            ez.loc += token.len() + 1;
+        }
+        Atom::Num(n) => {
+            let n_str = n.to_string();
+            let token = pdp.tokenizer(n_str.as_bytes());
+            ez.write_symbol(token);
+            ez.loc += token.len() + 1;
+        }
+        Atom::Expr(items) => {
+            let arity = items.len() as u64;
+            ez.write_arity(arity);
+            unsafe {
+                ez.loc += mork_expr::arity_byte_count_at(ez.root.ptr.byte_add(ez.loc));
+            }
+            for item in items.iter() {
+                encode_atom_inner(item, pdp, ez, vars)?;
+            }
+        }
+        Atom::Closure(_) => {
+            return Err("Cannot encode Closure in space".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn encode_pattern_inner(
+    p: &Pattern,
+    pdp: &mut mork::space::ParDataParser,
+    ez: &mut mork_expr::ExprZipper,
+    vars: &mut Vec<String>,
+) -> Result<(), String> {
+    match p {
+        Pattern::Any | Pattern::Var(_) => {
+            ez.write_new_var();
+            ez.loc += 1;
+        }
+        Pattern::Exact(atom) => {
+            encode_atom_inner(atom, pdp, ez, vars)?;
+        }
+        Pattern::Expr(ps) => {
+            let arity = ps.len() as u64;
+            ez.write_arity(arity);
+            unsafe {
+                ez.loc += mork_expr::arity_byte_count_at(ez.root.ptr.byte_add(ez.loc));
+            }
+            for item in ps.iter() {
+                encode_pattern_inner(item, pdp, ez, vars)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Space for MorkSpace {
     fn add_atom(&self, atom: &Atom) -> Result<(), String> {
-        let sexpr = atom.to_sexpr_string();
+        //  write directly to the trie bytes instead of formatting to an sexpr string first
         MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             let mut inner = self.inner.write().unwrap();
-            let len = Self::encode_into(&mut buf, &mut inner, &sexpr)?;
+            let len = Self::encode_atom_direct(atom, &mut inner, &mut buf)?;
             inner.btm.insert(&buf[..len], Default::default());
             Ok(())
         })
     }
 
     fn remove_atom(&self, atom: &Atom) -> Result<bool, String> {
-        let sexpr = atom.to_sexpr_string();
+        //  write directly to the trie bytes instead of formatting to an sexpr string first
         MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             let mut inner = self.inner.write().unwrap();
-            let len = Self::encode_into(&mut buf, &mut inner, &sexpr)?;
+            let len = Self::encode_atom_direct(atom, &mut inner, &mut buf)?;
             Ok(inner.btm.remove(&buf[..len]).is_some())
         })
     }
 
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
         if let Some(atom) = pattern.as_ground_atom() {
-            let sexpr = atom.to_sexpr_string();
             // Phase 1: encode (write lock, parse_sexpr needs &mut Space).
             let encoded: Vec<u8> = MORK_SPACE_ENCODE_BUF.with(|cell| {
                 let mut buf = cell.borrow_mut();
                 let mut inner = self.inner.write().unwrap();
-                match Self::encode_into(&mut buf, &mut inner, &sexpr) {
+                match Self::encode_atom_direct(&atom, &mut inner, &mut buf) {
                     Ok(len) => buf[..len].to_vec(),
                     Err(_) => vec![],
                 }
@@ -156,17 +276,17 @@ impl Space for MorkSpace {
             };
         }
 
-        let query_sexpr = pattern_to_query_sexpr(pattern);
         // Phase 1: encode prefix (write lock, short duration).
         let prefix_bytes: Vec<u8> = MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
-            let cap = query_sexpr.len() * 8 + 64;
-            if cap > buf.len() { buf.resize(cap, 0); }
             let mut inner = self.inner.write().unwrap();
-            match inner.parse_sexpr(query_sexpr.as_bytes(), buf.as_mut_ptr()) {
-                Ok((e, _len)) => match e.prefix() {
-                    Ok(p) | Err(p) => unsafe { &*p }.to_vec(),
-                },
+            match Self::encode_pattern_direct(pattern, &mut inner, &mut buf) {
+                Ok(len) => {
+                    let e = mork_expr::Expr { ptr: buf.as_mut_ptr() };
+                    match e.prefix() {
+                        Ok(p) | Err(p) => unsafe { &*p }.to_vec(),
+                    }
+                }
                 Err(_) => vec![],
             }
         });
