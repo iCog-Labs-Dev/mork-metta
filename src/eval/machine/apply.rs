@@ -4,7 +4,7 @@
 //! next machine actions required to continue evaluation.
 
 use super::budget::{atoms_of, plain, ResultSet};
-use super::frame::Frame;
+use super::frame::{Frame, ForwardCont};
 use super::state::Transition;
 use super::task::Task;
 use crate::atom::Atom;
@@ -143,6 +143,34 @@ pub(crate) fn apply_frame(
     vals: &mut Vec<ResultSet>,
 ) -> Result<(), String> {
     match frame {
+        Frame::Forward(c) => {
+            let mut rs = pop_n(vals, 1).pop().unwrap();
+            if let Some(had_bindings) = c.force_had_bindings {
+                let mut out = Vec::new();
+                out.extend(atoms_of(&rs));
+                rs = match out.len() {
+                    0 => Vec::new(),
+                    1 => plain(out),
+                    _ if had_bindings => plain(vec![Atom::Expr(crate::atom::expr_data(out))]),
+                    _ => plain(out),
+                };
+            }
+            if !c.prepend_env.is_empty_env() {
+                rs = rs
+                    .into_iter()
+                    .map(|(atom, result_env)| {
+                        let merged = crate::eval::shared::pattern::prepend_env(c.prepend_env.clone(), &result_env);
+                        (atom, merged)
+                    })
+                    .collect();
+            }
+            vals.push(rs);
+            Ok(())
+        }
+        Frame::Discard => {
+            pop_n(vals, 1);
+            Ok(())
+        }
         Frame::Gather { n } => {
             let mut out = Vec::new();
             for result_set in pop_n(vals, n) {
@@ -429,10 +457,7 @@ pub(crate) fn apply_frame(
         }
         Frame::Println => {
             let result = pop_n(vals, 1).pop().unwrap();
-            for (atom, _) in &result {
-                eprintln!("{}", atom.to_sexpr_string());
-            }
-            vals.push(result);
+            vals.push(crate::eval::io::finish_println(result));
             Ok(())
         }
         Frame::ImportFile { path, env } => {
@@ -659,10 +684,7 @@ pub(crate) fn apply_frame(
                         });
                     }
                     Branch::Final { env } => {
-                        work.push(Task::Eval {
-                            expr: Arc::clone(&body),
-                            env,
-                        });
+                        push_tail_eval(work, Arc::clone(&body), env);
                     }
                 }
             }
@@ -806,21 +828,7 @@ pub(crate) fn apply_frame(
                     env: next_env,
                 });
             } else {
-                // Tail call: Gather{1} between MergeEnv and the deeper continuation
-                // is a no-op (pop 1 ResultSet, re-emit unchanged). Remove it to save
-                // one frame allocation per tail step — halves stack depth for linear
-                // tail-recursive chain programs like iterative div/fib.
-                let n = work.len();
-                if n >= 2
-                    && matches!(work[n - 1], Task::Apply(Frame::MergeEnv { .. }))
-                    && matches!(work[n - 2], Task::Apply(Frame::Gather { n: 1 }))
-                {
-                    work.remove(n - 2);
-                }
-                work.push(Task::Eval {
-                    expr: Arc::new(args[args.len() - 1].clone()),
-                    env: next_env,
-                });
+                push_tail_eval(work, Arc::new(args[args.len() - 1].clone()), next_env);
             }
             Ok(())
         }
@@ -1198,22 +1206,76 @@ pub(crate) fn apply_frame(
                     if let Some(key) = memo_key {
                         work.push(Task::Apply(Frame::MemoStore { key }));
                     }
-                    work.push(Task::Apply(Frame::Gather { n: bodies.len() }));
-                    for (body, body_env, subst_cost) in bodies.into_iter().rev() {
-                        work.push(Task::Apply(Frame::MergeEnv { env: body_env.clone() }));
-                        work.push(Task::Eval {
-                            expr: body.clone(),
-                            env: body_env,
-                        });
-                        // debit query and substitution cost prior to body evaluation
+                    if bodies.len() == 1 {
+                        let (body, body_env, subst_cost) = bodies.into_iter().next().unwrap();
                         let body_cost = crate::eval::machine::budget::calculate_expr_cost(&body);
+                        work.push(Task::Apply(Frame::MergeEnv { env: body_env.clone() }));
+                        push_tail_eval(work, body, body_env);
                         work.push(Task::Transition(Transition::Query {
                             cost: subst_cost + body_cost,
                         }));
+                    } else {
+                        work.push(Task::Apply(Frame::Gather { n: bodies.len() }));
+                        for (body, body_env, subst_cost) in bodies.into_iter().rev() {
+                            work.push(Task::Apply(Frame::MergeEnv { env: body_env.clone() }));
+                            work.push(Task::Eval {
+                                expr: body.clone(),
+                                env: body_env,
+                            });
+                            // debit query and substitution cost prior to body evaluation
+                            let body_cost = crate::eval::machine::budget::calculate_expr_cost(&body);
+                            work.push(Task::Transition(Transition::Query {
+                                cost: subst_cost + body_cost,
+                            }));
+                        }
                     }
                     Ok(())
                 }
             }
         }
     }
+}
+
+/// Compose and push a tail-evaluation step.
+///
+/// Fuses linear single-result continuation frames on the stack to achieve O(1) space.
+pub(crate) fn push_tail_eval(work: &mut Vec<Task>, expr: Arc<Expr>, env: Env) {
+    let mut acc = ForwardCont {
+        prepend_env: Env::new(),
+        force_had_bindings: None,
+    };
+
+    while let Some(Task::Apply(frame)) = work.last() {
+        match frame {
+            Frame::Gather { n: 1 } => {
+                work.pop();
+            }
+            Frame::MergeEnv { env } => {
+                acc.prepend_env = crate::eval::shared::env::prepend_chain(env.clone(), &acc.prepend_env);
+                work.pop();
+            }
+            Frame::IfGather { had_bindings, n: 1 } => {
+                let had_bindings = *had_bindings;
+                acc.prepend_env = Env::new();
+                acc.force_had_bindings = Some(had_bindings);
+                work.pop();
+            }
+            Frame::Forward(inner) => {
+                let inner = inner.clone();
+                if let Some(had_bindings) = inner.force_had_bindings {
+                    acc.force_had_bindings = Some(had_bindings);
+                    acc.prepend_env = Env::new();
+                }
+                acc.prepend_env = crate::eval::shared::env::prepend_chain(inner.prepend_env, &acc.prepend_env);
+                work.pop();
+            }
+            _ => break,
+        }
+    }
+
+    if !acc.prepend_env.is_empty_env() || acc.force_had_bindings.is_some() {
+        // ponytail: avoid Frame::Forward if it resolves to identity (empty env and no force)
+        work.push(Task::Apply(Frame::Forward(acc)));
+    }
+    work.push(Task::Eval { expr, env });
 }

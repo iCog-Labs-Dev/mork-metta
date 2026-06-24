@@ -45,8 +45,20 @@ pub(crate) fn run_rs(
     work.push(super::task::Task::Eval { expr: root, env: root_env });
     let mut vals: Vec<ResultSet> = Vec::with_capacity(32);
 
+    // Debug: set MORK_DEBUG_STACK=1 to log a work-stack histogram as it grows.
+    static DEBUG_STACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let debug_stack = *DEBUG_STACK.get_or_init(|| std::env::var_os("MORK_DEBUG_STACK").is_some());
+    let mut next_log = 250_000usize;
+
     while let Some(task) = work.pop() {
+        if debug_stack && work.len() >= next_log {
+            eprintln!("[stack] work={} vals={} | {}", work.len(), vals.len(), stack_histogram(&work));
+            next_log += 250_000;
+        }
         if work.len() + vals.len() > 2_000_000 {
+            if debug_stack {
+                eprintln!("[stack] OVERFLOW histogram: {}", stack_histogram(&work));
+            }
             return Err(format!(
                 "evaluation stack overflow: {} pending tasks, {} result sets — \
                  possible infinite recursion (hint: use direct tail recursion \
@@ -73,4 +85,39 @@ pub(crate) fn run_rs(
     }
 
     Ok(vals.pop().unwrap_or_default())
+}
+
+/// Debug helper: tally the kinds of pending tasks on the work stack. Used to
+/// diagnose unbounded growth (e.g. missing tail-call optimization).
+fn stack_histogram(work: &[super::task::Task]) -> String {
+    use super::frame::Frame;
+    use super::task::Task;
+    let mut counts: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+    for t in work {
+        let key = match t {
+            Task::Eval { .. } => "Eval",
+            Task::Transition(_) => "Transition",
+            Task::Apply(f) => match f {
+                Frame::Call { .. } => "Call",
+                Frame::Gather { .. } => "Gather",
+                Frame::MergeEnv { .. } => "MergeEnv",
+                Frame::IfGather { .. } => "IfGather",
+                Frame::LetStarBind { .. } => "LetStarBind",
+                Frame::LetMatch { .. } => "LetMatch",
+                Frame::ChainBind { .. } => "ChainBind",
+                Frame::Progn { .. } => "Progn",
+                Frame::Prog1 { .. } => "Prog1",
+                Frame::Discard => "Discard",
+                Frame::Forward(_) => "Forward",
+                Frame::DataList { .. } | Frame::DataListWithHead { .. } => "DataList",
+                _ => "OtherFrame",
+            },
+        };
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    counts
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }

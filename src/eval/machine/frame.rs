@@ -220,4 +220,18 @@ pub(crate) enum Frame {
     SpaceMatchStream {
         remaining: Vec<(Arc<crate::parser::Expr>, Env)>,
     },
+    /// A fused continuation representing a chain of linear single-result forwarders.
+    Forward(ForwardCont),
+    /// Discard the top result set from the value stack.
+    Discard,
 }
+
+// ponytail: keep ForwardCont simple: only fuse Gather{1}, IfGather{1}, and MergeEnv.
+// This is the minimum that works for O(1) tail recursion without extra allocations.
+/// A compressed chain of linear single-result forwarders.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ForwardCont {
+    pub prepend_env: Env,
+    pub force_had_bindings: Option<bool>,
+}
+

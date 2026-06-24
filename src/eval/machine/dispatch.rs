@@ -90,9 +90,15 @@ pub(crate) fn dispatch_if(args: &[Expr], env: &Env, funcs: &FnTable, work: &mut 
             branches.push((Arc::new(else_expr.clone()), env.clone()));
         }
     }
-    work.push(Task::Apply(Frame::IfGather { had_bindings, n: branches.len() }));
-    for (branch, branch_env) in branches.into_iter().rev() {
-        work.push(Task::Eval { expr: branch, env: branch_env });
+    if branches.len() == 1 {
+        let (branch, branch_env) = branches.into_iter().next().unwrap();
+        work.push(Task::Apply(Frame::IfGather { had_bindings, n: 1 }));
+        super::apply::push_tail_eval(work, branch, branch_env);
+    } else {
+        work.push(Task::Apply(Frame::IfGather { had_bindings, n: branches.len() }));
+        for (branch, branch_env) in branches.into_iter().rev() {
+            work.push(Task::Eval { expr: branch, env: branch_env });
+        }
     }
     Ok(())
 }
@@ -583,13 +589,18 @@ pub(crate) fn dispatch_expr(
                         if args.len() < 1 {
                             return Err("progn: expected at least one form".into());
                         }
-                        // Evaluate all args sequentially, return last result
-                        work.push(Task::Apply(Frame::Progn { n: args.len() }));
-                        for arg in args.iter().rev() {
-                            work.push(Task::Eval {
-                                expr: Arc::new(arg.clone()),
-                                env: env.clone(),
-                            });
+                        if args.len() == 1 {
+                            super::apply::push_tail_eval(work, Arc::new(args[0].clone()), env.clone());
+                        } else {
+                            // ponytail: tail-recursive evaluation of progn using Discard frames
+                            super::apply::push_tail_eval(work, Arc::new(args[args.len() - 1].clone()), env.clone());
+                            for arg in args[..args.len() - 1].iter().rev() {
+                                work.push(Task::Apply(Frame::Discard));
+                                work.push(Task::Eval {
+                                    expr: Arc::new(arg.clone()),
+                                    env: env.clone(),
+                                });
+                            }
                         }
                         return Ok(());
                     }
@@ -597,11 +608,19 @@ pub(crate) fn dispatch_expr(
                         if args.len() < 1 {
                             return Err("prog1: expected at least one form".into());
                         }
-                        // Evaluate all args sequentially, return first result
-                        work.push(Task::Apply(Frame::Prog1 { n: args.len() }));
-                        for arg in args.iter().rev() {
+                        if args.len() == 1 {
+                            super::apply::push_tail_eval(work, Arc::new(args[0].clone()), env.clone());
+                        } else {
+                            // ponytail: tail-recursive evaluation of prog1 using Discard frames
+                            for arg in args[1..].iter().rev() {
+                                work.push(Task::Apply(Frame::Discard));
+                                work.push(Task::Eval {
+                                    expr: Arc::new(arg.clone()),
+                                    env: env.clone(),
+                                });
+                            }
                             work.push(Task::Eval {
-                                expr: Arc::new(arg.clone()),
+                                expr: Arc::new(args[0].clone()),
                                 env: env.clone(),
                             });
                         }

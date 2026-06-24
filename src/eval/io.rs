@@ -10,6 +10,7 @@
 /// data files are safe.
 use crate::atom::Atom;
 use crate::env::Env;
+use crate::eval::machine::budget::{plain, ResultSet};
 use crate::eval::runtime::eval_scope;
 use crate::func::{FnTable, NDet};
 use crate::parser::{Expr, TopForm, parse_forms};
@@ -409,23 +410,10 @@ pub(crate) fn eval_readln(_args: &[Expr], _env: &Env, _funcs: &FnTable) -> Resul
     }
 }
 
-/// Evaluate `(println! args...)` — print values to stdout (for debugging).
-/// Each arg is evaluated and its results printed space-separated.
-/// If a single arg is a non-empty list, its elements are printed space-separated.
-pub(crate) fn eval_println(args: &[Expr], env: &Env, funcs: &FnTable) -> Result<NDet, String> {
-    let mut parts = Vec::new();
-    for arg in args {
-        let mut results = eval_scope(arg, env, funcs)?;
-        let val = results
-            .next()
-            .ok_or_else(|| format!("println!: argument produced no results: {:?}", arg))?;
-        if let Atom::Expr(items) = &val {
-            let s: Vec<String> = items.iter().map(|a| a.to_sexpr_string()).collect();
-            parts.push(s.join(" "));
-        } else {
-            parts.push(val.to_sexpr_string());
-        }
+/// Evaluate `println!` after its arguments have already been reduced by the machine.
+pub(crate) fn finish_println(result: ResultSet) -> ResultSet {
+    for (atom, _) in &result {
+        eprintln!("{}", atom.to_sexpr_string());
     }
-    println!("{}", parts.join(" "));
-    Ok(NDet::single(Atom::sym("true")))
+    plain(vec![Atom::sym("true")])
 }
