@@ -550,20 +550,102 @@ pub fn register_collection_builtins(funcs: &FnTable) {
 
     funcs.insert_native("filter-atom", 2, |args, table| {
         expect(args, 2, "filter-atom")?;
-        let items: Vec<Atom> = match &args[1] { Atom::Expr(v) => v.to_vec(), other => vec![other.clone()] };
-        let fname = match &args[0] {
-            Atom::Sym(s) => s.clone(),
-            _ => return Err("filter-atom: first arg must be a symbol (function name)".into()),
+        // ponytail: filter-atom takes (list func) order, mirroring map-atom
+        let items: Vec<Atom> = match &args[0] {
+            Atom::Expr(v) => v.to_vec(),
+            other => vec![other.clone()],
         };
+        let func_atom = &args[1];
         let mut results = Vec::with_capacity(items.len());
-        for item in &items {
-            let func_ref = table.get(&fname, 1)
-                .ok_or_else(|| format!("filter-atom: function {} with arity 1 not found", fname))?;
-            let func_ptr = match &func_ref.kind { FunctionKind::Native { func } => func.clone() };
-            drop(func_ref);
-            let mut result = func_ptr(&[item.clone()], table)?;
-            if let Some(val) = result.next() {
-                if val == Atom::sym("True") { results.push(item.clone()); }
+        match func_atom {
+            Atom::Sym(fname) => {
+                if let Some(function) = table.get(fname, 1) {
+                    if let crate::func::FunctionKind::Native { func } = &function.kind {
+                        for item in &items {
+                            let mut result = func(&[item.clone()], table)?;
+                            if let Some(val) = result.next() {
+                                if val.is_truthy() {
+                                    results.push(item.clone());
+                                }
+                            }
+                        }
+                        return Ok(NDet::single(Atom::Expr(crate::atom::expr_data(results))));
+                    }
+                }
+                // Fallback for user-defined functions
+                let fn_expr = crate::parser::atom_to_expr(&Atom::Sym(fname.clone()))
+                    .unwrap_or(crate::parser::Expr::Symbol(fname.to_string()));
+                for item in &items {
+                    let item_expr = crate::parser::atom_to_expr(item)
+                        .unwrap_or(crate::parser::Expr::Symbol(item.to_sexpr_string()));
+                    let call = crate::parser::Expr::List(std::sync::Arc::from([fn_expr.clone(), item_expr]));
+                    let body_rs = crate::eval::machine::step::run_rs(
+                        std::sync::Arc::new(call),
+                        crate::env::Env::new(),
+                        table,
+                        &mut None,
+                    )?;
+                    if let Some((val, _)) = body_rs.into_iter().next() {
+                        if val.is_truthy() {
+                            results.push(item.clone());
+                        }
+                    }
+                }
+            }
+            Atom::Expr(parts) if parts.len() == 3 && parts[0] == Atom::sym("partial") => {
+                if let Atom::Sym(fn_name) = &parts[1] {
+                    let old_args: Vec<Atom> = match &parts[2] {
+                        Atom::Expr(v) => v.to_vec(),
+                        other => vec![other.clone()],
+                    };
+                    let fn_expr = crate::parser::atom_to_expr(&Atom::Sym(fn_name.clone()))
+                        .unwrap_or(crate::parser::Expr::Symbol(fn_name.to_string()));
+                    let mut old_arg_exprs: Vec<crate::parser::Expr> = old_args.iter()
+                        .map(|a| crate::parser::atom_to_expr(a)
+                            .unwrap_or(crate::parser::Expr::Symbol(a.to_sexpr_string())))
+                        .collect();
+                    for item in &items {
+                        let item_expr = crate::parser::atom_to_expr(item)
+                            .unwrap_or(crate::parser::Expr::Symbol(item.to_sexpr_string()));
+                        let mut call_items = vec![fn_expr.clone()];
+                        call_items.extend(old_arg_exprs.clone());
+                        call_items.push(item_expr);
+                        let call = crate::parser::Expr::List(call_items.into());
+                        let body_rs = crate::eval::machine::step::run_rs(
+                            std::sync::Arc::new(call),
+                            crate::env::Env::new(),
+                            table,
+                            &mut None,
+                        )?;
+                        if let Some((val, _)) = body_rs.into_iter().next() {
+                            if val.is_truthy() {
+                                    results.push(item.clone());
+                            }
+                        }
+                    }
+                } else {
+                    return Err("filter-atom: partial function name must be a symbol".into());
+                }
+            }
+            _ => {
+                let func_expr = crate::parser::atom_to_expr(func_atom)
+                    .unwrap_or(crate::parser::Expr::Symbol(func_atom.to_sexpr_string()));
+                for item in &items {
+                    let item_expr = crate::parser::atom_to_expr(item)
+                        .unwrap_or(crate::parser::Expr::Symbol(item.to_sexpr_string()));
+                    let call = crate::parser::Expr::List(std::sync::Arc::from([func_expr.clone(), item_expr]));
+                    let body_rs = crate::eval::machine::step::run_rs(
+                        std::sync::Arc::new(call),
+                        crate::env::Env::new(),
+                        table,
+                        &mut None,
+                    )?;
+                    if let Some((val, _)) = body_rs.into_iter().next() {
+                        if val.is_truthy() {
+                            results.push(item.clone());
+                        }
+                    }
+                }
             }
         }
         Ok(NDet::single(Atom::Expr(crate::atom::expr_data(results))))

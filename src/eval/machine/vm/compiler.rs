@@ -314,8 +314,66 @@ impl VMCompiler {
                             });
                             return Ok(());
                         }
+                        "map-atom" if items.len() == 4 => {
+                            // ponytail: map-atom Form 2 (with variable name and body expression)
+                            self.compile(&items[1], code, false)?;
+                            let var_name = match &items[2] {
+                                Expr::Symbol(s) => s.clone(),
+                                _ => return Err("map-atom: expected variable symbol".into()),
+                            };
+                            let mut body_comp = VMCompiler {
+                                locals: self.locals.clone(),
+                                free_vars: self.free_vars.clone(),
+                                fn_name: self.fn_name.clone(),
+                                arity: self.arity,
+                            };
+                            body_comp.locals.push(var_name.clone());
+                            let mut body_code = Vec::new();
+                            body_comp.compile(&items[3], &mut body_code, false)?;
+
+                            for v in &body_comp.free_vars {
+                                if !self.free_vars.contains(v) {
+                                    self.free_vars.push(v.clone());
+                                }
+                            }
+                            code.push(Opcode::MapAtomLambda {
+                                var_name,
+                                body_code,
+                                free_vars_map: body_comp.free_vars,
+                            });
+                            return Ok(());
+                        }
+                        "filter-atom" if items.len() == 4 => {
+                            // ponytail: filter-atom Form 2 (with variable name and condition expression)
+                            self.compile(&items[1], code, false)?;
+                            let var_name = match &items[2] {
+                                Expr::Symbol(s) => s.clone(),
+                                _ => return Err("filter-atom: expected variable symbol".into()),
+                            };
+                            let mut body_comp = VMCompiler {
+                                locals: self.locals.clone(),
+                                free_vars: self.free_vars.clone(),
+                                fn_name: self.fn_name.clone(),
+                                arity: self.arity,
+                            };
+                            body_comp.locals.push(var_name.clone());
+                            let mut body_code = Vec::new();
+                            body_comp.compile(&items[3], &mut body_code, false)?;
+
+                            for v in &body_comp.free_vars {
+                                if !self.free_vars.contains(v) {
+                                    self.free_vars.push(v.clone());
+                                }
+                            }
+                            code.push(Opcode::FilterAtomLambda {
+                                var_name,
+                                body_code,
+                                free_vars_map: body_comp.free_vars,
+                            });
+                            return Ok(());
+                        }
                         // For any other special keyword/construct (e.g. once, etc.), fallback to EvalCEK
-                        "|->" | "map-atom" | "filter-atom" | "within" | "once" | "progn" | "prog1" | "chain" | "add-atom" | "remove-atom" => {
+                        "|->" | "within" | "once" | "progn" | "prog1" | "chain" | "add-atom" | "remove-atom" => {
                             code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
                             return Ok(());
                         }

@@ -64,4 +64,14 @@ pub enum Opcode {
         body_code: Vec<Opcode>,
         free_vars_map: Vec<String>,
     },
+    MapAtomLambda {
+        var_name: String,
+        body_code: Vec<Opcode>,
+        free_vars_map: Vec<String>,
+    },
+    FilterAtomLambda {
+        var_name: String,
+        body_code: Vec<Opcode>,
+        free_vars_map: Vec<String>,
+    },
 }

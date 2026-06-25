@@ -466,7 +466,8 @@ pub fn run_vm(
                                 sub_state.locals.push((bound, Env::new()));
                             }
                             
-                            let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &match_env)?;
+                            let sub_env = crate::eval::shared::env::bind_all(&match_env, &matched.bindings);
+                            let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &sub_env)?;
                             state.budget = sub_budget;
                             results.extend(res);
                             if cut_executed {
@@ -876,6 +877,91 @@ pub fn run_vm(
                     }
                 }
                 state.stack.push(plain(vec![current_acc]));
+                state.ip += 1;
+            }
+            Opcode::MapAtomLambda {
+                var_name,
+                body_code,
+                free_vars_map,
+            } => {
+                // ponytail: MapAtomLambda maps list elements using a precompiled lambda body code for high performance
+                let list_rs = state.stack.pop().ok_or("VM stack underflow on MapAtomLambda")?;
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                    Some(Atom::Expr(v)) => v.to_vec(),
+                    Some(other) => vec![other],
+                    None => return Err("map-atom: list arg produced no result".to_string()),
+                };
+
+                let mut mapped_results = Vec::with_capacity(items.len());
+                for elem in items {
+                    let mut sub_state = VMState::new_with_parent(
+                        body_code.clone(),
+                        free_vars_map.clone(),
+                        state.budget,
+                        &state.free_vars_map,
+                        &state.free_vars_bindings,
+                    );
+                    for val in &state.locals {
+                        sub_state.locals.push(val.clone());
+                    }
+                    sub_state.locals.push((elem.clone(), Env::new()));
+                    
+                    let sub_env = base_env.extend(&var_name, elem.clone());
+                    let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &sub_env)?;
+                    state.budget = sub_budget;
+                    
+                    if let Some((val, _)) = res.into_iter().next() {
+                        mapped_results.push(val);
+                    }
+                    if cut_executed {
+                        state.cut_executed = true;
+                        break;
+                    }
+                }
+                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(mapped_results))]));
+                state.ip += 1;
+            }
+            Opcode::FilterAtomLambda {
+                var_name,
+                body_code,
+                free_vars_map,
+            } => {
+                // ponytail: FilterAtomLambda filters list elements using a precompiled lambda condition code for high performance
+                let list_rs = state.stack.pop().ok_or("VM stack underflow on FilterAtomLambda")?;
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                    Some(Atom::Expr(v)) => v.to_vec(),
+                    Some(other) => vec![other],
+                    None => return Err("filter-atom: list arg produced no result".to_string()),
+                };
+
+                let mut filtered_results = Vec::with_capacity(items.len());
+                for elem in items {
+                    let mut sub_state = VMState::new_with_parent(
+                        body_code.clone(),
+                        free_vars_map.clone(),
+                        state.budget,
+                        &state.free_vars_map,
+                        &state.free_vars_bindings,
+                    );
+                    for val in &state.locals {
+                        sub_state.locals.push(val.clone());
+                    }
+                    sub_state.locals.push((elem.clone(), Env::new()));
+                    
+                    let sub_env = base_env.extend(&var_name, elem.clone());
+                    let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &sub_env)?;
+                    state.budget = sub_budget;
+                    
+                    let is_true = res.into_iter().next().map(|(a, _)| a.is_truthy()).unwrap_or(false);
+                    if is_true {
+                        filtered_results.push(elem);
+                    }
+                    if cut_executed {
+                        state.cut_executed = true;
+                        break;
+                    }
+                }
+                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(filtered_results))]));
                 state.ip += 1;
             }
         }
