@@ -98,7 +98,6 @@ pub fn collect_match_results(
 
                 let results: Vec<Vec<(Arc<str>, Arc<Atom>)>> = if !remaining.is_empty()
                     && initial_bindings.len() > 1
-                    && initial_bindings.len() < 1000
                 {
                     initial_bindings
                         .par_iter()
