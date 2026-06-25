@@ -2,14 +2,77 @@ use crate::atom::Atom;
 use crate::env::Env;
 use crate::eval::shared::fresh;
 use crate::eval::machine::budget::{ResultSet, plain};
-use super::op::Opcode;
+use super::op::{Opcode, CaseBranch};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::parser::Expr;
+
+#[derive(Clone)]
+pub struct PendingCall {
+    pub body_code: Arc<[Opcode]>,
+    pub free_vars: Vec<String>,
+    pub body_env: Env,
+    pub locals_to_push: Vec<(Atom, Env)>,
+    pub cost: i64,
+}
+
+/// ponytail: Loop and execution state for frame-based control flow.
+pub enum CallFrameKind {
+    Normal,
+    Let {
+        value_rs: Vec<(Atom, Env)>,
+        next_idx: usize,
+        pattern: Expr,
+        pattern_vars: Vec<String>,
+        free_vars_map: Vec<String>,
+        body_code: Arc<[Opcode]>,
+        results: ResultSet,
+    },
+    If {
+        condition_rs: Vec<(Atom, Env)>,
+        next_idx: usize,
+        then_code: Arc<[Opcode]>,
+        else_code: Arc<[Opcode]>,
+        free_vars_map: Vec<String>,
+        had_nondet_truthy: bool,
+        truthy_count: usize,
+        results: ResultSet,
+    },
+    Case {
+        scrutinee_rs: Vec<(Atom, Env)>,
+        next_idx: usize,
+        branches: Vec<CaseBranch>,
+        results: ResultSet,
+    },
+    Call {
+        name: String,
+        arity: u8,
+        pending_calls: Vec<PendingCall>,
+        next_idx: usize,
+        results: ResultSet,
+    },
+    Eval {
+        target_rs: Vec<(Expr, Env)>,
+        next_idx: usize,
+        results: ResultSet,
+    },
+}
+
+/// ponytail: Frame-based return state for flat control flow.
+/// When Let/If execute their body inline (same VMState), a CallFrame
+/// saves the parent's code, ip, env, and free-var context so we can
+/// restore after the body completes. This avoids C-stack recursion
+/// for structural nesting (let*/if chains inside function bodies).
 pub struct CallFrame {
     pub return_ip: usize,
-    pub locals_start: usize,
-    pub locals_count: usize,
+    pub return_code: Arc<[Opcode]>,
+    pub locals_to_pop: usize,
+    pub saved_base_env: Env,
+    pub saved_locals: Vec<(Atom, Env)>,  // parent's locals for Call frames
+    pub saved_free_vars_map: Vec<String>,
+    pub saved_free_vars_bindings: Vec<Atom>,
+    pub kind: CallFrameKind,
 }
 
 pub struct VMState {
@@ -90,7 +153,7 @@ impl VMState {
     }
 }
 
-static FRESH_COUNTER: AtomicU64 = AtomicU64::new(100000);
-fn next_fresh_id() -> u64 {
+pub static FRESH_COUNTER: AtomicU64 = AtomicU64::new(100000);
+pub fn next_fresh_id() -> u64 {
     FRESH_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
