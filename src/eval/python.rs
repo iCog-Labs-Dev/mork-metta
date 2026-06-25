@@ -27,10 +27,10 @@ pub(crate) fn eval_py_call(
         use pyo3::types::PyAnyMethods;
         Python::with_gil(|py| {
             let py_obj = expr_to_py(&args[0], env, _funcs, py)?;
-            let result = py_obj
-                .call0()
-                .map_err(|e| format!("py-call: {}", e))?;
-            Ok(crate::func::NDet::single(atom_from_py(&result)))
+            // expr_to_py already evaluates function calls for list expressions
+            // (e.g. ("round" 3.14 2) → round(3.14, 2) → returns float result).
+            // For bare symbols, it resolves to the Python object directly.
+            Ok(crate::func::NDet::single(atom_from_py(&py_obj)))
         })
     }
     #[cfg(not(feature = "python-bridge"))]
@@ -163,11 +163,13 @@ fn atom_from_py(obj: &pyo3::Bound<'_, pyo3::types::PyAny>) -> Atom {
         return Atom::num(i);
     }
 
-    // Float → decimal
+    // Float → decimal, or symbol for special values (NaN, inf)
     if let Ok(f) = obj.extract::<f64>() {
         if let Ok(a) = Atom::decimal(&f.to_string()) {
             return a;
         }
+        // ponytail: NaN/inf can't be represented as dashu Decimal → store as symbol
+        return Atom::sym(&f.to_string());
     }
 
     // String
@@ -265,9 +267,17 @@ fn atom_to_py<'py>(
     use pyo3::prelude::*;
     match atom {
         Atom::Sym(s) | Atom::Str(s) => {
-            let ps: pyo3::Bound<'_, pyo3::types::PyString> =
-                pyo3::types::PyString::new(py, s);
-            Ok(ps.into_any())
+            // Try numeric parse first — MeTTa arithmetic produces Sym("NaN"),
+            // Sym("inf"), and numeric-looking symbols for special float values.
+            if let Ok(val) = s.parse::<i64>() {
+                Ok(val.into_py(py).into_bound(py))
+            } else if let Ok(val) = s.parse::<f64>() {
+                Ok(val.into_py(py).into_bound(py))
+            } else {
+                let ps: pyo3::Bound<'_, pyo3::types::PyString> =
+                    pyo3::types::PyString::new(py, s);
+                Ok(ps.into_any())
+            }
         }
         Atom::Num(n) => match n {
             crate::atom::Numeric::Int(i) => {
