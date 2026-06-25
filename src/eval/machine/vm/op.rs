@@ -74,4 +74,19 @@ pub enum Opcode {
         body_code: Vec<Opcode>,
         free_vars_map: Vec<String>,
     },
+    /// Wraps all results from body_code into (within result1 result2 ...).
+    Within {
+        body_code: Vec<Opcode>,
+        free_vars_map: Vec<String>,
+    },
+    /// Pops mutex-name result from stack, runs body_code under that named mutex.
+    WithMutex {
+        body_code: Vec<Opcode>,
+        free_vars_map: Vec<String>,
+    },
+    /// Snapshots space state, runs body_code; restores on empty result or error.
+    Transaction {
+        body_code: Vec<Opcode>,
+        free_vars_map: Vec<String>,
+    },
 }

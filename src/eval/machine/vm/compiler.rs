@@ -394,7 +394,65 @@ impl VMCompiler {
                             return Ok(());
                         }
                         // For any other special keyword/construct (e.g. once, etc.), fallback to EvalCEK
-                        "|->" | "within" | "once" | "progn" | "prog1" | "chain" | "add-atom" | "remove-atom" => {
+                        "within" if items.len() == 2 => {
+                            // ponytail: evaluate arg, wrap all results into (within ...)
+                            let mut body_comp = VMCompiler {
+                                locals: self.locals.clone(),
+                                free_vars: self.free_vars.clone(),
+                                fn_name: self.fn_name.clone(),
+                                arity: self.arity,
+                            };
+                            let mut body_code = Vec::new();
+                            body_comp.compile(&items[1], &mut body_code, false)?;
+                            for v in &body_comp.free_vars {
+                                if !self.free_vars.contains(v) { self.free_vars.push(v.clone()); }
+                            }
+                            code.push(Opcode::Within {
+                                body_code,
+                                free_vars_map: body_comp.free_vars,
+                            });
+                            return Ok(());
+                        }
+                        "with_mutex" if items.len() == 3 => {
+                            // ponytail: compile mutex-name arg, then run body under the named lock
+                            self.compile(&items[1], code, false)?;
+                            let mut body_comp = VMCompiler {
+                                locals: self.locals.clone(),
+                                free_vars: self.free_vars.clone(),
+                                fn_name: self.fn_name.clone(),
+                                arity: self.arity,
+                            };
+                            let mut body_code = Vec::new();
+                            body_comp.compile(&items[2], &mut body_code, false)?;
+                            for v in &body_comp.free_vars {
+                                if !self.free_vars.contains(v) { self.free_vars.push(v.clone()); }
+                            }
+                            code.push(Opcode::WithMutex {
+                                body_code,
+                                free_vars_map: body_comp.free_vars,
+                            });
+                            return Ok(());
+                        }
+                        "transaction" if items.len() == 2 => {
+                            // ponytail: snapshot state, run body, rollback on empty/error
+                            let mut body_comp = VMCompiler {
+                                locals: self.locals.clone(),
+                                free_vars: self.free_vars.clone(),
+                                fn_name: self.fn_name.clone(),
+                                arity: self.arity,
+                            };
+                            let mut body_code = Vec::new();
+                            body_comp.compile(&items[1], &mut body_code, false)?;
+                            for v in &body_comp.free_vars {
+                                if !self.free_vars.contains(v) { self.free_vars.push(v.clone()); }
+                            }
+                            code.push(Opcode::Transaction {
+                                body_code,
+                                free_vars_map: body_comp.free_vars,
+                            });
+                            return Ok(());
+                        }
+                        "|->" | "once" | "progn" | "prog1" | "chain" | "add-atom" | "remove-atom" => {
                             code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
                             return Ok(());
                         }

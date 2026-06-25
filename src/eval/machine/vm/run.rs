@@ -966,6 +966,76 @@ pub fn run_vm(
                 state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(filtered_results))]));
                 state.ip += 1;
             }
+            Opcode::Within { body_code, free_vars_map } => {
+                // ponytail: run body, collect all results, wrap into (within result1 result2 ...)
+                let mut sub_state = VMState::new_with_parent(
+                    body_code.clone(),
+                    free_vars_map.clone(),
+                    state.budget,
+                    &state.free_vars_map,
+                    &state.free_vars_bindings,
+                );
+                for val in &state.locals { sub_state.locals.push(val.clone()); }
+                let (res, sub_budget, _) = run_vm(sub_state, funcs, base_env)?;
+                state.budget = sub_budget;
+                let atoms: Vec<Atom> = res.into_iter().map(|(a, _)| a).collect();
+                if atoms.is_empty() {
+                    return Err("within: expression produced no results".into());
+                }
+                let wrapped = Atom::Expr(crate::atom::expr_data(
+                    std::iter::once(Atom::sym("within")).chain(atoms).collect::<Vec<_>>()
+                ));
+                state.stack.push(plain(vec![wrapped]));
+                state.ip += 1;
+            }
+            Opcode::WithMutex { body_code, free_vars_map } => {
+                // ponytail: pop evaluated mutex name, acquire named lock, run body, release
+                let name_rs = state.stack.pop().ok_or("VM stack underflow on WithMutex")?;
+                let mutex_name = name_rs.into_iter().next().map(|(a, _)| a.to_sexpr_string()).unwrap_or_default();
+                let mut sub_state = VMState::new_with_parent(
+                    body_code.clone(),
+                    free_vars_map.clone(),
+                    state.budget,
+                    &state.free_vars_map,
+                    &state.free_vars_bindings,
+                );
+                for val in &state.locals { sub_state.locals.push(val.clone()); }
+                let result = crate::space::mutate::with_named_mutex(&mutex_name, || {
+                    run_vm(sub_state, funcs, base_env)
+                })?;
+                let (res, sub_budget, _) = result;
+                state.budget = sub_budget;
+                state.stack.push(res);
+                state.ip += 1;
+            }
+            Opcode::Transaction { body_code, free_vars_map } => {
+                // ponytail: snapshot state, run body in sub-VM, rollback on empty result or error
+                let snapshot = crate::space::mutate::snapshot_transaction_state(funcs);
+                let mut sub_state = VMState::new_with_parent(
+                    body_code.clone(),
+                    free_vars_map.clone(),
+                    state.budget,
+                    &state.free_vars_map,
+                    &state.free_vars_bindings,
+                );
+                for val in &state.locals { sub_state.locals.push(val.clone()); }
+                match run_vm(sub_state, funcs, base_env) {
+                    Ok((res, sub_budget, _)) => {
+                        state.budget = sub_budget;
+                        if res.is_empty() {
+                            crate::space::mutate::restore_transaction_state(snapshot, funcs)
+                                .map_err(|e| format!("transaction: rollback failed: {e}"))?;
+                        }
+                        state.stack.push(res);
+                    }
+                    Err(err) => {
+                        crate::space::mutate::restore_transaction_state(snapshot, funcs)
+                            .map_err(|e| format!("transaction: rollback failed: {e}"))?;
+                        return Err(format!("transaction: {err}"));
+                    }
+                }
+                state.ip += 1;
+            }
         }
     }
 
