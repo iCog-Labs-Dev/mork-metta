@@ -565,8 +565,81 @@ impl VMCompiler {
                             code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
                             return Ok(());
                         }
-                        "|->" | "add-atom" | "remove-atom" => {
-                            code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
+                        "add-atom" if items.len() == 3 => {
+                            self.compile(&items[1], code, false)?;
+                            code.push(Opcode::AddAtom {
+                                expr: items[2].clone(),
+                                local_names: self.locals.clone(),
+                            });
+                            return Ok(());
+                        }
+                        "remove-atom" if items.len() == 3 => {
+                            self.compile(&items[1], code, false)?;
+                            code.push(Opcode::RemAtom {
+                                expr: items[2].clone(),
+                                local_names: self.locals.clone(),
+                            });
+                            return Ok(());
+                        }
+                        "|->" if items.len() == 3 => {
+                            let params: Vec<Expr> = match &items[1] {
+                                Expr::List(lst) => lst.to_vec(),
+                                other => vec![other.clone()],
+                            };
+                            let body = items[2].clone();
+                            code.push(Opcode::Lambda {
+                                params,
+                                body,
+                                local_names: self.locals.clone(),
+                            });
+                            return Ok(());
+                        }
+                        "unify" if items.len() == 5 => {
+                            // (unify pattern value then else)
+                            self.compile(&items[1], code, false)?;
+                            self.compile(&items[2], code, false)?;
+
+                            let mut pattern_vars = Vec::new();
+                            collect_pattern_vars(&items[1], &mut pattern_vars);
+                            collect_pattern_vars(&items[2], &mut pattern_vars);
+
+                            let mut then_comp = VMCompiler {
+                                locals: self.locals.clone(),
+                                free_vars: self.free_vars.clone(),
+                                fn_name: self.fn_name.clone(),
+                                arity: self.arity,
+                            };
+                            then_comp.locals.extend(pattern_vars.clone());
+                            let mut then_code = Vec::new();
+                            then_comp.compile(&items[3], &mut then_code, is_tail)?;
+
+                            let mut else_comp = VMCompiler {
+                                locals: self.locals.clone(),
+                                free_vars: self.free_vars.clone(),
+                                fn_name: self.fn_name.clone(),
+                                arity: self.arity,
+                            };
+                            let mut else_code = Vec::new();
+                            else_comp.compile(&items[4], &mut else_code, is_tail)?;
+
+                            let mut union_free_vars = self.free_vars.clone();
+                            for v in &then_comp.free_vars {
+                                if !union_free_vars.contains(v) { union_free_vars.push(v.clone()); }
+                            }
+                            for v in &else_comp.free_vars {
+                                if !union_free_vars.contains(v) { union_free_vars.push(v.clone()); }
+                            }
+                            self.free_vars = union_free_vars.clone();
+
+                            code.push(Opcode::Unify {
+                                pattern_a: items[1].clone(),
+                                pattern_b: items[2].clone(),
+                                then_code: std::sync::Arc::from(then_code),
+                                else_code: std::sync::Arc::from(else_code),
+                                pattern_vars,
+                                local_names: self.locals.clone(),
+                                free_vars_map: union_free_vars,
+                            });
                             return Ok(());
                         }
                         "py-call" if items.len() == 2 => {
