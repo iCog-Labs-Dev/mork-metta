@@ -111,4 +111,8 @@ pub enum Opcode {
         body_code: Vec<Opcode>,
         free_vars_map: Vec<String>,
     },
+    /// Pops space-ref from stack, loads a .metta file into it.
+    ImportFile { path: String },
+    /// Pops space-ref from stack (ignored), loads a .py library file.
+    PythonImport { path: String },
 }

@@ -517,6 +517,36 @@ impl VMCompiler {
                             });
                             return Ok(());
                         }
+                        "import!" if items.len() == 3 => {
+                            // ponytail: path is always a compile-time literal; compile space-ref arg only
+                            // Performance: avoids a full CEK round-trip just to eval &self
+                            let path_opcode = match &items[2] {
+                                // (library path.py) — Python import, space-ref is still evaluated but unused
+                                Expr::List(lib) if lib.len() == 2 => {
+                                    if let (Expr::Symbol(head), Expr::Symbol(py) | Expr::Str(py)) = (&lib[0], &lib[1]) {
+                                        if head == "library" {
+                                            Some(Opcode::PythonImport { path: py.clone() })
+                                        } else { None }
+                                    } else { None }
+                                }
+                                Expr::Symbol(p) | Expr::Str(p) => {
+                                    if p.ends_with(".py") {
+                                        Some(Opcode::PythonImport { path: p.clone() })
+                                    } else {
+                                        Some(Opcode::ImportFile { path: p.clone() })
+                                    }
+                                }
+                                _ => None,
+                            };
+                            if let Some(opcode) = path_opcode {
+                                self.compile(&items[1], code, false)?; // evaluate space-ref
+                                code.push(opcode);
+                                return Ok(());
+                            }
+                            // Dynamic path — fallback to EvalCEK
+                            code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
+                            return Ok(());
+                        }
                         "|->" | "add-atom" | "remove-atom" => {
                             code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
                             return Ok(());

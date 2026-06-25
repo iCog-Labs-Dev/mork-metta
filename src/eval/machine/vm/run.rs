@@ -1095,6 +1095,43 @@ pub fn run_vm(
                 }
                 state.ip += 1;
             }
+            Opcode::ImportFile { path } => {
+                // ponytail: reuse existing apply.rs Frame::ImportFile logic directly
+                let space_rs = state.stack.pop().ok_or("VM stack underflow on ImportFile")?;
+                let space_ref = space_rs
+                    .into_iter().next().map(|(a, _)| a)
+                    .unwrap_or_else(|| Atom::sym("&self"));
+                let import_dir = funcs.import_dir.lock().unwrap().clone();
+                let resolved = crate::eval::io::resolve_import_path(&path, &import_dir)
+                    .ok_or_else(|| format!("import!: cannot find '{}' (searched CWD and '{}')", path, import_dir.display()))?;
+                let new_dir = resolved.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+                let prev_dir = std::mem::replace(&mut *funcs.import_dir.lock().unwrap(), new_dir);
+                let atoms = crate::eval::io::load_metta_file(&resolved, &space_ref, base_env, funcs)?;
+                *funcs.import_dir.lock().unwrap() = prev_dir;
+                state.stack.push(plain(atoms));
+                state.ip += 1;
+            }
+            Opcode::PythonImport { path } => {
+                // ponytail: reuse existing apply.rs Frame::PythonImport logic directly
+                let _space_rs = state.stack.pop(); // space-ref consumed but unused for Python
+                let import_dir = funcs.import_dir.lock().unwrap().clone();
+                let py_path = std::path::Path::new(&path);
+                let resolved = if py_path.exists() {
+                    Some(py_path.to_path_buf())
+                } else {
+                    let with_ext = format!("{}.py", path);
+                    let candidates = [
+                        std::path::PathBuf::from(&with_ext),
+                        import_dir.join(&path),
+                        import_dir.join(&with_ext),
+                    ];
+                    candidates.into_iter().find(|p| p.exists())
+                }
+                .ok_or_else(|| format!("import!: cannot find Python file '{}' (searched CWD and '{}')", path, import_dir.display()))?;
+                crate::eval::python::eval_py_import_library(&resolved)?;
+                state.stack.push(plain(vec![Atom::sym("true")]));
+                state.ip += 1;
+            }
         }
     }
 
