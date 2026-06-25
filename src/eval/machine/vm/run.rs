@@ -206,46 +206,33 @@ pub fn run_vm(
                                         if let Some((body_env, subst_cost)) = crate::eval::forms::query::match_clause(patterns, &combo, &combo_env, funcs) {
                                             let mut comp = super::compiler::VMCompiler::new(patterns, Some(name.to_string()));
                                             let mut code = Vec::new();
-                                            if comp.compile(body, &mut code, true).is_ok() {
-                                                // Debit structural budget cost prior to body evaluation
-                                                let body_cost = crate::eval::machine::budget::calculate_expr_cost(body);
-                                                let total_cost = subst_cost + body_cost;
-                                                if let Some(b) = state.budget {
-                                                    if b <= total_cost {
-                                                        return Err("Budget exhausted".into());
-                                                    }
-                                                    state.budget = Some(b - total_cost);
+                                            comp.compile(body, &mut code, true)?;
+                                            // Debit structural budget cost prior to body evaluation
+                                            let body_cost = crate::eval::machine::budget::calculate_expr_cost(body);
+                                            let total_cost = subst_cost + body_cost;
+                                            if let Some(b) = state.budget {
+                                                if b <= total_cost {
+                                                    return Err("Budget exhausted".into());
                                                 }
-                                                let mut sub_state = VMState::new_with_parent(
-                                                    code,
-                                                    comp.free_vars,
-                                                    state.budget,
-                                                    &state.free_vars_map,
-                                                    &state.free_vars_bindings,
-                                                );
-                                                for var in &comp.locals {
-                                                    let val = body_env.get(var).unwrap_or(Atom::sym("()"));
-                                                    sub_state.locals.push((val, Env::new()));
-                                                }
-                                                let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &body_env)?;
-                                                state.budget = sub_budget;
-                                                results.extend(res);
-                                                if cut_executed {
-                                                    state.cut_executed = true;
-                                                    break 'combos_loop;
-                                                }
-                                            } else {
-                                                // Fallback to CEK machine for this clause body
-                                                let body_cost = crate::eval::machine::budget::calculate_expr_cost(body);
-                                                let total_cost = subst_cost + body_cost;
-                                                if let Some(b) = state.budget {
-                                                    if b <= total_cost {
-                                                        return Err("Budget exhausted".into());
-                                                    }
-                                                    state.budget = Some(b - total_cost);
-                                                }
-                                                let body_rs = super::super::step::run_rs(Arc::new(body.clone()), body_env, funcs, &mut state.budget)?;
-                                                results.extend(body_rs);
+                                                state.budget = Some(b - total_cost);
+                                            }
+                                            let mut sub_state = VMState::new_with_parent(
+                                                code,
+                                                comp.free_vars,
+                                                state.budget,
+                                                &state.free_vars_map,
+                                                &state.free_vars_bindings,
+                                            );
+                                            for var in &comp.locals {
+                                                let val = body_env.get(var).unwrap_or(Atom::sym("()"));
+                                                sub_state.locals.push((val, Env::new()));
+                                            }
+                                            let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &body_env)?;
+                                            state.budget = sub_budget;
+                                            results.extend(res);
+                                            if cut_executed {
+                                                state.cut_executed = true;
+                                                break 'combos_loop;
                                             }
                                         }
                                     }
@@ -289,28 +276,24 @@ pub fn run_vm(
                                     );
                                     let mut comp = super::compiler::VMCompiler::new(patterns, None);
                                     let mut code = Vec::new();
-                                    if comp.compile(&body, &mut code, false).is_ok() {
-                                        let mut sub_state = VMState::new_with_parent(
-                                            code,
-                                            comp.free_vars,
-                                            state.budget,
-                                            &state.free_vars_map,
-                                            &state.free_vars_bindings,
-                                        );
-                                        for var in &comp.locals {
-                                            let val = body_env.get(var).unwrap_or(Atom::sym("()"));
-                                            sub_state.locals.push((val, Env::new()));
-                                        }
-                                        let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &body_env)?;
-                                        state.budget = sub_budget;
-                                        results.extend(res);
-                                        if cut_executed {
-                                            state.cut_executed = true;
-                                            break;
-                                        }
-                                    } else {
-                                        let body_rs = super::super::step::run_rs(Arc::new(body), body_env, funcs, &mut state.budget)?;
-                                        results.extend(body_rs);
+                                    comp.compile(&body, &mut code, false)?;
+                                    let mut sub_state = VMState::new_with_parent(
+                                        code,
+                                        comp.free_vars,
+                                        state.budget,
+                                        &state.free_vars_map,
+                                        &state.free_vars_bindings,
+                                    );
+                                    for var in &comp.locals {
+                                        let val = body_env.get(var).unwrap_or(Atom::sym("()"));
+                                        sub_state.locals.push((val, Env::new()));
+                                    }
+                                    let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &body_env)?;
+                                    state.budget = sub_budget;
+                                    results.extend(res);
+                                    if cut_executed {
+                                        state.cut_executed = true;
+                                        break;
                                     }
                                 }
                             }

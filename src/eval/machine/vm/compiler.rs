@@ -62,7 +62,7 @@ impl VMCompiler {
                             code.push(Opcode::Const(atom));
                             return Ok(());
                         }
-                        "empty" if items.len() == 1 => {
+                        "empty" => {
                             code.push(Opcode::ConstEmpty);
                             return Ok(());
                         }

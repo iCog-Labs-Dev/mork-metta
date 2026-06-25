@@ -38,7 +38,8 @@ pub fn register_boolean_builtins(funcs: &FnTable) {
 
     funcs.insert_native("=?", 2, |args, _| {
         crate::builtins::arithmetic::expect_n_args(args, 2, "=?")?;
-        Ok(NDet::single(bool_atom(args[0] == args[1])))
+        let unifiable = crate::eval::machine::state::unify(&args[0], &args[1]).is_some();
+        Ok(NDet::single(bool_atom(unifiable)))
     });
     funcs.mark_pure("=?", 2);
 
@@ -61,6 +62,20 @@ pub fn register_boolean_builtins(funcs: &FnTable) {
         Ok(NDet::single(bool_atom(eq)))
     });
     funcs.mark_pure("=alpha", 2);
+
+    funcs.insert_native("=@=", 2, |args, _| {
+        crate::builtins::arithmetic::expect_n_args(args, 2, "=@=")?;
+        let mut map_ab = std::collections::HashMap::new();
+        let mut map_ba = std::collections::HashMap::new();
+        let eq = crate::builtins::arithmetic::alpha_equiv(
+            &args[0],
+            &args[1],
+            &mut map_ab,
+            &mut map_ba,
+        );
+        Ok(NDet::single(bool_atom(eq)))
+    });
+    funcs.mark_pure("=@=", 2);
 }
 
 fn register_truth_tables(funcs: &FnTable) {

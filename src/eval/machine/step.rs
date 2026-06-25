@@ -44,31 +44,22 @@ pub(crate) fn run_rs(
     let _profile = crate::profile::ProfileGuard::new("run_rs");
     crate::env::clear_lookup_cache();
 
-    // Try compiling with bytecode VM first
+    // Compiling with bytecode VM
     let mut comp = super::vm::VMCompiler::new(&[], None);
     let mut code = Vec::new();
-    if comp.compile(&root, &mut code, false).is_ok() {
-        let state = super::vm::VMState::new(code, comp.free_vars.clone(), *budget);
-        let mut sub_env = root_env.clone();
-        for (i, name) in comp.free_vars.iter().enumerate() {
-            if let Some(val) = root_env.get(name) {
-                if let crate::atom::Atom::Sym(fresh_name) = &state.free_vars_bindings[i] {
-                    sub_env = sub_env.extend(fresh_name, val.clone());
-                }
-            }
-        }
-        match super::vm::run_vm(state, funcs, &sub_env) {
-            Ok((rs, sub_budget, _cut_executed)) => {
-                *budget = sub_budget;
-                return Ok(rs);
-            }
-            Err(e) => {
-                return Err(e);
+    comp.compile(&root, &mut code, false)?;
+    let state = super::vm::VMState::new(code, comp.free_vars.clone(), *budget);
+    let mut sub_env = root_env.clone();
+    for (i, name) in comp.free_vars.iter().enumerate() {
+        if let Some(val) = root_env.get(name) {
+            if let crate::atom::Atom::Sym(fresh_name) = &state.free_vars_bindings[i] {
+                sub_env = sub_env.extend(fresh_name, val.clone());
             }
         }
     }
-
-    run_rs_cek(root, root_env, funcs, budget)
+    let (rs, sub_budget, _cut_executed) = super::vm::run_vm(state, funcs, &sub_env)?;
+    *budget = sub_budget;
+    Ok(rs)
 }
 
 pub(crate) fn run_rs_cek(
