@@ -139,6 +139,7 @@ fn approx_size(atom: &Atom) -> usize {
         Atom::Num(_) => 32,
         Atom::Expr(items) => 2 + items.iter().map(approx_size).sum::<usize>(),
         Atom::Closure(_) => 128,
+        Atom::Gnd(_) => 128,
     }
 }
 
@@ -200,6 +201,12 @@ fn encode_atom_inner(
         }
         Atom::Closure(_) => {
             return Err("Cannot encode Closure in space".to_string());
+        }
+        Atom::Gnd(g) => {
+            let s = g.display_metta();
+            let token = pdp.tokenizer(s.as_bytes());
+            ez.write_symbol(token);
+            ez.loc += token.len() + 1;
         }
     }
     Ok(())

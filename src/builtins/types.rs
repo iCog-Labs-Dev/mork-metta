@@ -128,6 +128,7 @@ pub fn register_type_builtins(funcs: &FnTable) {
             Atom::Num(_) => "Number",
             Atom::Expr(_) => "Expression",
             Atom::Closure(_) => "Grounded",
+            Atom::Gnd(_) => "Grounded",
         };
         Ok(NDet::single(Atom::sym(kind)))
     });

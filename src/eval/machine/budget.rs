@@ -31,6 +31,7 @@ pub fn calculate_cost(atom: &Atom) -> Option<i64> {
         Atom::Sym(_) | Atom::Str(_) | Atom::Num(_) => Some(1),
         Atom::Expr(items) => Some(items.len() as i64 + 1),
         Atom::Closure(_) => Some(5),
+        Atom::Gnd(_) => Some(5),
     }
 }
 

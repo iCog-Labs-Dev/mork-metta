@@ -3,6 +3,9 @@ use crate::parser::Expr;
 use dashu::Integer as IBig;
 use dashu::Decimal as DBig;
 
+use std::any::Any;
+use std::sync::Arc;
+use std::fmt;
 /// A growing numeric value — either an arbitrary-precision integer or decimal.
 /// Integer values up to ~2×64 bits are stored inline (no heap alloc); larger
 /// values promote to heap. Decimal values are exact (no NaN, no IEEE rounding).
@@ -75,7 +78,22 @@ impl Numeric {
 /// - Equality is structural (recursive). Str != Sym even with same content.
 /// - Empty symbol `Sym("")` represents MeTTa's `Empty` / false / unit value.
 /// - `Closure` equality compares params, body, and captured env structurally.
-use std::sync::Arc;
+
+/// Trait for external ("grounded") values embedded in Atom::Gnd.
+///
+/// Enables storing arbitrary host-language objects (Python objects, torch tensors,
+/// etc.) inside the MeTTa atomspace. Implementations must be `Send + Sync` for
+/// thread-safe evaluation.
+pub trait Grounded: fmt::Debug + Send + Sync {
+    /// MeTTa S-expression representation (for `to_sexpr_string` and space encoding).
+    fn display_metta(&self) -> String;
+    /// Structural equality. Must be consistent with `hash_gnd`.
+    fn eq_gnd(&self, other: &dyn Grounded) -> bool;
+    /// Hash consistent with `eq_gnd`.
+    fn hash_gnd(&self) -> u64;
+    /// Downcast to concrete type for type-specific operations.
+    fn as_any(&self) -> &dyn Any;
+}
 
 /// Heap-allocated closure fields — boxed so `Atom` stays 32 bytes.
 #[derive(Clone, Debug, PartialEq)]
@@ -126,7 +144,6 @@ impl std::ops::Deref for ExprData {
         &self.items
     }
 }
-
 /// Build an `Arc<ExprData>` from anything convertible to `Vec<Atom>`.
 ///
 /// Drop-in replacement for the old `Arc::from(items)` at `Atom::Expr(..)`
@@ -136,7 +153,6 @@ impl std::ops::Deref for ExprData {
 pub fn expr_data<T: Into<Vec<Atom>>>(items: T) -> Arc<ExprData> {
     Arc::new(ExprData::new(items.into()))
 }
-
 
 #[derive(Clone, Debug)]
 pub enum Atom {
@@ -153,6 +169,9 @@ pub enum Atom {
     Expr(Arc<ExprData>),
     /// An anonymous function created by `|->`. Boxed to keep Atom at 32 bytes.
     Closure(Box<ClosureData>),
+    /// A grounded value from the host language (e.g. a Python object).
+    /// Wrapped in Arc so cloning is O(1). Requires the `Grounded` trait.
+    Gnd(Arc<dyn Grounded>),
 }
 
 impl PartialEq for Atom {
@@ -160,9 +179,10 @@ impl PartialEq for Atom {
         match (self, other) {
             (Atom::Sym(a), Atom::Sym(b)) => a == b,
             (Atom::Str(a), Atom::Str(b)) => a == b,
-            (Atom::Num(a), Atom::Num(b)) => a == b, // delegates to Numeric::PartialEq
+            (Atom::Num(a), Atom::Num(b)) => a == b,
             (Atom::Expr(a), Atom::Expr(b)) => Arc::ptr_eq(a, b) || a.items == b.items,
             (Atom::Closure(a), Atom::Closure(b)) => a == b,
+            (Atom::Gnd(a), Atom::Gnd(b)) => a.eq_gnd(b.as_ref()),
             _ => false,
         }
     }
@@ -183,9 +203,11 @@ impl std::hash::Hash for Atom {
                 }
             }
             Atom::Closure(c) => c.hash(state),
+            Atom::Gnd(g) => g.hash_gnd().hash(state),
         }
     }
 }
+
 
 impl Atom {
     /// Format an Atom as an S-expression string (for display and repr).
@@ -208,6 +230,7 @@ impl Atom {
                 let param_strs: Vec<String> = c.params.iter().map(|p| p.to_string()).collect();
                 format!("(|-> ({}) {})", param_strs.join(" "), c.body.to_string())
             }
+            Atom::Gnd(g) => g.display_metta(),
         }
     }
 

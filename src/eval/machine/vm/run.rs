@@ -1210,6 +1210,13 @@ pub fn run_vm(
                 state.stack.push(plain(vec![Atom::sym("true")]));
                 state.ip += 1;
             }
+            Opcode::PyCall { expr } => {
+                // Direct VM opcode for py-call — bypasses dispatch.rs entirely.
+                let result = crate::eval::python::eval_py_call(&[expr.clone()], base_env, funcs)?;
+                let atoms: Vec<Atom> = result.collect();
+                state.stack.push(plain(atoms));
+                state.ip += 1;
+            }
         }
     }
 

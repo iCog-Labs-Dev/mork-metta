@@ -115,4 +115,7 @@ pub enum Opcode {
     ImportFile { path: String },
     /// Pops space-ref from stack (ignored), loads a .py library file.
     PythonImport { path: String },
+    /// Evaluates a `(py-call expr)` — raw expression tree, not evaluated args.
+    /// Bypasses dispatch.rs string matching and CEK machine entirely.
+    PyCall { expr: Expr },
 }
