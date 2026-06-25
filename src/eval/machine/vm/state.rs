@@ -46,7 +46,7 @@ pub enum CallFrameKind {
         results: ResultSet,
     },
     Call {
-        name: String,
+        name: &'static str,
         arity: u8,
         pending_calls: Vec<PendingCall>,
         next_idx: usize,

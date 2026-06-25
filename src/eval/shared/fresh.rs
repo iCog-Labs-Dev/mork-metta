@@ -230,7 +230,7 @@ fn freshen_expr_inner_opt(
     locals: &HashMap<String, String>,
     free: &mut HashMap<String, String>,
 ) -> Option<Expr> {
-    let _profile = crate::profile::ProfileGuard::new("freshen_expr_inner");
+    let _profile = crate::profile::ProfileGuard::new_owned("freshen_expr_inner");
     match expr {
         Expr::Symbol(symbol) if is_var_symbol(symbol) => {
             let fresh = freshen_symbol(symbol, bound_vars, locals, free);

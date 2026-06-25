@@ -41,7 +41,6 @@ pub(crate) fn run_rs(
     funcs: &FnTable,
     budget: &mut Option<i64>,
 ) -> Result<ResultSet, String> {
-    let _profile = crate::profile::ProfileGuard::new("run_rs");
     crate::env::clear_lookup_cache();
 
     // Compiling with bytecode VM

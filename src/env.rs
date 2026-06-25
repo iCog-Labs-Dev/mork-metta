@@ -119,7 +119,7 @@ impl Env {
     /// # Assumptions
     /// - Variable name includes the `$` prefix, e.g. `"$x"`.
     pub fn get(&self, name: &str) -> Option<Atom> {
-        let _profile = crate::profile::ProfileGuard::new("Env::get");
+        let _profile = crate::profile::ProfileGuard::new_owned("Env::get");
         // ponytail: lookup cache removed because of pointer reuse/cache invalidation bugs across recursive executions.
         match self.inner() {
             EnvNode::Empty => None,

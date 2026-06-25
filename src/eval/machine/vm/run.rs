@@ -24,6 +24,16 @@ thread_local! {
     static VM_DEPTH: Cell<u32> = Cell::new(0);
 }
 
+fn intern_name(name: &str) -> &'static str {
+    static INTERNER: std::sync::OnceLock<std::sync::Mutex<HashMap<String, &'static str>>> =
+        std::sync::OnceLock::new();
+    let map = INTERNER.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap();
+    *map.entry(name.to_string()).or_insert_with(|| {
+        Box::leak(name.to_string().into_boxed_str())
+    })
+}
+
 struct VmDepthGuard;
 impl VmDepthGuard {
     fn enter() -> Self {
@@ -71,6 +81,118 @@ pub fn run_vm(
     loop {
         while state.ip < state.code.len() {
         let op = &state.code[state.ip];
+            let _profile = if cfg!(feature = "profile") {
+                let name = match state.frames.last() {
+                    Some(frame) => match &frame.kind {
+                        CallFrameKind::Call { name, .. } => *name,
+                        _ => match op {
+                            Opcode::Call(_) => "Opcode::Call",
+                            Opcode::Const(_) => "Opcode::Const",
+                            Opcode::Load(_) => "Opcode::Load",
+                            Opcode::Store(_) => "Opcode::Store",
+                            Opcode::LoadFree(_) => "Opcode::LoadFree",
+                            Opcode::Pop => "Opcode::Pop",
+                            Opcode::Jump(_) => "Opcode::Jump",
+                            Opcode::JumpIfEmpty(_) => "Opcode::JumpIfEmpty",
+                            Opcode::JumpIfFalsy(_) => "Opcode::JumpIfFalsy",
+                            Opcode::PopLocals(_) => "Opcode::PopLocals",
+                            Opcode::TailCallSelf => "Opcode::TailCallSelf",
+                            Opcode::UnifyPattern(_, _) => "Opcode::UnifyPattern",
+                            Opcode::AddAtom { .. } => "Opcode::AddAtom",
+                            Opcode::RemAtom { .. } => "Opcode::RemAtom",
+                            Opcode::DebitBudget(_) => "Opcode::DebitBudget",
+                            Opcode::Collapse => "Opcode::Collapse",
+                            Opcode::Superpose(_) => "Opcode::Superpose",
+                            Opcode::SuperposeUnpack => "Opcode::SuperposeUnpack",
+                            Opcode::Eval => "Opcode::Eval",
+                            Opcode::Lambda { .. } => "Opcode::Lambda",
+                            Opcode::Unify { .. } => "Opcode::Unify",
+                            Opcode::ConstEmpty => "Opcode::ConstEmpty",
+                            Opcode::Cut => "Opcode::Cut",
+                            Opcode::Println => "Opcode::Println",
+                            Opcode::Readln => "Opcode::Readln",
+                            Opcode::Let { .. } => "Opcode::Let",
+                            Opcode::If { .. } => "Opcode::If",
+                            Opcode::Case { .. } => "Opcode::Case",
+                            Opcode::Match { .. } => "Opcode::Match",
+                            Opcode::Foldall => "Opcode::Foldall",
+                            Opcode::Forall => "Opcode::Forall",
+                            Opcode::Foldl => "Opcode::Foldl",
+                            Opcode::FoldlLambda { .. } => "Opcode::FoldlLambda",
+                            Opcode::MapAtomLambda { .. } => "Opcode::MapAtomLambda",
+                            Opcode::FilterAtomLambda { .. } => "Opcode::FilterAtomLambda",
+                            Opcode::Once { .. } => "Opcode::Once",
+                            Opcode::Progn { .. } => "Opcode::Progn",
+                            Opcode::Prog1 { .. } => "Opcode::Prog1",
+                            Opcode::Chain { .. } => "Opcode::Chain",
+                            Opcode::Within { .. } => "Opcode::Within",
+                            Opcode::WithMutex { .. } => "Opcode::WithMutex",
+                            Opcode::Transaction { .. } => "Opcode::Transaction",
+                            Opcode::ImportFile { .. } => "Opcode::ImportFile",
+                            Opcode::PythonImport { .. } => "Opcode::PythonImport",
+                            Opcode::PyCall { .. } => "Opcode::PyCall",
+                            Opcode::PyEval { .. } => "Opcode::PyEval",
+                            Opcode::ImportDynamic => "Opcode::ImportDynamic",
+                            Opcode::MapAtomPatternLambda { .. } => "Opcode::MapAtomPatternLambda",
+                            Opcode::FilterAtomPatternLambda { .. } => "Opcode::FilterAtomPatternLambda",
+                        }
+                    },
+                    None => match op {
+                        Opcode::Call(_) => "Opcode::Call",
+                        Opcode::Const(_) => "Opcode::Const",
+                        Opcode::Load(_) => "Opcode::Load",
+                        Opcode::Store(_) => "Opcode::Store",
+                        Opcode::LoadFree(_) => "Opcode::LoadFree",
+                        Opcode::Pop => "Opcode::Pop",
+                        Opcode::Jump(_) => "Opcode::Jump",
+                        Opcode::JumpIfEmpty(_) => "Opcode::JumpIfEmpty",
+                        Opcode::JumpIfFalsy(_) => "Opcode::JumpIfFalsy",
+                        Opcode::PopLocals(_) => "Opcode::PopLocals",
+                        Opcode::TailCallSelf => "Opcode::TailCallSelf",
+                        Opcode::UnifyPattern(_, _) => "Opcode::UnifyPattern",
+                        Opcode::AddAtom { .. } => "Opcode::AddAtom",
+                        Opcode::RemAtom { .. } => "Opcode::RemAtom",
+                        Opcode::DebitBudget(_) => "Opcode::DebitBudget",
+                        Opcode::Collapse => "Opcode::Collapse",
+                        Opcode::Superpose(_) => "Opcode::Superpose",
+                        Opcode::SuperposeUnpack => "Opcode::SuperposeUnpack",
+                        Opcode::Eval => "Opcode::Eval",
+                        Opcode::Lambda { .. } => "Opcode::Lambda",
+                        Opcode::Unify { .. } => "Opcode::Unify",
+                        Opcode::ConstEmpty => "Opcode::ConstEmpty",
+                        Opcode::Cut => "Opcode::Cut",
+                        Opcode::Println => "Opcode::Println",
+                        Opcode::Readln => "Opcode::Readln",
+                        Opcode::Let { .. } => "Opcode::Let",
+                        Opcode::If { .. } => "Opcode::If",
+                        Opcode::Case { .. } => "Opcode::Case",
+                        Opcode::Match { .. } => "Opcode::Match",
+                        Opcode::Foldall => "Opcode::Foldall",
+                        Opcode::Forall => "Opcode::Forall",
+                        Opcode::Foldl => "Opcode::Foldl",
+                        Opcode::FoldlLambda { .. } => "Opcode::FoldlLambda",
+                        Opcode::MapAtomLambda { .. } => "Opcode::MapAtomLambda",
+                        Opcode::FilterAtomLambda { .. } => "Opcode::FilterAtomLambda",
+                        Opcode::Once { .. } => "Opcode::Once",
+                        Opcode::Progn { .. } => "Opcode::Progn",
+                        Opcode::Prog1 { .. } => "Opcode::Prog1",
+                        Opcode::Chain { .. } => "Opcode::Chain",
+                        Opcode::Within { .. } => "Opcode::Within",
+                        Opcode::WithMutex { .. } => "Opcode::WithMutex",
+                        Opcode::Transaction { .. } => "Opcode::Transaction",
+                        Opcode::ImportFile { .. } => "Opcode::ImportFile",
+                        Opcode::PythonImport { .. } => "Opcode::PythonImport",
+                        Opcode::PyCall { .. } => "Opcode::PyCall",
+                        Opcode::PyEval { .. } => "Opcode::PyEval",
+                        Opcode::ImportDynamic => "Opcode::ImportDynamic",
+                        Opcode::MapAtomPatternLambda { .. } => "Opcode::MapAtomPatternLambda",
+                        Opcode::FilterAtomPatternLambda { .. } => "Opcode::FilterAtomPatternLambda",
+                    }
+                };
+                Some(crate::profile::ProfileGuard::new(name))
+            } else {
+                None
+            };
         if debug_vm {
             eprintln!("IP: {:03} | OP: {:?} | STACK: {:?} | LOCALS: {:?}", state.ip, op, state.stack, state.locals);
         }
@@ -452,6 +574,11 @@ pub fn run_vm(
                             if let Some(function) = funcs.get(fn_name, *arity) {
                                 match &function.kind {
                                     FunctionKind::Native { func: native_f } => {
+                                        let _profile = if cfg!(feature = "profile") {
+                                            Some(crate::profile::ProfileGuard::new_owned(fn_name))
+                                        } else {
+                                            None
+                                        };
                                         let res = native_f(args, funcs)?;
                                         for a in res {
                                             results.push((a, combo_env.clone()));
@@ -616,8 +743,8 @@ pub fn run_vm(
                     saved_free_vars_bindings: state.free_vars_bindings.clone(),
                     kind: CallFrameKind::Call {
                         name: match full_combos.first().and_then(|c| c.0.first()) {
-                            Some(Atom::Sym(s)) => s.to_string(),
-                            _ => "".to_string(),
+                            Some(Atom::Sym(s)) => intern_name(s),
+                            _ => "",
                         },
                         arity: *arity,
                         pending_calls,
@@ -642,12 +769,22 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::Collapse => {
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("Collapse"))
+                } else {
+                    None
+                };
                 let val_rs = state.stack.pop().ok_or("VM stack underflow on Collapse")?;
                 let atoms: Vec<Atom> = val_rs.into_iter().map(|(a, _)| a).collect();
                 state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(atoms))]));
                 state.ip += 1;
             }
             Opcode::Superpose(count) => {
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("Superpose"))
+                } else {
+                    None
+                };
                 let mut results = Vec::new();
                 let mut popped = Vec::with_capacity(*count as usize);
                 for _ in 0..*count {
@@ -661,6 +798,11 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::SuperposeUnpack => {
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("SuperposeUnpack"))
+                } else {
+                    None
+                };
                 let val_rs = state.stack.pop().ok_or("VM stack underflow on SuperposeUnpack")?;
                 if let Some((first, _)) = val_rs.first() {
                     match first {
@@ -677,6 +819,11 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::ConstEmpty => {
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("ConstEmpty"))
+                } else {
+                    None
+                };
                 state.stack.push(Vec::new());
                 state.ip += 1;
             }
@@ -692,6 +839,11 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::Readln => {
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("Readln"))
+                } else {
+                    None
+                };
                 let nd = crate::eval::io::eval_readln(&[], &base_env, funcs)?;
                 state.stack.push(plain(nd.collect()));
                 state.ip += 1;
@@ -703,6 +855,11 @@ pub fn run_vm(
                 pattern_vars,
                 free_vars_map,
             } => {
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("Match"))
+                } else {
+                    None
+                };
                 let space_rs = state.stack.pop().ok_or("VM stack underflow on Match space")?;
                 let mut results = Vec::new();
                 if let Some((space_ref, _)) = space_rs.first() {
@@ -763,6 +920,11 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::Eval => {
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("Eval"))
+                } else {
+                    None
+                };
                 let val_rs = state.stack.pop().ok_or("VM stack underflow on Eval")?;
                 let mut target_rs = Vec::new();
                 for (atom, env) in val_rs {
@@ -799,6 +961,11 @@ pub fn run_vm(
                 continue;
             }
             Opcode::If { then_code, else_code, free_vars_map } => {
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("If"))
+                } else {
+                    None
+                };
                 let condition_rs = state.stack.pop().ok_or("VM stack underflow on If")?;
                 let truthy_condition_count = condition_rs.iter().filter(|(cond, _)| cond.is_truthy()).count();
                 let had_nondet_truthy = truthy_condition_count > 1
@@ -834,6 +1001,11 @@ pub fn run_vm(
                 pattern_vars,
                 free_vars_map,
             } => {
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("Let"))
+                } else {
+                    None
+                };
                 let value_rs = state.stack.pop().ok_or("VM stack underflow on Let")?;
                 let frame = CallFrame {
                     return_ip: state.ip,
@@ -860,6 +1032,11 @@ pub fn run_vm(
                 continue;
             }
             Opcode::Case { branches, local_names } => {
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("Case"))
+                } else {
+                    None
+                };
                 let scrutinee_rs = state.stack.pop().ok_or("VM stack underflow on Case")?;
                 let frame = CallFrame {
                     return_ip: state.ip,
@@ -1660,12 +1837,12 @@ pub fn run_vm(
                     state.locals = std::mem::take(&mut frame.saved_locals);
                     
                     let name = if let CallFrameKind::Call { name, .. } = &frame.kind {
-                        name.clone()
+                        *name
                     } else { unreachable!() };
                     
                     let mut pending_calls = Vec::new();
-                    if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(&name, arity, funcs) {
-                        let cache_key = (name.clone(), arity);
+                    if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(name, arity, funcs) {
+                        let cache_key = (name.to_string(), arity);
                         let cached = FN_BYTECODE_CACHE.with(|cache_ref| {
                             Ok::<_, String>(cache_ref.borrow().get(&cache_key).unwrap().clone())
                         })?;
