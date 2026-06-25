@@ -50,7 +50,7 @@ pub(crate) fn run_rs(
     if comp.compile(&root, &mut code, false).is_ok() {
         let state = super::vm::VMState::new(code, comp.free_vars, *budget);
         match super::vm::run_vm(state, funcs, &root_env) {
-            Ok((rs, sub_budget)) => {
+            Ok((rs, sub_budget, _cut_executed)) => {
                 *budget = sub_budget;
                 return Ok(rs);
             }

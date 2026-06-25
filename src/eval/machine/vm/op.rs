@@ -30,6 +30,10 @@ pub enum Opcode {
     SuperposeUnpack,
     Eval,
     EvalCEK(Expr, Vec<String>), // Fallback to evaluate expression in CEK machine with local variable names
+    ConstEmpty,
+    Cut,
+    Println,
+    Readln,
     If {
         then_code: Vec<Opcode>,
         else_code: Vec<Opcode>,

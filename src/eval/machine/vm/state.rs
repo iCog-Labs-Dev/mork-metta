@@ -20,6 +20,7 @@ pub struct VMState {
     pub free_vars_bindings: Vec<Atom>,  // Index to instantiated fresh Atom
     pub frames: Vec<CallFrame>,
     pub budget: Option<i64>,
+    pub cut_executed: bool,
 }
 
 impl VMState {
@@ -47,6 +48,7 @@ impl VMState {
             free_vars_bindings,
             frames: Vec::with_capacity(8),
             budget,
+            cut_executed: false,
         }
     }
 
@@ -82,6 +84,7 @@ impl VMState {
             free_vars_bindings,
             frames: Vec::with_capacity(8),
             budget,
+            cut_executed: false,
         }
     }
 }

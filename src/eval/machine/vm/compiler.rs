@@ -62,6 +62,23 @@ impl VMCompiler {
                             code.push(Opcode::Const(atom));
                             return Ok(());
                         }
+                        "empty" if items.len() == 1 => {
+                            code.push(Opcode::ConstEmpty);
+                            return Ok(());
+                        }
+                        "cut" if items.len() == 1 => {
+                            code.push(Opcode::Cut);
+                            return Ok(());
+                        }
+                        "println!" if items.len() == 2 => {
+                            self.compile(&items[1], code, false)?;
+                            code.push(Opcode::Println);
+                            return Ok(());
+                        }
+                        "readln!" if items.len() == 1 => {
+                            code.push(Opcode::Readln);
+                            return Ok(());
+                        }
                         "if" if items.len() == 3 || items.len() == 4 => {
                             self.compile(&items[1], code, false)?; // Compile condition
                             

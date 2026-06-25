@@ -11,7 +11,7 @@ pub fn run_vm(
     mut state: VMState,
     funcs: &FnTable,
     base_env: &Env,
-) -> Result<(ResultSet, Option<i64>), String> {
+) -> Result<(ResultSet, Option<i64>, bool), String> {
     let debug_vm = std::env::var_os("MORK_DEBUG_VM").is_some();
     if debug_vm {
         println!("--- VM CODE ---");
@@ -201,7 +201,7 @@ pub fn run_vm(
                             let combos = super::super::apply::threaded_combinations(&arg_sets);
                             let mut results = Vec::new();
                             if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(name, *arity, funcs) {
-                                for (combo, combo_env) in combos {
+                                'combos_loop: for (combo, combo_env) in combos {
                                     for (patterns, body) in &clauses {
                                         if let Some((body_env, subst_cost)) = crate::eval::forms::query::match_clause(patterns, &combo, &combo_env, funcs) {
                                             let mut comp = super::compiler::VMCompiler::new(patterns, Some(name.to_string()));
@@ -227,9 +227,13 @@ pub fn run_vm(
                                                     let val = body_env.get(var).unwrap_or(Atom::sym("()"));
                                                     sub_state.locals.push((val, Env::new()));
                                                 }
-                                                let (res, sub_budget) = run_vm(sub_state, funcs, &body_env)?;
+                                                let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &body_env)?;
                                                 state.budget = sub_budget;
                                                 results.extend(res);
+                                                if cut_executed {
+                                                    state.cut_executed = true;
+                                                    break 'combos_loop;
+                                                }
                                             } else {
                                                 // Fallback to CEK machine for this clause body
                                                 let body_cost = crate::eval::machine::budget::calculate_expr_cost(body);
@@ -354,6 +358,26 @@ pub fn run_vm(
                 state.stack.push(res);
                 state.ip += 1;
             }
+            Opcode::ConstEmpty => {
+                state.stack.push(Vec::new());
+                state.ip += 1;
+            }
+            Opcode::Cut => {
+                state.stack.push(plain(vec![Atom::sym("true")]));
+                state.cut_executed = true;
+                state.ip += 1;
+            }
+            Opcode::Println => {
+                let arg_rs = state.stack.pop().ok_or("VM stack underflow on Println")?;
+                let res = crate::eval::io::finish_println(arg_rs);
+                state.stack.push(res);
+                state.ip += 1;
+            }
+            Opcode::Readln => {
+                let nd = crate::eval::io::eval_readln(&[], base_env, funcs)?;
+                state.stack.push(plain(nd.collect()));
+                state.ip += 1;
+            }
             Opcode::Match {
                 pattern,
                 body_code,
@@ -400,9 +424,13 @@ pub fn run_vm(
                                 sub_state.locals.push((bound, Env::new()));
                             }
                             
-                            let (res, sub_budget) = run_vm(sub_state, funcs, &match_env)?;
+                            let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &match_env)?;
                             state.budget = sub_budget;
                             results.extend(res);
+                            if cut_executed {
+                                state.cut_executed = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -432,9 +460,13 @@ pub fn run_vm(
                             &state.free_vars_map,
                             &state.free_vars_bindings,
                         );
-                        let (res, sub_budget) = run_vm(sub_state, funcs, &target_env)?;
+                        let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &target_env)?;
                         state.budget = sub_budget;
                         results.extend(res);
+                        if cut_executed {
+                            state.cut_executed = true;
+                            break;
+                        }
                     } else {
                         let res = super::super::step::run_rs(Arc::new(target_expr), target_env, funcs, &mut state.budget)?;
                         results.extend(res);
@@ -468,9 +500,13 @@ pub fn run_vm(
                         base_env.clone()
                     };
                     
-                    let (res, sub_budget) = run_vm(sub_state, funcs, &branch_env)?;
+                    let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &branch_env)?;
                     state.budget = sub_budget;
                     results.extend(res);
+                    if cut_executed {
+                        state.cut_executed = true;
+                        break;
+                    }
                 }
                 let final_results = if had_bindings && results.len() > 1 {
                     let atoms: Vec<Atom> = results
@@ -503,10 +539,13 @@ pub fn run_vm(
                             }
                             let mut run_state = sub_state;
                             run_state.locals = sub_locals;
-                            let (res, sub_budget) = run_vm(run_state, funcs, base_env)?;
+                            let (res, sub_budget, cut_executed) = run_vm(run_state, funcs, base_env)?;
                             state.budget = sub_budget;
                             state.stack.push(res);
                             evaluated = true;
+                            if cut_executed {
+                                state.cut_executed = true;
+                            }
                             break;
                         }
                     }
@@ -551,9 +590,13 @@ pub fn run_vm(
                                 let bound = body_env.get(var).unwrap_or(Atom::sym("()"));
                                 sub_state.locals.push((bound, Env::new()));
                             }
-                            let (res, sub_budget) = run_vm(sub_state, funcs, &body_env)?;
+                            let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &body_env)?;
                             state.budget = sub_budget;
                             results.extend(res);
+                            if cut_executed {
+                                state.cut_executed = true;
+                                break;
+                            }
                         } else {
                             return Err(format!(
                                 "case: no clause matched value {}",
@@ -576,7 +619,8 @@ pub fn run_vm(
             (atom, merged)
         })
         .collect();
-    Ok((prepended_rs, state.budget))
+    // ponytail: cut flag is propagated using the 3rd tuple element of run_vm return value to prune loops recursively.
+    Ok((prepended_rs, state.budget, state.cut_executed))
 }
 
 fn collect_pattern_vars(expr: &Expr, set: &mut Vec<String>) {
