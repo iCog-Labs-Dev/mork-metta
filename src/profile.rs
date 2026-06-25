@@ -2,7 +2,7 @@
 mod real_impl {
     use std::cell::RefCell;
     use std::time::{Duration, Instant};
-    use std::collections::HashMap;
+    use rustc_hash::FxHashMap as HashMap;
 
     static PROFILE_MEM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -31,7 +31,7 @@ mod real_impl {
     }
 
     thread_local! {
-        pub static PROFILE_DATA: RefCell<HashMap<&'static str, FuncStats>> = RefCell::new(HashMap::new());
+        pub static PROFILE_DATA: RefCell<HashMap<&'static str, FuncStats>> = RefCell::new(HashMap::default());
         pub static ACTIVE_STACK: RefCell<Vec<ActiveFrame>> = RefCell::new(Vec::new());
     }
 

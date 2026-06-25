@@ -82,7 +82,7 @@ fn has_shadowing(new_env: &Env, outer_env: &Env) -> bool {
 /// Lazy cartesian product: visits every combination via callback without
 /// materialising the full M^K intermediate Vec. Uses O(depth) stack memory.
 #[inline]
-fn cartesian_product_apply<E>(
+pub(crate) fn cartesian_product_apply<E>(
     options: &[ResultSet],
     buf: &mut Vec<Atom>,
     f: &mut impl FnMut(&[Atom]) -> Result<(), E>,
@@ -106,7 +106,7 @@ fn cartesian_product_apply<E>(
 ///
 /// This is what enables relational (Prolog-like) behaviour where bindings
 /// discovered in one argument are visible in subsequent arguments.
-fn threaded_combinations(sets: &[ResultSet]) -> Vec<(Vec<Atom>, Env)> {
+pub(crate) fn threaded_combinations(sets: &[ResultSet]) -> Vec<(Vec<Atom>, Env)> {
     // ponytail: fast path for all-singleton result sets (bypasses redundant environment merging and prefix cloning)
     if sets.iter().all(|s| s.len() == 1) {
         let mut atoms = Vec::with_capacity(sets.len());

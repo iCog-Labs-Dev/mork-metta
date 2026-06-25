@@ -43,6 +43,23 @@ pub(crate) fn run_rs(
 ) -> Result<ResultSet, String> {
     let _profile = crate::profile::ProfileGuard::new("run_rs");
     crate::env::clear_lookup_cache();
+
+    // Try compiling with bytecode VM first
+    let mut comp = super::vm::VMCompiler::new(&[], None);
+    let mut code = Vec::new();
+    if comp.compile(&root, &mut code, false).is_ok() {
+        let state = super::vm::VMState::new(code, comp.free_vars, *budget);
+        match super::vm::run_vm(state, funcs, &root_env) {
+            Ok((rs, sub_budget)) => {
+                *budget = sub_budget;
+                return Ok(rs);
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+    }
+
     // reuse vectors from thread-local pools to prevent the allocation storm of nested run_rs calls
     thread_local! {
         static WORK_POOL: std::cell::RefCell<Vec<Vec<super::task::Task>>> = const { std::cell::RefCell::new(Vec::new()) };
