@@ -2,388 +2,10 @@ use crate::atom::Atom;
 use crate::env::Env;
 use crate::parser::Expr;
 use crate::func::{FnTable, FunctionKind};
-use crate::eval::shared::fresh;
 use crate::eval::machine::budget::{ResultSet, plain};
+use super::op::Opcode;
+use super::state::VMState;
 use std::sync::Arc;
-
-#[derive(Clone, Debug)]
-pub struct CaseBranch {
-    pub pattern: Expr,
-    pub body_code: Vec<Opcode>,
-    pub pattern_vars: Vec<String>,
-    pub free_vars_map: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-pub enum Opcode {
-    Const(Atom),
-    Load(u8),
-    Store(u8),
-    LoadFree(u8),
-    Pop,
-    Jump(usize),
-    JumpIfEmpty(usize),
-    JumpIfFalsy(usize),
-    Call(u8),
-    UnifyPattern(Expr, u8),
-    PopLocals(u8),
-    AddAtom,
-    RemAtom,
-    DebitBudget(i64),
-    Collapse,
-    Superpose(u8),
-    SuperposeUnpack,
-    Eval,
-    EvalCEK(Expr, Vec<String>), // Fallback to evaluate expression in CEK machine with local variable names
-    If {
-        then_code: Vec<Opcode>,
-        else_code: Vec<Opcode>,
-        free_vars_map: Vec<String>,
-    },
-    Case {
-        branches: Vec<CaseBranch>,
-        local_names: Vec<String>,
-    },
-    Match {
-        pattern: Expr,
-        body_code: Vec<Opcode>,
-        local_names: Vec<String>,
-        pattern_vars: Vec<String>,
-        free_vars_map: Vec<String>,
-    },
-}
-
-pub struct CallFrame {
-    pub return_ip: usize,
-    pub locals_start: usize,
-    pub locals_count: usize,
-}
-
-pub struct VMState {
-    pub code: Vec<Opcode>,
-    pub ip: usize,
-    pub stack: Vec<ResultSet>,
-    pub locals: Vec<(Atom, Env)>,
-    pub free_vars_map: Vec<String>,     // Index to original free var name
-    pub free_vars_bindings: Vec<Atom>,  // Index to instantiated fresh Atom
-    pub frames: Vec<CallFrame>,
-    pub budget: Option<i64>,
-}
-
-impl VMState {
-    pub fn new(code: Vec<Opcode>, free_vars_map: Vec<String>, budget: Option<i64>) -> Self {
-        let free_vars_bindings = free_vars_map
-            .iter()
-            .map(|name| {
-                let fresh_name = if fresh::is_generated_var_name(name) {
-                    name.clone()
-                } else {
-                    let id = next_fresh_id();
-                    let hint = name.strip_prefix('$').unwrap_or(name);
-                    format!("$__fresh_{hint}_{id}")
-                };
-                Atom::sym(&fresh_name)
-            })
-            .collect();
-
-        VMState {
-            code,
-            ip: 0,
-            stack: Vec::with_capacity(32),
-            locals: Vec::with_capacity(16),
-            free_vars_map,
-            free_vars_bindings,
-            frames: Vec::with_capacity(8),
-            budget,
-        }
-    }
-
-    pub fn new_with_parent(
-        code: Vec<Opcode>,
-        free_vars_map: Vec<String>,
-        budget: Option<i64>,
-        parent_map: &[String],
-        parent_bindings: &[Atom],
-    ) -> Self {
-        let free_vars_bindings = free_vars_map
-            .iter()
-            .map(|name| {
-                if let Some(pos) = parent_map.iter().position(|x| x == name) {
-                    parent_bindings[pos].clone()
-                } else if fresh::is_generated_var_name(name) {
-                    Atom::sym(name)
-                } else {
-                    let id = next_fresh_id();
-                    let hint = name.strip_prefix('$').unwrap_or(name);
-                    let fresh_name = format!("$__fresh_{hint}_{id}");
-                    Atom::sym(&fresh_name)
-                }
-            })
-            .collect();
-
-        VMState {
-            code,
-            ip: 0,
-            stack: Vec::with_capacity(32),
-            locals: Vec::with_capacity(16),
-            free_vars_map,
-            free_vars_bindings,
-            frames: Vec::with_capacity(8),
-            budget,
-        }
-    }
-}
-
-use std::sync::atomic::{AtomicU64, Ordering};
-static FRESH_COUNTER: AtomicU64 = AtomicU64::new(100000);
-fn next_fresh_id() -> u64 {
-    FRESH_COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
-pub struct VMCompiler {
-    pub locals: Vec<String>,
-    pub free_vars: Vec<String>,
-    pub fn_name: Option<String>,
-    pub arity: usize,
-}
-
-impl VMCompiler {
-    pub fn new(patterns: &[Expr], fn_name: Option<String>) -> Self {
-        let mut locals = Vec::new();
-        for pat in patterns {
-            collect_pattern_vars(pat, &mut locals);
-        }
-        let arity = locals.len();
-        VMCompiler {
-            locals,
-            free_vars: Vec::new(),
-            fn_name,
-            arity,
-        }
-    }
-
-    pub fn compile(&mut self, expr: &Expr, code: &mut Vec<Opcode>, is_tail: bool) -> Result<(), String> {
-        match expr {
-            Expr::Symbol(s) => {
-                if s.starts_with('$') {
-                    if let Some(pos) = self.locals.iter().rposition(|x| x == s) {
-                        code.push(Opcode::Load(pos as u8));
-                    } else {
-                        let pos = if let Some(p) = self.free_vars.iter().position(|x| x == s) {
-                            p
-                        } else {
-                            self.free_vars.push(s.clone());
-                            self.free_vars.len() - 1
-                        };
-                        code.push(Opcode::LoadFree(pos as u8));
-                    }
-                } else {
-                    code.push(Opcode::Const(Atom::sym(s)));
-                }
-            }
-            Expr::Str(s) => {
-                code.push(Opcode::Const(Atom::str_val(s)));
-            }
-            Expr::Number(n) => {
-                code.push(Opcode::Const(Atom::Num(n.clone())));
-            }
-            Expr::List(items) => {
-                if items.is_empty() {
-                    code.push(Opcode::Const(Atom::Expr(crate::atom::expr_data([]))));
-                    return Ok(());
-                }
-
-                if let Expr::Symbol(head) = &items[0] {
-                    match head.as_str() {
-                        "quote" if items.len() == 2 => {
-                            let atom = crate::parser::expr_to_atom(&items[1]);
-                            code.push(Opcode::Const(atom));
-                            return Ok(());
-                        }
-                        "if" if items.len() == 3 || items.len() == 4 => {
-                            self.compile(&items[1], code, false)?; // Compile condition
-                            
-                            let mut then_comp = VMCompiler {
-                                locals: self.locals.clone(),
-                                free_vars: self.free_vars.clone(),
-                                fn_name: self.fn_name.clone(),
-                                arity: self.arity,
-                            };
-                            let mut then_code = Vec::new();
-                            then_comp.compile(&items[2], &mut then_code, is_tail)?;
-                            
-                            let mut else_comp = VMCompiler {
-                                locals: self.locals.clone(),
-                                free_vars: self.free_vars.clone(),
-                                fn_name: self.fn_name.clone(),
-                                arity: self.arity,
-                            };
-                            let mut else_code = Vec::new();
-                            if items.len() == 4 {
-                                else_comp.compile(&items[3], &mut else_code, is_tail)?;
-                            }
-                            
-                            // Combine free vars
-                            let mut union_free_vars = self.free_vars.clone();
-                            for v in &then_comp.free_vars {
-                                if !union_free_vars.contains(v) { union_free_vars.push(v.clone()); }
-                            }
-                            for v in &else_comp.free_vars {
-                                if !union_free_vars.contains(v) { union_free_vars.push(v.clone()); }
-                            }
-                            self.free_vars = union_free_vars.clone();
-                            
-                            code.push(Opcode::If {
-                                then_code,
-                                else_code,
-                                free_vars_map: union_free_vars,
-                            });
-                            return Ok(());
-                        }
-                        "case" if items.len() == 3 => {
-                            let Expr::List(clauses) = &items[2] else {
-                                return Err("case clauses must be a list".into());
-                            };
-                            self.compile(&items[1], code, false)?;
-                            
-                            let mut compiled_branches = Vec::new();
-                            let mut union_free_vars = self.free_vars.clone();
-                            for clause in clauses.iter() {
-                                let (pattern, body) = match clause {
-                                    Expr::List(clause_items) if clause_items.len() == 2 => (&clause_items[0], &clause_items[1]),
-                                    _ => return Err("case clause must be a list of 2 items".into()),
-                                };
-                                
-                                let mut body_comp = VMCompiler {
-                                    locals: self.locals.clone(),
-                                    free_vars: union_free_vars.clone(),
-                                    fn_name: None,
-                                    arity: self.arity,
-                                };
-                                
-                                let mut pattern_vars = Vec::new();
-                                collect_pattern_vars(pattern, &mut pattern_vars);
-                                body_comp.locals.extend(pattern_vars.clone());
-                                
-                                let mut branch_code = Vec::new();
-                                body_comp.compile(body, &mut branch_code, is_tail)?;
-                                
-                                for v in &body_comp.free_vars {
-                                    if !union_free_vars.contains(v) {
-                                        union_free_vars.push(v.clone());
-                                    }
-                                }
-                                
-                                compiled_branches.push(CaseBranch {
-                                    pattern: pattern.clone(),
-                                    body_code: branch_code,
-                                    pattern_vars,
-                                    free_vars_map: body_comp.free_vars,
-                                });
-                            }
-                            self.free_vars = union_free_vars;
-                            
-                            code.push(Opcode::Case {
-                                branches: compiled_branches,
-                                local_names: self.locals.clone(),
-                            });
-                            return Ok(());
-                        }
-                        "match" if items.len() == 4 => {
-                            self.compile(&items[1], code, false)?;
-                            
-                            let mut body_comp = VMCompiler {
-                                locals: self.locals.clone(),
-                                free_vars: self.free_vars.clone(),
-                                fn_name: None,
-                                arity: self.arity,
-                            };
-                            let mut pattern_vars = Vec::new();
-                            collect_pattern_vars(&items[2], &mut pattern_vars);
-                            body_comp.locals.extend(pattern_vars.clone());
-                            
-                            let mut body_code = Vec::new();
-                            body_comp.compile(&items[3], &mut body_code, true)?;
-                            
-                            code.push(Opcode::Match {
-                                pattern: items[2].clone(),
-                                body_code,
-                                local_names: self.locals.clone(),
-                                pattern_vars,
-                                free_vars_map: body_comp.free_vars,
-                            });
-                            return Ok(());
-                        }
-                        "collapse" if items.len() == 2 => {
-                            self.compile(&items[1], code, false)?;
-                            code.push(Opcode::Collapse);
-                            return Ok(());
-                        }
-                        "superpose" if items.len() == 2 => {
-                            if let Expr::List(elems) = &items[1] {
-                                for elem in elems.iter() {
-                                    self.compile(elem, code, false)?;
-                                }
-                                code.push(Opcode::Superpose(elems.len() as u8));
-                            } else {
-                                self.compile(&items[1], code, false)?;
-                                code.push(Opcode::SuperposeUnpack);
-                            }
-                            return Ok(());
-                        }
-                        // For any other special keyword/construct (e.g. let, let*, once, etc.), fallback to EvalCEK
-                        "let" | "let*" | "once" | "progn" | "prog1" | "chain" | "add-atom" | "remove-atom" => {
-                            code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
-                            return Ok(());
-                        }
-                        _ => {}
-                    }
-                }
-
-                // General application
-                let arity = items.len() - 1;
-                if is_tail {
-                    if let Some(ref fname) = self.fn_name {
-                        if let Expr::Symbol(hname) = &items[0] {
-                            if hname == fname && arity == self.arity {
-                                for i in 1..items.len() {
-                                    self.compile(&items[i], code, false)?;
-                                }
-                                for i in (1..items.len()).rev() {
-                                    code.push(Opcode::Store((i - 1) as u8));
-                                }
-                                code.push(Opcode::Jump(0));
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-                for i in 1..items.len() {
-                    self.compile(&items[i], code, false)?;
-                }
-                self.compile(&items[0], code, false)?;
-                code.push(Opcode::Call(arity as u8));
-            }
-        }
-        Ok(())
-    }
-}
-
-fn collect_pattern_vars(expr: &Expr, set: &mut Vec<String>) {
-    match expr {
-        Expr::Symbol(s) if s.starts_with('$') => {
-            if !set.contains(s) {
-                set.push(s.clone());
-            }
-        }
-        Expr::List(items) => {
-            for item in items.iter() {
-                collect_pattern_vars(item, set);
-            }
-        }
-        _ => {}
-    }
-}
 
 pub fn run_vm(
     mut state: VMState,
@@ -566,7 +188,7 @@ pub fn run_vm(
                                 FunctionKind::Native { func: native_f } => {
                                     let mut buf = Vec::new();
                                     let mut results = Vec::new();
-                                    super::apply::cartesian_product_apply::<String>(&arg_sets, &mut buf, &mut |slice: &[Atom]| {
+                                    super::super::apply::cartesian_product_apply::<String>(&arg_sets, &mut buf, &mut |slice: &[Atom]| {
                                         let res = native_f(slice, funcs)?;
                                         results.extend(res.into_iter());
                                         Ok(())
@@ -576,13 +198,13 @@ pub fn run_vm(
                             }
                         } else {
                             // User function call lookup
-                            let combos = super::apply::threaded_combinations(&arg_sets);
+                            let combos = super::super::apply::threaded_combinations(&arg_sets);
                             let mut results = Vec::new();
                             if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(name, *arity, funcs) {
                                 for (combo, combo_env) in combos {
                                     for (patterns, body) in &clauses {
                                         if let Some((body_env, subst_cost)) = crate::eval::forms::query::match_clause(patterns, &combo, &combo_env, funcs) {
-                                            let mut comp = VMCompiler::new(patterns, Some(name.to_string()));
+                                            let mut comp = super::compiler::VMCompiler::new(patterns, Some(name.to_string()));
                                             let mut code = Vec::new();
                                             if comp.compile(body, &mut code, true).is_ok() {
                                                 // Debit structural budget cost prior to body evaluation
@@ -618,7 +240,7 @@ pub fn run_vm(
                                                     }
                                                     state.budget = Some(b - total_cost);
                                                 }
-                                                let body_rs = super::step::run_rs(Arc::new(body.clone()), body_env, funcs, &mut state.budget)?;
+                                                let body_rs = super::super::step::run_rs(Arc::new(body.clone()), body_env, funcs, &mut state.budget)?;
                                                 results.extend(body_rs);
                                             }
                                         }
@@ -652,7 +274,7 @@ pub fn run_vm(
                     _ => {
                         let mut sets = vec![head_rs];
                         sets.extend(arg_sets);
-                        let combos = super::apply::threaded_combinations(&sets);
+                        let combos = super::super::apply::threaded_combinations(&sets);
                         let mut lists = Vec::new();
                         for (combo, combo_env) in combos {
                             let substituted: Vec<Atom> = combo
@@ -728,7 +350,7 @@ pub fn run_vm(
                     }
                     state.budget = Some(b - body_cost);
                 }
-                let res = super::step::run_rs(Arc::new(expr.clone()), current_env, funcs, &mut state.budget)?;
+                let res = super::super::step::run_rs(Arc::new(expr.clone()), current_env, funcs, &mut state.budget)?;
                 state.stack.push(res);
                 state.ip += 1;
             }
@@ -800,7 +422,7 @@ pub fn run_vm(
                             (expr, env.clone())
                         }
                     };
-                    let mut comp = VMCompiler::new(&[], None);
+                    let mut comp = super::compiler::VMCompiler::new(&[], None);
                     let mut code = Vec::new();
                     if comp.compile(&target_expr, &mut code, false).is_ok() {
                         let sub_state = VMState::new_with_parent(
@@ -814,7 +436,7 @@ pub fn run_vm(
                         state.budget = sub_budget;
                         results.extend(res);
                     } else {
-                        let res = super::step::run_rs(Arc::new(target_expr), target_env, funcs, &mut state.budget)?;
+                        let res = super::super::step::run_rs(Arc::new(target_expr), target_env, funcs, &mut state.budget)?;
                         results.extend(res);
                     }
                 }
@@ -955,4 +577,20 @@ pub fn run_vm(
         })
         .collect();
     Ok((prepended_rs, state.budget))
+}
+
+fn collect_pattern_vars(expr: &Expr, set: &mut Vec<String>) {
+    match expr {
+        Expr::Symbol(s) if s.starts_with('$') => {
+            if !set.contains(s) {
+                set.push(s.clone());
+            }
+        }
+        Expr::List(items) => {
+            for item in items.iter() {
+                collect_pattern_vars(item, set);
+            }
+        }
+        _ => {}
+    }
 }
