@@ -258,8 +258,64 @@ impl VMCompiler {
                             self.compile_let_star(bindings, 0, &items[2], code, is_tail)?;
                             return Ok(());
                         }
+                        "foldall" if items.len() == 4 => {
+                            // ponytail: foldall aggregates values from generator over initial value
+                            self.compile(&items[2], code, false)?;
+                            self.compile(&items[3], code, false)?;
+                            self.compile(&items[1], code, false)?;
+                            code.push(Opcode::Foldall);
+                            return Ok(());
+                        }
+                        "forall" if items.len() == 3 => {
+                            // ponytail: forall checks if all values of generator satisfy condition
+                            self.compile(&items[1], code, false)?;
+                            self.compile(&items[2], code, false)?;
+                            code.push(Opcode::Forall);
+                            return Ok(());
+                        }
+                        "foldl-atom" if items.len() == 4 => {
+                            // ponytail: foldl-atom Form 1 (with accumulator function)
+                            self.compile(&items[1], code, false)?;
+                            self.compile(&items[2], code, false)?;
+                            self.compile(&items[3], code, false)?;
+                            code.push(Opcode::Foldl);
+                            return Ok(());
+                        }
+                        "foldl-atom" if items.len() >= 5 => {
+                            // ponytail: foldl-atom Form 2 (with variable names and body expression)
+                            self.compile(&items[1], code, false)?;
+                            self.compile(&items[2], code, false)?;
+                            let mut var_names = Vec::new();
+                            for item in &items[3..items.len() - 1] {
+                                match item {
+                                    Expr::Symbol(s) => var_names.push(s.clone()),
+                                    _ => return Err("foldl-atom: expected variable symbol".into()),
+                                }
+                            }
+                            let mut body_comp = VMCompiler {
+                                locals: self.locals.clone(),
+                                free_vars: self.free_vars.clone(),
+                                fn_name: self.fn_name.clone(),
+                                arity: self.arity,
+                            };
+                            body_comp.locals.extend(var_names.clone());
+                            let mut body_code = Vec::new();
+                            body_comp.compile(&items[items.len() - 1], &mut body_code, false)?;
+
+                            for v in &body_comp.free_vars {
+                                if !self.free_vars.contains(v) {
+                                    self.free_vars.push(v.clone());
+                                }
+                            }
+                            code.push(Opcode::FoldlLambda {
+                                var_names,
+                                body_code,
+                                free_vars_map: body_comp.free_vars,
+                            });
+                            return Ok(());
+                        }
                         // For any other special keyword/construct (e.g. once, etc.), fallback to EvalCEK
-                        "once" | "progn" | "prog1" | "chain" | "add-atom" | "remove-atom" => {
+                        "|->" | "map-atom" | "filter-atom" | "within" | "once" | "progn" | "prog1" | "chain" | "add-atom" | "remove-atom" => {
                             code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
                             return Ok(());
                         }

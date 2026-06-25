@@ -48,8 +48,16 @@ pub(crate) fn run_rs(
     let mut comp = super::vm::VMCompiler::new(&[], None);
     let mut code = Vec::new();
     if comp.compile(&root, &mut code, false).is_ok() {
-        let state = super::vm::VMState::new(code, comp.free_vars, *budget);
-        match super::vm::run_vm(state, funcs, &root_env) {
+        let state = super::vm::VMState::new(code, comp.free_vars.clone(), *budget);
+        let mut sub_env = root_env.clone();
+        for (i, name) in comp.free_vars.iter().enumerate() {
+            if let Some(val) = root_env.get(name) {
+                if let crate::atom::Atom::Sym(fresh_name) = &state.free_vars_bindings[i] {
+                    sub_env = sub_env.extend(fresh_name, val.clone());
+                }
+            }
+        }
+        match super::vm::run_vm(state, funcs, &sub_env) {
             Ok((rs, sub_budget, _cut_executed)) => {
                 *budget = sub_budget;
                 return Ok(rs);

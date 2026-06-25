@@ -56,4 +56,12 @@ pub enum Opcode {
         pattern_vars: Vec<String>,
         free_vars_map: Vec<String>,
     },
+    Foldall,
+    Forall,
+    Foldl,
+    FoldlLambda {
+        var_names: Vec<String>,
+        body_code: Vec<Opcode>,
+        free_vars_map: Vec<String>,
+    },
 }

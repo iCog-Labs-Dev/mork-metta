@@ -275,6 +275,48 @@ pub fn run_vm(
                             state.stack.push(results);
                         }
                     }
+                    Atom::Closure(ref c) => {
+                        // ponytail: apply anonymous closure by matching arguments and running the body in sub-VM
+                        let clauses: Vec<(Vec<Expr>, Expr)> = vec![(c.params.clone(), c.body.clone())];
+                        let combos_with_envs = super::super::apply::threaded_combinations(&arg_sets);
+                        let mut results = Vec::new();
+                        for (combo, combo_env) in combos_with_envs {
+                            for (patterns, body) in &clauses {
+                                if let Some((body_env, _subst_cost)) = crate::eval::forms::query::match_clause(patterns, &combo, &combo_env, funcs) {
+                                    let body = crate::eval::shared::fresh::rename_apart_unbound_vars(
+                                        body,
+                                        patterns,
+                                    );
+                                    let mut comp = super::compiler::VMCompiler::new(patterns, None);
+                                    let mut code = Vec::new();
+                                    if comp.compile(&body, &mut code, false).is_ok() {
+                                        let mut sub_state = VMState::new_with_parent(
+                                            code,
+                                            comp.free_vars,
+                                            state.budget,
+                                            &state.free_vars_map,
+                                            &state.free_vars_bindings,
+                                        );
+                                        for var in &comp.locals {
+                                            let val = body_env.get(var).unwrap_or(Atom::sym("()"));
+                                            sub_state.locals.push((val, Env::new()));
+                                        }
+                                        let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &body_env)?;
+                                        state.budget = sub_budget;
+                                        results.extend(res);
+                                        if cut_executed {
+                                            state.cut_executed = true;
+                                            break;
+                                        }
+                                    } else {
+                                        let body_rs = super::super::step::run_rs(Arc::new(body), body_env, funcs, &mut state.budget)?;
+                                        results.extend(body_rs);
+                                    }
+                                }
+                            }
+                        }
+                        state.stack.push(results);
+                    }
                     _ => {
                         let mut sets = vec![head_rs];
                         sets.extend(arg_sets);
@@ -659,6 +701,183 @@ pub fn run_vm(
                 }
                 state.ip += 1;
             }
+            Opcode::Foldall => {
+                // ponytail: Foldall pops agg-func, init, and generator, then loops using eval_call_vm
+                let agg_rs = state.stack.pop().ok_or("VM stack underflow on Foldall agg-func")?;
+                let init_rs = state.stack.pop().ok_or("VM stack underflow on Foldall init")?;
+                let gen_rs = state.stack.pop().ok_or("VM stack underflow on Foldall generator")?;
+
+                let agg_atom = agg_rs.into_iter().next().map(|(a, _)| a)
+                    .ok_or_else(|| "foldall: agg-func produced no value".to_string())?;
+                let init_atom = init_rs.into_iter().next().map(|(a, _)| a)
+                    .ok_or_else(|| "foldall: init produced no result".to_string())?;
+                let gen_values: Vec<Atom> = gen_rs.into_iter().map(|(a, _)| a).collect();
+
+                let (agg_head, agg_env) = match &agg_atom {
+                    Atom::Sym(name) => {
+                        (Expr::Symbol(name.to_string()), base_env.clone())
+                    }
+                    Atom::Closure(_) => {
+                        (Expr::Symbol("$__foldall_fn".to_string()),
+                         crate::eval::shared::env::bind(base_env, "$__foldall_fn", agg_atom.clone()))
+                    }
+                    _ => return Err("foldall: agg-func must be a function symbol or closure".to_string()),
+                };
+
+                let mut accum = init_atom;
+                for val in gen_values {
+                    let acc_expr = crate::parser::atom_to_expr(&accum)?;
+                    let val_expr = crate::parser::atom_to_expr(&val)?;
+                    let res = eval_call_vm(
+                        agg_head.clone(),
+                        vec![acc_expr, val_expr],
+                        &agg_env,
+                        funcs,
+                        &mut state.budget,
+                        &state.free_vars_map,
+                        &state.free_vars_bindings,
+                    )?;
+                    accum = res.into_iter().next().map(|(a, _)| a)
+                        .ok_or_else(|| "foldall: agg-func produced no result".to_string())?;
+                }
+                state.stack.push(plain(vec![accum]));
+                state.ip += 1;
+            }
+            Opcode::Forall => {
+                // ponytail: Forall pops check-expr and generator, then verifies truthiness for all values
+                let check_rs = state.stack.pop().ok_or("VM stack underflow on Forall check")?;
+                let gen_rs = state.stack.pop().ok_or("VM stack underflow on Forall generator")?;
+
+                let check_atom = check_rs.into_iter().next().map(|(a, _)| a)
+                    .ok_or_else(|| "forall: check produced no value".to_string())?;
+                let gen_values: Vec<Atom> = gen_rs.into_iter().map(|(a, _)| a).collect();
+
+                let check_head = match &check_atom {
+                    Atom::Sym(name) => Expr::Symbol(name.to_string()),
+                    Atom::Closure(_) => Expr::Symbol("$__check_fn".to_string()),
+                    _ => return Err("forall: check must be a function symbol or closure".to_string()),
+                };
+
+                let mut is_forall_true = true;
+                for val in gen_values {
+                    let mut call_env = crate::eval::shared::env::bind(base_env, "$__fv", val);
+                    if let Atom::Closure(_) = &check_atom {
+                        let check_env = crate::eval::shared::env::bind(base_env, "$__check_fn", check_atom.clone());
+                        call_env = crate::eval::shared::pattern::prepend_env(check_env, &call_env);
+                    }
+                    let res = eval_call_vm(
+                        check_head.clone(),
+                        vec![Expr::Symbol("$__fv".to_string())],
+                        &call_env,
+                        funcs,
+                        &mut state.budget,
+                        &state.free_vars_map,
+                        &state.free_vars_bindings,
+                    )?;
+                    let results: Vec<Atom> = res.into_iter().map(|(a, _)| a).collect();
+                    if results.is_empty() || !results.iter().all(|a| crate::eval::forms::control::is_truthy(a)) {
+                        is_forall_true = false;
+                        break;
+                    }
+                }
+                let final_atom = if is_forall_true { Atom::sym("true") } else { Atom::sym("false") };
+                state.stack.push(plain(vec![final_atom]));
+                state.ip += 1;
+            }
+            Opcode::Foldl => {
+                // ponytail: Foldl pops func, acc, and list, and folds dynamically
+                let func_rs = state.stack.pop().ok_or("VM stack underflow on Foldl func")?;
+                let acc_rs = state.stack.pop().ok_or("VM stack underflow on Foldl acc")?;
+                let list_rs = state.stack.pop().ok_or("VM stack underflow on Foldl list")?;
+
+                let func = func_rs.into_iter().next().map(|(a, _)| a)
+                    .ok_or_else(|| "foldl-atom: func arg produced no result".to_string())?;
+                let acc = acc_rs.into_iter().next().map(|(a, _)| a)
+                    .ok_or_else(|| "foldl-atom: acc arg produced no result".to_string())?;
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                    Some(Atom::Expr(v)) => v.to_vec(),
+                    Some(other) => vec![other],
+                    None => return Err("foldl-atom: list arg produced no result".to_string()),
+                };
+
+                let mut current_acc = acc;
+                let func_head = match &func {
+                    Atom::Sym(name) => Expr::Symbol(name.to_string()),
+                    _ => crate::parser::atom_to_expr(&func)
+                        .unwrap_or_else(|_| Expr::Symbol(func.to_sexpr_string())),
+                };
+                for item in items {
+                    let acc_expr = crate::parser::atom_to_expr(&current_acc)
+                        .unwrap_or_else(|_| Expr::Symbol(current_acc.to_sexpr_string()));
+                    let item_expr = crate::parser::atom_to_expr(&item)
+                        .unwrap_or_else(|_| Expr::Symbol(item.to_sexpr_string()));
+                    let res = eval_call_vm(
+                        func_head.clone(),
+                        vec![acc_expr, item_expr],
+                        &Env::new(),
+                        funcs,
+                        &mut state.budget,
+                        &state.free_vars_map,
+                        &state.free_vars_bindings,
+                    )?;
+                    current_acc = res.into_iter().next().map(|(a, _)| a).unwrap_or(current_acc);
+                }
+                state.stack.push(plain(vec![current_acc]));
+                state.ip += 1;
+            }
+            Opcode::FoldlLambda {
+                var_names,
+                body_code,
+                free_vars_map,
+            } => {
+                // ponytail: FoldlLambda aggregates list elements using a precompiled lambda body code for high performance
+                let acc_rs = state.stack.pop().ok_or("VM stack underflow on FoldlLambda acc")?;
+                let list_rs = state.stack.pop().ok_or("VM stack underflow on FoldlLambda list")?;
+
+                let acc = acc_rs.into_iter().next().map(|(a, _)| a)
+                    .ok_or_else(|| "foldl-atom: acc arg produced no result".to_string())?;
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                    Some(Atom::Expr(v)) => v.to_vec(),
+                    Some(other) => vec![other],
+                    None => return Err("foldl-atom: list arg produced no result".to_string()),
+                };
+
+                let mut current_acc = acc;
+                for elem in items {
+                    let mut sub_state = VMState::new_with_parent(
+                        body_code.clone(),
+                        free_vars_map.clone(),
+                        state.budget,
+                        &state.free_vars_map,
+                        &state.free_vars_bindings,
+                    );
+                    for val in &state.locals {
+                        sub_state.locals.push(val.clone());
+                    }
+                    let vals_to_bind = [current_acc.clone(), elem];
+                    for (var, val) in var_names.iter().zip(vals_to_bind.iter()) {
+                        sub_state.locals.push((val.clone(), Env::new()));
+                    }
+                    if var_names.len() > vals_to_bind.len() {
+                        for _ in vals_to_bind.len()..var_names.len() {
+                            sub_state.locals.push((Atom::sym("()"), Env::new()));
+                        }
+                    }
+                    let mut step_env = base_env.clone();
+                    for (var, val) in var_names.iter().zip(vals_to_bind.iter()) {
+                        step_env = step_env.extend(var, val.clone());
+                    }
+                    let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &step_env)?;
+                    state.budget = sub_budget;
+                    current_acc = res.into_iter().next().map(|(a, _)| a).unwrap_or(current_acc);
+                    if cut_executed {
+                        state.cut_executed = true;
+                        break;
+                    }
+                }
+                state.stack.push(plain(vec![current_acc]));
+                state.ip += 1;
+            }
         }
     }
 
@@ -687,5 +906,43 @@ fn collect_pattern_vars(expr: &Expr, set: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+fn eval_call_vm(
+    head: Expr,
+    args: Vec<Expr>,
+    env: &Env,
+    funcs: &FnTable,
+    budget: &mut Option<i64>,
+    free_vars_map: &[String],
+    free_vars_bindings: &[Atom],
+) -> Result<ResultSet, String> {
+    let call = Expr::List(Arc::from(
+        std::iter::once(head).chain(args.into_iter()).collect::<Vec<_>>()
+    ));
+    let mut comp = super::compiler::VMCompiler::new(&[], None);
+    let mut code = Vec::new();
+    if comp.compile(&call, &mut code, false).is_ok() {
+        let sub_state = VMState::new_with_parent(
+            code,
+            comp.free_vars.clone(),
+            *budget,
+            free_vars_map,
+            free_vars_bindings,
+        );
+        let mut sub_env = env.clone();
+        for (i, name) in comp.free_vars.iter().enumerate() {
+            if let Some(val) = env.get(name) {
+                if let Atom::Sym(fresh_name) = &sub_state.free_vars_bindings[i] {
+                    sub_env = sub_env.extend(fresh_name, val.clone());
+                }
+            }
+        }
+        let (res, sub_budget, _) = run_vm(sub_state, funcs, &sub_env)?;
+        *budget = sub_budget;
+        Ok(res)
+    } else {
+        crate::eval::machine::step::run_rs(Arc::new(call), env.clone(), funcs, budget)
     }
 }
