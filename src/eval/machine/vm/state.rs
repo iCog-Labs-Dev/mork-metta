@@ -4,6 +4,7 @@ use crate::eval::shared::fresh;
 use crate::eval::machine::budget::{ResultSet, plain};
 use super::op::Opcode;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub struct CallFrame {
     pub return_ip: usize,
@@ -12,7 +13,7 @@ pub struct CallFrame {
 }
 
 pub struct VMState {
-    pub code: Vec<Opcode>,
+    pub code: Arc<[Opcode]>,
     pub ip: usize,
     pub stack: Vec<ResultSet>,
     pub locals: Vec<(Atom, Env)>,
@@ -24,7 +25,7 @@ pub struct VMState {
 }
 
 impl VMState {
-    pub fn new(code: Vec<Opcode>, free_vars_map: Vec<String>, budget: Option<i64>) -> Self {
+    pub fn new(code: Arc<[Opcode]>, free_vars_map: Vec<String>, budget: Option<i64>) -> Self {
         let free_vars_bindings = free_vars_map
             .iter()
             .map(|name| {
@@ -53,7 +54,7 @@ impl VMState {
     }
 
     pub fn new_with_parent(
-        code: Vec<Opcode>,
+        code: Arc<[Opcode]>,
         free_vars_map: Vec<String>,
         budget: Option<i64>,
         parent_map: &[String],

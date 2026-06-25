@@ -48,7 +48,7 @@ pub(crate) fn run_rs(
     let mut comp = super::vm::VMCompiler::new(&[], None);
     let mut code = Vec::new();
     comp.compile(&root, &mut code, false)?;
-    let state = super::vm::VMState::new(code, comp.free_vars.clone(), *budget);
+    let state = super::vm::VMState::new(std::sync::Arc::from(code), comp.free_vars.clone(), *budget);
     let mut sub_env = root_env.clone();
     for (i, name) in comp.free_vars.iter().enumerate() {
         if let Some(val) = root_env.get(name) {
@@ -57,7 +57,7 @@ pub(crate) fn run_rs(
             }
         }
     }
-    let (rs, sub_budget, _cut_executed) = super::vm::run_vm(state, funcs, &sub_env)?;
+    let (rs, sub_budget, _) = super::vm::run_vm(state, funcs, &sub_env)?;
     *budget = sub_budget;
     Ok(rs)
 }

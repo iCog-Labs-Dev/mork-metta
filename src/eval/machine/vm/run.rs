@@ -3,7 +3,7 @@ use crate::env::Env;
 use crate::parser::Expr;
 use crate::func::{FnTable, FunctionKind};
 use crate::eval::machine::budget::{ResultSet, plain};
-use super::op::Opcode;
+use super::op::{Opcode, VmExit};
 use super::state::VMState;
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 /// Cached compilation of a user-defined function clause body.
 #[derive(Clone)]
 struct CompiledClause {
-    body_code: Vec<Opcode>,
+    body_code: std::sync::Arc<[Opcode]>,
     free_vars: Vec<String>,
     locals: Vec<String>,
 }
@@ -47,9 +47,18 @@ pub fn run_vm(
     mut state: VMState,
     funcs: &FnTable,
     base_env: &Env,
-) -> Result<(ResultSet, Option<i64>, bool), String> {
+) -> Result<(ResultSet, Option<i64>, VmExit), String> {
     let _guard = VmDepthGuard::enter();
-    let debug_vm = std::env::var_os("MORK_DEBUG_VM").is_some();
+    static DEBUG_VM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let debug_vm = match DEBUG_VM.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let val = std::env::var_os("MORK_DEBUG_VM").is_some();
+            DEBUG_VM.store(if val { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+            val
+        }
+        1 => false,
+        _ => true,
+    };
     if debug_vm {
         eprintln!("--- VM CODE ---");
         for (i, op) in state.code.iter().enumerate() {
@@ -266,7 +275,7 @@ pub fn run_vm(
                                             let mut code = Vec::new();
                                             comp.compile(b, &mut code, true)?;
                                             compiled.push(CompiledClause {
-                                                body_code: code,
+                                                body_code: std::sync::Arc::from(code),
                                                 free_vars: comp.free_vars,
                                                 locals: comp.locals,
                                             });
@@ -287,23 +296,38 @@ pub fn run_vm(
                                                 }
                                                 state.budget = Some(b - total_cost);
                                             }
-                                            let mut sub_state = VMState::new_with_parent(
-                                                clause.body_code.clone(),
-                                                clause.free_vars.clone(),
-                                                state.budget,
-                                                &state.free_vars_map,
-                                                &state.free_vars_bindings,
-                                            );
+                                            let mut current_locals = Vec::with_capacity(clause.locals.len());
                                             for var in &clause.locals {
                                                 let val = body_env.get(var).unwrap_or(Atom::sym("()"));
-                                                sub_state.locals.push((val, Env::new()));
+                                                current_locals.push((val, Env::new()));
                                             }
-                                            let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &body_env)?;
-                                            state.budget = sub_budget;
-                                            results.extend(res);
-                                            if cut_executed {
-                                                state.cut_executed = true;
-                                                break 'combos_loop;
+                                            loop {
+                                                let mut sub_state = VMState::new_with_parent(
+                                                    clause.body_code.clone(),
+                                                    clause.free_vars.clone(),
+                                                    state.budget,
+                                                    &state.free_vars_map,
+                                                    &state.free_vars_bindings,
+                                                );
+                                                sub_state.locals = current_locals.clone();
+                                                let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &body_env)?;
+                                                state.budget = sub_budget;
+                                                match exit_status {
+                                                    VmExit::TailCall(mut new_locals) => {
+                                                        // ponytail: catch self-recursive tail call, update local parameters, and loop back.
+                                                        new_locals.truncate(clause.locals.len());
+                                                        current_locals = new_locals;
+                                                    }
+                                                    VmExit::Cut => {
+                                                        results.extend(res);
+                                                        state.cut_executed = true;
+                                                        break 'combos_loop;
+                                                    }
+                                                    VmExit::Normal => {
+                                                        results.extend(res);
+                                                        break;
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -348,7 +372,7 @@ pub fn run_vm(
                                     let mut code = Vec::new();
                                     comp.compile(&body, &mut code, false)?;
                                     let mut sub_state = VMState::new_with_parent(
-                                        code,
+                                        std::sync::Arc::from(code),
                                         comp.free_vars,
                                         state.budget,
                                         &state.free_vars_map,
@@ -358,13 +382,19 @@ pub fn run_vm(
                                         let val = body_env.get(var).unwrap_or(Atom::sym("()"));
                                         sub_state.locals.push((val, Env::new()));
                                     }
-                                    let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &body_env)?;
-                                    state.budget = sub_budget;
-                                    results.extend(res);
-                                    if cut_executed {
-                                        state.cut_executed = true;
-                                        break 'combos_loop;
-                                    }
+                                     let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &body_env)?;
+                                     state.budget = sub_budget;
+                                     results.extend(res);
+                                     match exit_status {
+                                         VmExit::Cut => {
+                                             state.cut_executed = true;
+                                             break 'combos_loop;
+                                         }
+                                         VmExit::TailCall(new_locals) => {
+                                             return Ok((results, state.budget, VmExit::TailCall(new_locals)));
+                                         }
+                                         VmExit::Normal => {}
+                                     }
                                 }
                             }
                         }
@@ -542,12 +572,18 @@ pub fn run_vm(
                             }
                             
                             let sub_env = crate::eval::shared::env::bind_all(&match_env, &matched.bindings);
-                            let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &sub_env)?;
+                            let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &sub_env)?;
                             state.budget = sub_budget;
                             results.extend(res);
-                            if cut_executed {
-                                state.cut_executed = true;
-                                break;
+                            match exit_status {
+                                VmExit::Cut => {
+                                    state.cut_executed = true;
+                                    break;
+                                }
+                                VmExit::TailCall(new_locals) => {
+                                    return Ok((results, state.budget, VmExit::TailCall(new_locals)));
+                                }
+                                VmExit::Normal => {}
                             }
                         }
                     }
@@ -572,18 +608,24 @@ pub fn run_vm(
                     let mut code = Vec::new();
                     if comp.compile(&target_expr, &mut code, false).is_ok() {
                         let sub_state = VMState::new_with_parent(
-                            code,
+                            std::sync::Arc::from(code),
                             comp.free_vars,
                             state.budget,
                             &state.free_vars_map,
                             &state.free_vars_bindings,
                         );
-                        let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &target_env)?;
+                        let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &target_env)?;
                         state.budget = sub_budget;
                         results.extend(res);
-                        if cut_executed {
-                            state.cut_executed = true;
-                            break;
+                        match exit_status {
+                            VmExit::Cut => {
+                                state.cut_executed = true;
+                                break;
+                            }
+                            VmExit::TailCall(new_locals) => {
+                                return Ok((results, state.budget, VmExit::TailCall(new_locals)));
+                            }
+                            VmExit::Normal => {}
                         }
                     } else {
                         let res = super::super::step::run_rs(Arc::new(target_expr), target_env, funcs, &mut state.budget)?;
@@ -623,12 +665,18 @@ pub fn run_vm(
                         base_env.clone()
                     };
                     
-                    let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &branch_env)?;
+                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &branch_env)?;
                     state.budget = sub_budget;
                     results.extend(res);
-                    if cut_executed {
-                        state.cut_executed = true;
-                        break;
+                    match exit_status {
+                        VmExit::Cut => {
+                            state.cut_executed = true;
+                            break;
+                        }
+                        VmExit::TailCall(new_locals) => {
+                            return Ok((results, state.budget, VmExit::TailCall(new_locals)));
+                        }
+                        VmExit::Normal => {}
                     }
                 }
                 let final_results = if had_nondet_truthy && results.len() > 1 {
@@ -674,12 +722,18 @@ pub fn run_vm(
                             let bound = body_env.get(var).unwrap_or(Atom::sym("()"));
                             sub_state.locals.push((bound, Env::new()));
                         }
-                        let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &body_env)?;
+                        let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &body_env)?;
                         state.budget = sub_budget;
                         results.extend(res);
-                        if cut_executed {
-                            state.cut_executed = true;
-                            break;
+                        match exit_status {
+                            VmExit::Cut => {
+                                state.cut_executed = true;
+                                break;
+                            }
+                            VmExit::TailCall(new_locals) => {
+                                return Ok((results, state.budget, VmExit::TailCall(new_locals)));
+                            }
+                            VmExit::Normal => {}
                         }
                     } else {
                         crate::eval::shared::debug::logical_failure(|| {
@@ -713,12 +767,18 @@ pub fn run_vm(
                             }
                             let mut run_state = sub_state;
                             run_state.locals = sub_locals;
-                            let (res, sub_budget, cut_executed) = run_vm(run_state, funcs, base_env)?;
+                            let (res, sub_budget, exit_status) = run_vm(run_state, funcs, base_env)?;
                             state.budget = sub_budget;
                             state.stack.push(res);
                             evaluated = true;
-                            if cut_executed {
-                                state.cut_executed = true;
+                            match exit_status {
+                                VmExit::Cut => {
+                                    state.cut_executed = true;
+                                }
+                                VmExit::TailCall(new_locals) => {
+                                    return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
+                                }
+                                VmExit::Normal => {}
                             }
                             break;
                         }
@@ -764,12 +824,18 @@ pub fn run_vm(
                                 let bound = body_env.get(var).unwrap_or(Atom::sym("()"));
                                 sub_state.locals.push((bound, Env::new()));
                             }
-                            let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &body_env)?;
+                            let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &body_env)?;
                             state.budget = sub_budget;
                             results.extend(res);
-                            if cut_executed {
-                                state.cut_executed = true;
-                                break;
+                            match exit_status {
+                                VmExit::Cut => {
+                                    state.cut_executed = true;
+                                    break;
+                                }
+                                VmExit::TailCall(new_locals) => {
+                                    return Ok((results, state.budget, VmExit::TailCall(new_locals)));
+                                }
+                                VmExit::Normal => {}
                             }
                         } else {
                             return Err(format!(
@@ -948,12 +1014,18 @@ pub fn run_vm(
                     for (var, val) in var_names.iter().zip(vals_to_bind.iter()) {
                         step_env = step_env.extend(var, val.clone());
                     }
-                    let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &step_env)?;
+                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &step_env)?;
                     state.budget = sub_budget;
                     current_acc = res.into_iter().next().map(|(a, _)| a).unwrap_or(current_acc);
-                    if cut_executed {
-                        state.cut_executed = true;
-                        break;
+                    match exit_status {
+                        VmExit::Cut => {
+                            state.cut_executed = true;
+                            break;
+                        }
+                        VmExit::TailCall(new_locals) => {
+                            return Ok((plain(vec![current_acc]), state.budget, VmExit::TailCall(new_locals)));
+                        }
+                        VmExit::Normal => {}
                     }
                 }
                 state.stack.push(plain(vec![current_acc]));
@@ -987,15 +1059,21 @@ pub fn run_vm(
                     sub_state.locals.push((elem.clone(), Env::new()));
                     
                     let sub_env = base_env.extend(&var_name, elem.clone());
-                    let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &sub_env)?;
+                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &sub_env)?;
                     state.budget = sub_budget;
                     
                     if let Some((val, _)) = res.into_iter().next() {
                         mapped_results.push(val);
                     }
-                    if cut_executed {
-                        state.cut_executed = true;
-                        break;
+                    match exit_status {
+                        VmExit::Cut => {
+                            state.cut_executed = true;
+                            break;
+                        }
+                        VmExit::TailCall(new_locals) => {
+                            return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(mapped_results))]), state.budget, VmExit::TailCall(new_locals)));
+                        }
+                        VmExit::Normal => {}
                     }
                 }
                 state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(mapped_results))]));
@@ -1029,16 +1107,22 @@ pub fn run_vm(
                     sub_state.locals.push((elem.clone(), Env::new()));
                     
                     let sub_env = base_env.extend(&var_name, elem.clone());
-                    let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &sub_env)?;
+                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &sub_env)?;
                     state.budget = sub_budget;
                     
                     let is_true = res.into_iter().next().map(|(a, _)| a.is_truthy()).unwrap_or(false);
                     if is_true {
                         filtered_results.push(elem);
                     }
-                    if cut_executed {
-                        state.cut_executed = true;
-                        break;
+                    match exit_status {
+                        VmExit::Cut => {
+                            state.cut_executed = true;
+                            break;
+                        }
+                        VmExit::TailCall(new_locals) => {
+                            return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(filtered_results))]), state.budget, VmExit::TailCall(new_locals)));
+                        }
+                        VmExit::Normal => {}
                     }
                 }
                 state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(filtered_results))]));
@@ -1048,9 +1132,20 @@ pub fn run_vm(
                 // ponytail: run body, take only the first result
                 let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
                 for val in &state.locals { sub_state.locals.push(val.clone()); }
-                let (res, sub_budget, _) = run_vm(sub_state, funcs, base_env)?;
+                let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, base_env)?;
                 state.budget = sub_budget;
-                state.stack.push(res.into_iter().take(1).collect());
+                match exit_status {
+                    VmExit::TailCall(new_locals) => {
+                        return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
+                    }
+                    VmExit::Cut => {
+                        state.stack.push(res.into_iter().take(1).collect());
+                        state.cut_executed = true;
+                    }
+                    VmExit::Normal => {
+                        state.stack.push(res.into_iter().take(1).collect());
+                    }
+                }
                 state.ip += 1;
             }
             Opcode::Progn { bodies, free_vars_map } => {
@@ -1059,9 +1154,21 @@ pub fn run_vm(
                 for body_code in bodies {
                     let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
                     for val in &state.locals { sub_state.locals.push(val.clone()); }
-                    let (res, sub_budget, _) = run_vm(sub_state, funcs, base_env)?;
+                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, base_env)?;
                     state.budget = sub_budget;
-                    last = res;
+                    match exit_status {
+                        VmExit::TailCall(new_locals) => {
+                            return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
+                        }
+                        VmExit::Cut => {
+                            last = res;
+                            state.cut_executed = true;
+                            break;
+                        }
+                        VmExit::Normal => {
+                            last = res;
+                        }
+                    }
                 }
                 state.stack.push(last);
                 state.ip += 1;
@@ -1072,9 +1179,21 @@ pub fn run_vm(
                 for (i, body_code) in bodies.iter().enumerate() {
                     let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
                     for val in &state.locals { sub_state.locals.push(val.clone()); }
-                    let (res, sub_budget, _) = run_vm(sub_state, funcs, base_env)?;
+                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, base_env)?;
                     state.budget = sub_budget;
-                    if i == 0 { first = res; }
+                    match exit_status {
+                        VmExit::TailCall(new_locals) => {
+                            return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
+                        }
+                        VmExit::Cut => {
+                            if i == 0 { first = res; }
+                            state.cut_executed = true;
+                            break;
+                        }
+                        VmExit::Normal => {
+                            if i == 0 { first = res; }
+                        }
+                    }
                 }
                 state.stack.push(first);
                 state.ip += 1;
@@ -1084,10 +1203,22 @@ pub fn run_vm(
                 for (step_code, var_name) in steps.iter() {
                     let mut sub_state = VMState::new_with_parent(step_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
                     for val in &state.locals { sub_state.locals.push(val.clone()); }
-                    let (res, sub_budget, _) = run_vm(sub_state, funcs, base_env)?;
+                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, base_env)?;
                     state.budget = sub_budget;
-                    let val: Atom = res.into_iter().next().map(|(a, _)| a)
-                        .ok_or_else(|| format!("chain: expression for {} produced no result", var_name))?;
+                    
+                    let val: Atom = match exit_status {
+                        VmExit::TailCall(new_locals) => {
+                            return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
+                        }
+                        VmExit::Cut => {
+                            state.cut_executed = true;
+                            res.into_iter().next().map(|(a, _)| a)
+                        }
+                        VmExit::Normal => {
+                            res.into_iter().next().map(|(a, _)| a)
+                        }
+                    }.ok_or_else(|| format!("chain: expression for {} produced no result", var_name))?;
+                    
                     // Inject into parent so subsequent steps and final body inherit the binding
                     if let Some(pos) = state.free_vars_map.iter().position(|x| x == var_name) {
                         state.free_vars_bindings[pos] = val;
@@ -1095,12 +1226,28 @@ pub fn run_vm(
                         state.free_vars_map.push(var_name.clone());
                         state.free_vars_bindings.push(val);
                     }
+                    if state.cut_executed { break; }
                 }
-                let mut sub_state = VMState::new_with_parent(final_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
-                for val in &state.locals { sub_state.locals.push(val.clone()); }
-                let (res, sub_budget, _) = run_vm(sub_state, funcs, base_env)?;
-                state.budget = sub_budget;
-                state.stack.push(res);
+                if !state.cut_executed {
+                    let mut sub_state = VMState::new_with_parent(final_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                    for val in &state.locals { sub_state.locals.push(val.clone()); }
+                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, base_env)?;
+                    state.budget = sub_budget;
+                    match exit_status {
+                        VmExit::TailCall(new_locals) => {
+                            return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
+                        }
+                        VmExit::Cut => {
+                            state.cut_executed = true;
+                            state.stack.push(res);
+                        }
+                        VmExit::Normal => {
+                            state.stack.push(res);
+                        }
+                    }
+                } else {
+                    state.stack.push(Vec::new());
+                }
                 state.ip += 1;
             }
             Opcode::Within { body_code, free_vars_map } => {
@@ -1113,8 +1260,17 @@ pub fn run_vm(
                     &state.free_vars_bindings,
                 );
                 for val in &state.locals { sub_state.locals.push(val.clone()); }
-                let (res, sub_budget, _) = run_vm(sub_state, funcs, base_env)?;
+                let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, base_env)?;
                 state.budget = sub_budget;
+                match exit_status {
+                    VmExit::TailCall(new_locals) => {
+                        return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
+                    }
+                    VmExit::Cut => {
+                        state.cut_executed = true;
+                    }
+                    VmExit::Normal => {}
+                }
                 let atoms: Vec<Atom> = res.into_iter().map(|(a, _)| a).collect();
                 if atoms.is_empty() {
                     return Err("within: expression produced no results".into());
@@ -1140,8 +1296,17 @@ pub fn run_vm(
                 let result = crate::space::mutate::with_named_mutex(&mutex_name, || {
                     run_vm(sub_state, funcs, base_env)
                 })?;
-                let (res, sub_budget, _) = result;
+                let (res, sub_budget, exit_status) = result;
                 state.budget = sub_budget;
+                match exit_status {
+                    VmExit::TailCall(new_locals) => {
+                        return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
+                    }
+                    VmExit::Cut => {
+                        state.cut_executed = true;
+                    }
+                    VmExit::Normal => {}
+                }
                 state.stack.push(res);
                 state.ip += 1;
             }
@@ -1157,8 +1322,19 @@ pub fn run_vm(
                 );
                 for val in &state.locals { sub_state.locals.push(val.clone()); }
                 match run_vm(sub_state, funcs, base_env) {
-                    Ok((res, sub_budget, _)) => {
+                    Ok((res, sub_budget, exit_status)) => {
                         state.budget = sub_budget;
+                        match exit_status {
+                            VmExit::TailCall(new_locals) => {
+                                crate::space::mutate::restore_transaction_state(snapshot, funcs)
+                                    .map_err(|e| format!("transaction: rollback failed: {e}"))?;
+                                return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
+                            }
+                            VmExit::Cut => {
+                                state.cut_executed = true;
+                            }
+                            VmExit::Normal => {}
+                        }
                         if res.is_empty() {
                             crate::space::mutate::restore_transaction_state(snapshot, funcs)
                                 .map_err(|e| format!("transaction: rollback failed: {e}"))?;
@@ -1217,6 +1393,10 @@ pub fn run_vm(
                 state.stack.push(plain(atoms));
                 state.ip += 1;
             }
+            Opcode::TailCallSelf => {
+                // ponytail: self-recursive tail call. Return VmExit::TailCall with the updated locals.
+                return Ok((plain(Vec::new()), state.budget, VmExit::TailCall(state.locals)));
+            }
         }
     }
 
@@ -1228,8 +1408,9 @@ pub fn run_vm(
             (atom, merged)
         })
         .collect();
-    // ponytail: cut flag is propagated using the 3rd tuple element of run_vm return value to prune loops recursively.
-    Ok((prepended_rs, state.budget, state.cut_executed))
+    // ponytail: exit flag is propagated using the VmExit enum.
+    let exit = if state.cut_executed { VmExit::Cut } else { VmExit::Normal };
+    Ok((prepended_rs, state.budget, exit))
 }
 
 fn collect_pattern_vars(expr: &Expr, set: &mut Vec<String>) {
@@ -1264,7 +1445,7 @@ fn eval_call_vm(
     let mut code = Vec::new();
     if comp.compile(&call, &mut code, false).is_ok() {
         let sub_state = VMState::new_with_parent(
-            code,
+            std::sync::Arc::from(code),
             comp.free_vars.clone(),
             *budget,
             free_vars_map,
