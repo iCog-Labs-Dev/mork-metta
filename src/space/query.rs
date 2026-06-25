@@ -41,6 +41,36 @@ fn merge_match_bindings(
     Some(merged)
 }
 
+fn subst_pattern(pattern: &Pattern, env: &Env) -> Pattern {
+    match pattern {
+        Pattern::Var(name) => {
+            if let Some(atom) = crate::eval::shared::env::lookup(env, name) {
+                match &atom {
+                    Atom::Sym(s) if s.starts_with('$') => Pattern::Var(s.to_string()),
+                    _ => Pattern::Exact(atom.clone()),
+                }
+            } else {
+                pattern.clone()
+            }
+        }
+        Pattern::Expr(items) => {
+            let inner: Vec<Pattern> = items.iter().map(|item| subst_pattern(item, env)).collect();
+            Pattern::Expr(inner)
+        }
+        _ => pattern.clone(),
+    }
+}
+
+fn collect_match_results_pattern(
+    funcs: &FnTable,
+    space_ref: &Atom,
+    pattern: &Pattern,
+    env: &Env,
+) -> Result<Vec<MatchResult>, String> {
+    let substituted = subst_pattern(pattern, env);
+    match_in_space(funcs, space_ref, &substituted)
+}
+
 /// Collect all matches for a surface pattern in a resolved space.
 pub fn collect_match_results(
     funcs: &FnTable,
@@ -64,19 +94,22 @@ pub fn collect_match_results(
                 // tasks with significant work per task (the full remaining conjunction).
                 // RwLock on space allows concurrent readers.
                 let remaining = &subpatterns[1..];
+                let remaining_compiled: Vec<Pattern> = remaining.iter().map(pattern_from_expr).collect();
+
                 let results: Vec<Vec<(Arc<str>, Arc<Atom>)>> = if !remaining.is_empty()
                     && initial_bindings.len() > 1
+                    && initial_bindings.len() < 1000
                 {
                     initial_bindings
                         .par_iter()
                         .map(|seed| -> Result<Vec<Vec<(Arc<str>, Arc<Atom>)>>, String> {
                             let mut bindings_sets = vec![seed.clone()];
-                            for subpattern in remaining {
+                            for subpattern in &remaining_compiled {
                                 let mut next = Vec::new();
                                 for bindings in &bindings_sets {
                                     let bound_env =
                                         crate::eval::shared::env::bind_all(env, bindings);
-                                    let submatches = collect_match_results(
+                                    let submatches = collect_match_results_pattern(
                                         funcs, space_ref, subpattern, &bound_env,
                                     )?;
                                     for matched in &submatches {
@@ -101,12 +134,12 @@ pub fn collect_match_results(
                 } else {
                     // Single initial binding or no remaining subpatterns: serial.
                     let mut bindings_sets = initial_bindings;
-                    for subpattern in remaining {
+                    for subpattern in &remaining_compiled {
                         let mut next = Vec::new();
                         for bindings in &bindings_sets {
                             let bound_env = crate::eval::shared::env::bind_all(env, bindings);
                             let submatches =
-                                collect_match_results(funcs, space_ref, subpattern, &bound_env)?;
+                                collect_match_results_pattern(funcs, space_ref, subpattern, &bound_env)?;
                             for matched in &submatches {
                                 if let Some(merged) =
                                     merge_match_bindings(bindings, &matched.bindings)
