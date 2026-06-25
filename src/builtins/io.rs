@@ -14,19 +14,12 @@ pub fn register_io_builtins(funcs: &FnTable) {
 
     funcs.insert_native("parse", 1, |args, _| {
         crate::builtins::arithmetic::expect_n_args(args, 1, "parse")?;
-        let text = crate::eval::shared::value::expect_sym(&args[0])?;
-        let expr = if let Some(rest) = text.strip_prefix('(') {
-            let body = format!("({rest}");
-            crate::parser::parse_sexpr_body(&mut body.chars().peekable())?
-        } else {
-            let forms = crate::parser::parse_forms(text)?;
-            match forms.into_iter().next() {
-                Some(crate::parser::TopForm::Runnable(expr)) => expr,
-                Some(crate::parser::TopForm::Definition(expr)) => expr,
-                None => return Err("parse: expected non-empty input".to_string()),
-            }
+        let text = match &args[0] {
+            Atom::Sym(s) => s.as_ref(),
+            Atom::Str(s) => s.as_ref(),
+            other => return Err(format!("parse: expected symbol or string, got {}", other.to_sexpr_string())),
         };
-        Ok(NDet::single(crate::parser::expr_to_atom(&expr)))
+        Ok(NDet::single(parse_single_expr(text)?))
     });
     funcs.mark_pure("parse", 1);
 
@@ -53,54 +46,32 @@ pub fn register_io_builtins(funcs: &FnTable) {
 
     funcs.insert_native("sread", 1, |args, _| {
         crate::builtins::arithmetic::expect_n_args(args, 1, "sread")?;
-        let input = match &args[0] {
-            Atom::Sym(s) => s.to_string(),
-            other => other.to_sexpr_string(),
+        let text = match &args[0] {
+            Atom::Sym(s) => s.as_ref(),
+            Atom::Str(s) => s.as_ref(),
+            other => return Err(format!("sread: expected symbol or string, got {}", other.to_sexpr_string())),
         };
-        Ok(NDet::single(sread_parse(&input)?))
+        Ok(NDet::single(parse_single_expr(text)?))
     });
     funcs.mark_pure("sread", 1);
 }
 
-fn sread_parse(input: &str) -> Result<Atom, String> {
-    let input = input.trim();
-    if input.is_empty() {
-        return Err("sread: empty input".into());
+// ponytail: wrap in parens to leverage parse_sexpr_body for single expression parsing
+fn parse_single_expr(input: &str) -> Result<Atom, String> {
+    let trimmed = input.trim();
+    let body = format!("({trimmed})");
+    let mut chars = body.chars().peekable();
+    if chars.next() != Some('(') {
+        return Err("parse: internal error".to_string());
     }
-    if input.starts_with('(') && input.ends_with(')') {
-        let inner = input[1..input.len() - 1].trim();
-        if inner.is_empty() {
-            return Ok(Atom::Expr(crate::atom::expr_data([])));
-        }
-        let mut items = Vec::new();
-        let mut depth = 0i32;
-        let mut start = 0usize;
-        let bytes = inner.as_bytes();
-        for i in 0..bytes.len() {
-            match bytes[i] {
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                b' ' | b'\t' | b'\n' => {
-                    if depth == 0 && i > start {
-                        items.push(sread_parse(&inner[start..i])?);
-                        start = i + 1;
-                    } else if depth == 0 {
-                        start = i + 1;
-                    }
-                }
-                _ => {}
+    let parsed = crate::parser::parse_sexpr_body(&mut chars)?;
+    match parsed {
+        crate::parser::Expr::List(items) => {
+            if items.is_empty() {
+                return Err("parse: expected non-empty input".to_string());
             }
+            Ok(crate::parser::expr_to_atom(&items[0]))
         }
-        if start < inner.len() {
-            let token = inner[start..].trim();
-            if !token.is_empty() {
-                items.push(sread_parse(token)?);
-            }
-        }
-        return Ok(Atom::Expr(crate::atom::expr_data(items)));
+        other => Ok(crate::parser::expr_to_atom(&other)),
     }
-    if let Ok(n) = input.parse::<i128>() {
-        return Ok(Atom::num(n));
-    }
-    Ok(Atom::sym(input))
 }
