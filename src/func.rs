@@ -212,6 +212,17 @@ impl FnTable {
             .map_or(false, |inner| inner.contains_key(&arity))
     }
 
+    pub fn has_greater_arity(&self, name: &str, arity: u8) -> bool {
+        // ponytail: check if function is registered with any arity greater than current arity
+        if self.map.read().unwrap().get(name).map_or(false, |inner| inner.keys().any(|&k| k > arity)) {
+            return true;
+        }
+        if self.fn_cache.read().unwrap().get(name).map_or(false, |inner| inner.keys().any(|&k| k > arity)) {
+            return true;
+        }
+        false
+    }
+
     pub fn is_registered(&self, name: &str) -> bool {
         self.map.read().unwrap().contains_key(name) || self.fn_cache.read().unwrap().contains_key(name)
     }

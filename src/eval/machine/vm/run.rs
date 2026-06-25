@@ -613,165 +613,29 @@ pub fn run_vm(
                 let mut pending_calls = Vec::new();
                 let mut results = Vec::new();
                 
+                let mut call_memo_key = None;
                 for (combo, combo_env) in &full_combos {
                     if combo.is_empty() { continue; }
                     let head_atom = &combo[0];
                     let args = &combo[1..];
                     
-                    match head_atom {
-                        Atom::Sym(fn_name) => {
-                            if let Some(function) = funcs.get(fn_name, *arity) {
-                                match &function.kind {
-                                    FunctionKind::Native { func: native_f } => {
-                                        let _profile = if cfg!(feature = "profile") {
-                                            Some(crate::profile::ProfileGuard::new_owned(fn_name))
-                                        } else {
-                                            None
-                                        };
-                                        let res = native_f(args, funcs)?;
-                                        for a in res {
-                                            results.push((a, combo_env.clone()));
-                                        }
-                                        continue;
-                                    }
-                                }
-                            }
-                            
-                            let memo_key = if full_combos.len() == 1 && funcs.is_pure_fn(fn_name, *arity) {
-                                let k = (fn_name.to_string(), args.to_vec());
-                                if let Some(cached) = funcs.memo_get(&k) {
-                                    results.extend(cached.into_iter().map(|a| (a, combo_env.clone())));
-                                    continue;
-                                }
-                                Some(k)
-                            } else {
-                                None
-                            };
-                            
-                            let mut matched_any = false;
-                            if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(fn_name, *arity, funcs) {
-                                let cache_key = (fn_name.to_string(), *arity);
-                                let cached = FN_BYTECODE_CACHE.with(|cache_ref| {
-                                    let mut cache = cache_ref.borrow_mut();
-                                    if let Some(entry) = cache.get(&cache_key) {
-                                        return Ok::<_, String>(entry.clone());
-                                    }
-                                    let mut compiled = Vec::with_capacity(clauses.len());
-                                    for (pat, b) in &clauses {
-                                        let mut comp = super::compiler::VMCompiler::new(pat, Some(fn_name.to_string()));
-                                        let mut code = Vec::new();
-                                        comp.compile(b, &mut code, true)?;
-                                        compiled.push(CompiledClause {
-                                            body_code: std::sync::Arc::from(code),
-                                            free_vars: comp.free_vars,
-                                            locals: comp.locals,
-                                        });
-                                    }
-                                    cache.insert(cache_key, compiled.clone());
-                                    Ok(compiled)
-                                })?;
-                                
-                                for (i, (patterns, body)) in clauses.iter().enumerate() {
-                                    if let Some((body_env, subst_cost)) = crate::eval::forms::query::match_clause(patterns, args, combo_env, funcs) {
-                                        matched_any = true;
-                                        let clause = &cached[i];
-                                        let body_cost = crate::eval::machine::budget::calculate_expr_cost(body);
-                                        let total_cost = subst_cost + body_cost;
-                                        
-                                        let mut locals_to_push = Vec::with_capacity(clause.locals.len());
-                                        for var in &clause.locals {
-                                            let val = body_env.get(var).unwrap_or(Atom::sym("()"));
-                                            locals_to_push.push((val, Env::new()));
-                                        }
-                                        
-                                        pending_calls.push(super::state::PendingCall {
-                                            body_code: clause.body_code.clone(),
-                                            free_vars: clause.free_vars.clone(),
-                                            body_env,
-                                            locals_to_push,
-                                            cost: total_cost,
-                                        });
-                                    }
-                                }
-                            }
-                            
-                            if !matched_any {
-                                let mut items = vec![Atom::sym(fn_name)];
-                                items.extend(args.to_vec());
-                                let substituted: Vec<Atom> = items
-                                    .iter()
-                                    .map(|a| crate::eval::shared::subst::subst_atom(a, combo_env))
-                                    .collect();
-                                results.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env.clone()));
-                            }
-                        }
-                        Atom::Closure(c) => {
-                            let mut matched_any = false;
-                            let clauses: Vec<(Vec<Expr>, Expr)> = vec![(c.params.clone(), c.body.clone())];
-                            for (patterns, body) in &clauses {
-                                if let Some((body_env, _subst_cost)) = crate::eval::forms::query::match_clause(patterns, args, combo_env, funcs) {
-                                    matched_any = true;
-                                    let body_renamed = crate::eval::shared::fresh::rename_apart_unbound_vars(
-                                        body,
-                                        patterns,
-                                    );
-                                    let mut comp = super::compiler::VMCompiler::new(patterns, None);
-                                    let mut code = Vec::new();
-                                    comp.compile(&body_renamed, &mut code, false)?;
-                                    
-                                    let mut locals_to_push = Vec::with_capacity(comp.locals.len());
-                                    for var in &comp.locals {
-                                        let val = body_env.get(var).unwrap_or(Atom::sym("()"));
-                                        locals_to_push.push((val, Env::new()));
-                                    }
-                                    
-                                    pending_calls.push(super::state::PendingCall {
-                                        body_code: std::sync::Arc::from(code),
-                                        free_vars: comp.free_vars,
-                                        body_env,
-                                        locals_to_push,
-                                        cost: 0,
-                                    });
-                                }
-                            }
-                            if !matched_any {
-                                let mut items = vec![head_atom.clone()];
-                                items.extend(args.to_vec());
-                                let substituted: Vec<Atom> = items
-                                    .iter()
-                                    .map(|a| crate::eval::shared::subst::subst_atom(a, combo_env))
-                                    .collect();
-                                results.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env.clone()));
-                            }
-                        }
-                        _ => {
-                            let mut items = vec![head_atom.clone()];
-                            items.extend(args.to_vec());
-                            let substituted: Vec<Atom> = items
-                                .iter()
-                                .map(|a| crate::eval::shared::subst::subst_atom(a, combo_env))
-                                .collect();
-                            results.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env.clone()));
-                        }
+                    let mut memo_key_out = None;
+                    dispatch_call(
+                        head_atom,
+                        args,
+                        *arity,
+                        combo_env,
+                        funcs,
+                        &mut results,
+                        &mut pending_calls,
+                        &mut memo_key_out,
+                    )?;
+                    if full_combos.len() == 1 {
+                        call_memo_key = memo_key_out;
                     }
                 }
                 
-                // Extract memo_key for the frame (only valid for single-combo pure calls).
-                let call_memo_key: Option<(String, Vec<Atom>)> = if full_combos.len() == 1 {
-                    let head = &full_combos[0].0[0];
-                    if let Atom::Sym(fn_name) = head {
-                        if funcs.is_pure_fn(fn_name, *arity) {
-                            Some((fn_name.to_string(), full_combos[0].0[1..].to_vec()))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                // Ponytail: skip frame when no pending calls (native functions fully resolved).
+                // Ponytail: skip frame when no pending calls (native functions / partial applications fully resolved).
                 // Pushing an empty frame and immediately popping it would restore an empty
                 // saved_locals, clearing the function's actual state.locals.
                 if pending_calls.is_empty() {
@@ -2149,6 +2013,194 @@ fn eval_call_vm(
     } else {
         crate::eval::machine::step::run_rs(Arc::new(call), env.clone(), funcs, budget)
     }
+}
+
+fn dispatch_call(
+    head_atom: &Atom,
+    args: &[Atom],
+    arity: u8,
+    combo_env: &Env,
+    funcs: &FnTable,
+    results: &mut Vec<(Atom, Env)>,
+    pending_calls: &mut Vec<super::state::PendingCall>,
+    memo_key_out: &mut Option<(String, Vec<Atom>)>,
+) -> Result<(), String> {
+    // ponytail: recursively resolve and evaluate function calls and partial applications (currying)
+    match head_atom {
+        Atom::Sym(fn_name) => {
+            if let Some(function) = funcs.get(fn_name, arity) {
+                match &function.kind {
+                    FunctionKind::Native { func: native_f } => {
+                        let _profile = if cfg!(feature = "profile") {
+                            Some(crate::profile::ProfileGuard::new_owned(fn_name))
+                        } else {
+                            None
+                        };
+                        let res = native_f(args, funcs)?;
+                        for a in res {
+                            results.push((a, combo_env.clone()));
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+
+            // ponytail: retrieve cached result if user function is pure and already computed
+            if funcs.is_pure_fn(fn_name, arity) {
+                let k = (fn_name.to_string(), args.to_vec());
+                if let Some(cached) = funcs.memo_get(&k) {
+                    results.extend(cached.into_iter().map(|a| (a, combo_env.clone())));
+                    return Ok(());
+                }
+                *memo_key_out = Some(k);
+            }
+
+            let mut matched_any = false;
+            if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(fn_name, arity, funcs) {
+                let cache_key = (fn_name.to_string(), arity);
+                let cached = FN_BYTECODE_CACHE.with(|cache_ref| {
+                    let mut cache = cache_ref.borrow_mut();
+                    if let Some(entry) = cache.get(&cache_key) {
+                        return Ok::<_, String>(entry.clone());
+                    }
+                    let mut compiled = Vec::with_capacity(clauses.len());
+                    for (pat, b) in &clauses {
+                        let mut comp = super::compiler::VMCompiler::new(pat, Some(fn_name.to_string()));
+                        let mut code = Vec::new();
+                        comp.compile(b, &mut code, true)?;
+                        compiled.push(CompiledClause {
+                            body_code: std::sync::Arc::from(code),
+                            free_vars: comp.free_vars,
+                            locals: comp.locals,
+                        });
+                    }
+                    cache.insert(cache_key, compiled.clone());
+                    Ok(compiled)
+                })?;
+
+                for (i, (patterns, body)) in clauses.iter().enumerate() {
+                    if let Some((body_env, subst_cost)) = crate::eval::forms::query::match_clause(patterns, args, combo_env, funcs) {
+                        matched_any = true;
+                        let clause = &cached[i];
+                        let body_cost = crate::eval::machine::budget::calculate_expr_cost(body);
+                        let total_cost = subst_cost + body_cost;
+
+                        let mut locals_to_push = Vec::with_capacity(clause.locals.len());
+                        for var in &clause.locals {
+                            let val = body_env.get(var).unwrap_or(Atom::sym("()"));
+                            locals_to_push.push((val, Env::new()));
+                        }
+
+                        pending_calls.push(super::state::PendingCall {
+                            body_code: clause.body_code.clone(),
+                            free_vars: clause.free_vars.clone(),
+                            body_env,
+                            locals_to_push,
+                            cost: total_cost,
+                        });
+                    }
+                }
+            }
+
+            if !matched_any {
+                if funcs.has_greater_arity(fn_name, arity) {
+                    let partial_atom = Atom::Expr(crate::atom::expr_data(vec![
+                        Atom::sym("partial"),
+                        head_atom.clone(),
+                        Atom::Expr(crate::atom::expr_data(args.to_vec())),
+                    ]));
+                    results.push((partial_atom, combo_env.clone()));
+                } else {
+                    let mut items = vec![Atom::sym(fn_name)];
+                    items.extend(args.to_vec());
+                    let substituted: Vec<Atom> = items
+                        .iter()
+                        .map(|a| crate::eval::shared::subst::subst_atom(a, combo_env))
+                        .collect();
+                    results.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env.clone()));
+                }
+            }
+        }
+        Atom::Closure(c) => {
+            let mut matched_any = false;
+            let clauses: Vec<(Vec<Expr>, Expr)> = vec![(c.params.clone(), c.body.clone())];
+            for (patterns, body) in &clauses {
+                if let Some((body_env, _subst_cost)) = crate::eval::forms::query::match_clause(patterns, args, combo_env, funcs) {
+                    matched_any = true;
+                    let body_renamed = crate::eval::shared::fresh::rename_apart_unbound_vars(
+                        body,
+                        patterns,
+                    );
+                    let mut comp = super::compiler::VMCompiler::new(patterns, None);
+                    let mut code = Vec::new();
+                    comp.compile(&body_renamed, &mut code, false)?;
+
+                    let mut locals_to_push = Vec::with_capacity(comp.locals.len());
+                    for var in &comp.locals {
+                        let val = body_env.get(var).unwrap_or(Atom::sym("()"));
+                        locals_to_push.push((val, Env::new()));
+                    }
+
+                    pending_calls.push(super::state::PendingCall {
+                        body_code: std::sync::Arc::from(code),
+                        free_vars: comp.free_vars,
+                        body_env,
+                        locals_to_push,
+                        cost: 0,
+                    });
+                }
+            }
+            if !matched_any {
+                let params_len = c.params.len();
+                if (arity as usize) < params_len {
+                    let partial_atom = Atom::Expr(crate::atom::expr_data(vec![
+                        Atom::sym("partial"),
+                        head_atom.clone(),
+                        Atom::Expr(crate::atom::expr_data(args.to_vec())),
+                    ]));
+                    results.push((partial_atom, combo_env.clone()));
+                } else {
+                    let mut items = vec![head_atom.clone()];
+                    items.extend(args.to_vec());
+                    let substituted: Vec<Atom> = items
+                        .iter()
+                        .map(|a| crate::eval::shared::subst::subst_atom(a, combo_env))
+                        .collect();
+                    results.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env.clone()));
+                }
+            }
+        }
+        Atom::Expr(parts) if parts.len() == 3 && parts[0] == Atom::sym("partial") => {
+            let inner_head = &parts[1];
+            let old_args: Vec<Atom> = match &parts[2] {
+                Atom::Expr(v) => v.to_vec(),
+                other => vec![other.clone()],
+            };
+            let mut combined_args = old_args;
+            combined_args.extend(args.to_vec());
+            let combined_arity = combined_args.len() as u8;
+            dispatch_call(
+                inner_head,
+                &combined_args,
+                combined_arity,
+                combo_env,
+                funcs,
+                results,
+                pending_calls,
+                memo_key_out,
+            )?;
+        }
+        _ => {
+            let mut items = vec![head_atom.clone()];
+            items.extend(args.to_vec());
+            let substituted: Vec<Atom> = items
+                .iter()
+                .map(|a| crate::eval::shared::subst::subst_atom(a, combo_env))
+                .collect();
+            results.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env.clone()));
+        }
+    }
+    Ok(())
 }
 
 /// ponytail: Run the next iteration of the Let opcode in flat frame-based control flow.
