@@ -300,6 +300,41 @@ pub fn run_vm(
                         }
                         state.stack.push(results);
                     }
+                    Atom::Expr(ref items) if items.len() == 3 && items[0] == Atom::sym("partial") => {
+                        if let Atom::Sym(fn_name) = &items[1] {
+                            if let Atom::Expr(old_args) = &items[2] {
+                                let mut results = Vec::new();
+                                let mut buf = Vec::new();
+                                super::super::apply::cartesian_product_apply(&arg_sets, &mut buf, &mut |combo: &[Atom]| {
+                                    let mut all_args: Vec<Atom> = old_args.to_vec();
+                                    all_args.extend_from_slice(combo);
+                                    let fn_expr = crate::parser::atom_to_expr(&Atom::Sym(fn_name.clone()))
+                                        .unwrap_or(crate::parser::Expr::Symbol(fn_name.to_string()));
+                                    let mut call_items = vec![fn_expr];
+                                    for arg in &all_args {
+                                        call_items.push(
+                                            crate::parser::atom_to_expr(arg)
+                                                .unwrap_or(crate::parser::Expr::Symbol(arg.to_sexpr_string()))
+                                        );
+                                    }
+                                    let call_expr = crate::parser::Expr::List(call_items.into());
+                                    let body_rs = super::super::step::run_rs(
+                                        std::sync::Arc::new(call_expr),
+                                        crate::env::Env::new(),
+                                        funcs,
+                                        &mut state.budget,
+                                    )?;
+                                    results.extend(body_rs);
+                                    Ok::<(), String>(())
+                                })?;
+                                state.stack.push(results);
+                            } else {
+                                return Err("partial application second argument must be an expression of old arguments".into());
+                            }
+                        } else {
+                            return Err("partial application first argument must be a symbol (function name)".into());
+                        }
+                    }
                     _ => {
                         let mut sets = vec![head_rs];
                         sets.extend(arg_sets);

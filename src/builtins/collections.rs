@@ -275,6 +275,41 @@ pub fn register_collection_builtins(funcs: &FnTable) {
     });
     funcs.mark_pure("is-member", 2);
 
+    funcs.insert_native("member", 2, |args, _| {
+        expect(args, 2, "member")?;
+        let items = match &args[1] {
+            Atom::Expr(v) => v.to_vec(),
+            other => vec![other.clone()],
+        };
+        let mut results = Vec::new();
+        for item in &items {
+            if args[0] == *item || crate::eval::machine::state::unify(&args[0], item).is_some() {
+                results.push(Atom::sym("True"));
+            }
+        }
+        Ok(NDet::stream(results.into_iter()))
+    });
+    funcs.mark_pure("member", 2);
+
+    funcs.insert_native("is-alpha-member", 2, |args, _| {
+        expect(args, 2, "is-alpha-member")?;
+        let items = match &args[1] {
+            Atom::Expr(v) => v.to_vec(),
+            other => vec![other.clone()],
+        };
+        let mut found = false;
+        for item in &items {
+            let mut map_ab = std::collections::HashMap::new();
+            let mut map_ba = std::collections::HashMap::new();
+            if crate::builtins::arithmetic::alpha_equiv(&args[0], item, &mut map_ab, &mut map_ba) {
+                found = true;
+                break;
+            }
+        }
+        Ok(NDet::single(crate::builtins::boolean::bool_atom(found)))
+    });
+    funcs.mark_pure("is-alpha-member", 2);
+
     funcs.insert_native("exclude-item", 2, |args, _| {
         expect(args, 2, "exclude-item")?;
         match &args[1] {
