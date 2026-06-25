@@ -223,6 +223,7 @@ pub fn run_vm(
                 let full_combos = super::super::apply::threaded_combinations(&sets);
                 let mut results = Vec::new();
 
+                let combo_count = full_combos.len();
                 'combos_loop: for (combo, combo_env) in full_combos {
                     let head_atom = &combo[0];
                     let args = &combo[1..];
@@ -238,6 +239,18 @@ pub fn run_vm(
                                     }
                                 }
                             } else {
+                                // Memo: cache pure single-combo user function results
+                                let memo_key = if combo_count == 1 && funcs.is_pure_fn(name, *arity) {
+                                    let k = (name.to_string(), args.to_vec());
+                                    if let Some(cached) = funcs.memo_get(&k) {
+                                        results.extend(cached.into_iter().map(|a| (a, combo_env.clone())));
+                                        continue 'combos_loop;
+                                    }
+                                    Some(k)
+                                } else {
+                                    None
+                                };
+                                
                                 // User function call lookup with bytecode cache
                                 if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(name, *arity, funcs) {
                                     // Check or populate bytecode cache for this (name, arity)
@@ -312,6 +325,14 @@ pub fn run_vm(
                                         .map(|a| crate::eval::shared::subst::subst_atom(a, &combo_env))
                                         .collect();
                                     results.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env.clone()));
+                                }
+                                
+                                // Store memo for pure single-combo user functions
+                                if let Some(key) = memo_key {
+                                    let atoms: Vec<Atom> = results.iter().map(|(a, _)| a.clone()).collect();
+                                    if !atoms.is_empty() {
+                                        funcs.memo_set(key, atoms);
+                                    }
                                 }
                             }
                         }
