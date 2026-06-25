@@ -120,28 +120,8 @@ impl Env {
     /// - Variable name includes the `$` prefix, e.g. `"$x"`.
     pub fn get(&self, name: &str) -> Option<Atom> {
         let _profile = crate::profile::ProfileGuard::new("Env::get");
-        let env_ptr = Arc::as_ptr(&self.0) as usize;
-        let mut hash = env_ptr;
-        for b in name.bytes() {
-            hash = hash.wrapping_mul(31).wrapping_add(b as usize);
-        }
-        let idx = hash % CACHE_SIZE;
-
-        let cached = LOOKUP_CACHE.with(|c| {
-            let cache = c.borrow();
-            if let Some((ptr, ref n, ref val)) = cache[idx] {
-                if ptr == env_ptr && n == name {
-                    return Some(val.clone());
-                }
-            }
-            None
-        });
-
-        if let Some(val) = cached {
-            return val;
-        }
-
-        let val = match self.inner() {
+        // ponytail: lookup cache removed because of pointer reuse/cache invalidation bugs across recursive executions.
+        match self.inner() {
             EnvNode::Empty => None,
             EnvNode::Cons { name: n, value, next } => {
                 if &**n == name {
@@ -153,13 +133,7 @@ impl Env {
             EnvNode::Link { prefix, base } => {
                 prefix.get(name).or_else(|| base.get(name))
             }
-        };
-
-        LOOKUP_CACHE.with(|c| {
-            c.borrow_mut()[idx] = Some((env_ptr, name.to_string(), val.clone()));
-        });
-
-        val
+        }
     }
 
     /// Return a new environment with one additional binding prepended.

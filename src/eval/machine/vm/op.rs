@@ -34,6 +34,12 @@ pub enum Opcode {
     Cut,
     Println,
     Readln,
+    Let {
+        pattern: Expr,
+        body_code: Vec<Opcode>,
+        pattern_vars: Vec<String>,
+        free_vars_map: Vec<String>,
+    },
     If {
         then_code: Vec<Opcode>,
         else_code: Vec<Opcode>,

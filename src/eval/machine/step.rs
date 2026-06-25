@@ -60,6 +60,15 @@ pub(crate) fn run_rs(
         }
     }
 
+    run_rs_cek(root, root_env, funcs, budget)
+}
+
+pub(crate) fn run_rs_cek(
+    root: Arc<Expr>,
+    root_env: Env,
+    funcs: &FnTable,
+    budget: &mut Option<i64>,
+) -> Result<ResultSet, String> {
     // reuse vectors from thread-local pools to prevent the allocation storm of nested run_rs calls
     thread_local! {
         static WORK_POOL: std::cell::RefCell<Vec<Vec<super::task::Task>>> = const { std::cell::RefCell::new(Vec::new()) };

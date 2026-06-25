@@ -79,6 +79,16 @@ impl VMCompiler {
                             code.push(Opcode::Readln);
                             return Ok(());
                         }
+                        "eval" if items.len() == 2 => {
+                            self.compile(&items[1], code, false)?;
+                            code.push(Opcode::Eval);
+                            return Ok(());
+                        }
+                        "call" | "reduce" if items.len() == 2 => {
+                            // ponytail: call and reduce are compiled by directly compiling their argument as they have the same evaluation result.
+                            self.compile(&items[1], code, is_tail)?;
+                            return Ok(());
+                        }
                         "if" if items.len() == 3 || items.len() == 4 => {
                             self.compile(&items[1], code, false)?; // Compile condition
                             
@@ -210,8 +220,46 @@ impl VMCompiler {
                             }
                             return Ok(());
                         }
-                        // For any other special keyword/construct (e.g. let, let*, once, etc.), fallback to EvalCEK
-                        "let" | "let*" | "once" | "progn" | "prog1" | "chain" | "add-atom" | "remove-atom" => {
+                        "let" if items.len() == 4 => {
+                            // ponytail: Let matches value and binds pattern variables to locals before executing body
+                            self.compile(&items[2], code, false)?;
+                            let mut body_comp = VMCompiler {
+                                locals: self.locals.clone(),
+                                free_vars: self.free_vars.clone(),
+                                fn_name: self.fn_name.clone(),
+                                arity: self.arity,
+                            };
+                            let mut pattern_vars = Vec::new();
+                            collect_pattern_vars(&items[1], &mut pattern_vars);
+                            body_comp.locals.extend(pattern_vars.clone());
+
+                            let mut body_code = Vec::new();
+                            body_comp.compile(&items[3], &mut body_code, is_tail)?;
+
+                            for v in &body_comp.free_vars {
+                                if !self.free_vars.contains(v) {
+                                    self.free_vars.push(v.clone());
+                                }
+                            }
+                            code.push(Opcode::Let {
+                                pattern: items[1].clone(),
+                                body_code,
+                                pattern_vars,
+                                free_vars_map: body_comp.free_vars,
+                            });
+                            return Ok(());
+                        }
+                        "let*" if items.len() == 3 => {
+                            // ponytail: let* desugared into nested let instructions recursively
+                            let bindings = match &items[1] {
+                                Expr::List(b) => b,
+                                _ => return Err("let*: bindings must be a list".into()),
+                            };
+                            self.compile_let_star(bindings, 0, &items[2], code, is_tail)?;
+                            return Ok(());
+                        }
+                        // For any other special keyword/construct (e.g. once, etc.), fallback to EvalCEK
+                        "once" | "progn" | "prog1" | "chain" | "add-atom" | "remove-atom" => {
                             code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
                             return Ok(());
                         }
@@ -244,6 +292,50 @@ impl VMCompiler {
                 code.push(Opcode::Call(arity as u8));
             }
         }
+        Ok(())
+    }
+
+    fn compile_let_star(
+        &mut self,
+        bindings: &[Expr],
+        bind_idx: usize,
+        body: &Expr,
+        code: &mut Vec<Opcode>,
+        is_tail: bool,
+    ) -> Result<(), String> {
+        if bind_idx >= bindings.len() {
+            self.compile(body, code, is_tail)?;
+            return Ok(());
+        }
+        let (pattern, value_expr) = match &bindings[bind_idx] {
+            Expr::List(pair) if pair.len() == 2 => (&pair[0], &pair[1]),
+            _ => return Err("let*: each binding must be a list of 2 items".into()),
+        };
+        self.compile(value_expr, code, false)?;
+        let mut body_comp = VMCompiler {
+            locals: self.locals.clone(),
+            free_vars: self.free_vars.clone(),
+            fn_name: self.fn_name.clone(),
+            arity: self.arity,
+        };
+        let mut pattern_vars = Vec::new();
+        collect_pattern_vars(pattern, &mut pattern_vars);
+        body_comp.locals.extend(pattern_vars.clone());
+
+        let mut body_code = Vec::new();
+        body_comp.compile_let_star(bindings, bind_idx + 1, body, &mut body_code, is_tail)?;
+
+        for v in &body_comp.free_vars {
+            if !self.free_vars.contains(v) {
+                self.free_vars.push(v.clone());
+            }
+        }
+        code.push(Opcode::Let {
+            pattern: pattern.clone(),
+            body_code,
+            pattern_vars,
+            free_vars_map: body_comp.free_vars,
+        });
         Ok(())
     }
 }

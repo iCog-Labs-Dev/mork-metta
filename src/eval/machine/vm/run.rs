@@ -14,17 +14,17 @@ pub fn run_vm(
 ) -> Result<(ResultSet, Option<i64>, bool), String> {
     let debug_vm = std::env::var_os("MORK_DEBUG_VM").is_some();
     if debug_vm {
-        println!("--- VM CODE ---");
+        eprintln!("--- VM CODE ---");
         for (i, op) in state.code.iter().enumerate() {
-            println!("{:03}: {:?}", i, op);
+            eprintln!("{:03}: {:?}", i, op);
         }
-        println!("----------------");
+        eprintln!("----------------");
     }
 
     while state.ip < state.code.len() {
         let op = &state.code[state.ip];
         if debug_vm {
-            println!("IP: {:03} | OP: {:?} | STACK: {:?} | LOCALS: {:?}", state.ip, op, state.stack, state.locals);
+            eprintln!("IP: {:03} | OP: {:?} | STACK: {:?} | LOCALS: {:?}", state.ip, op, state.stack, state.locals);
         }
         match op {
             Opcode::Const(atom) => {
@@ -354,7 +354,7 @@ pub fn run_vm(
                     }
                     state.budget = Some(b - body_cost);
                 }
-                let res = super::super::step::run_rs(Arc::new(expr.clone()), current_env, funcs, &mut state.budget)?;
+                let res = super::super::step::run_rs_cek(Arc::new(expr.clone()), current_env, funcs, &mut state.budget)?;
                 state.stack.push(res);
                 state.ip += 1;
             }
@@ -518,6 +518,57 @@ pub fn run_vm(
                     results
                 };
                 state.stack.push(final_results);
+                state.ip += 1;
+            }
+            Opcode::Let {
+                pattern,
+                body_code,
+                pattern_vars,
+                free_vars_map,
+            } => {
+                // ponytail: Let match pops value, binds matching pattern variables to locals, and executes the body
+                let value_rs = state.stack.pop().ok_or("VM stack underflow on Let")?;
+                let mut results = Vec::new();
+                for (value, value_env) in &value_rs {
+                    if let Some(match_env) = crate::eval::shared::pattern::try_match_one(
+                        pattern,
+                        value,
+                        &Env::new(),
+                        funcs,
+                    )? {
+                        let body_env = crate::eval::shared::env::prepend_chain(match_env, value_env);
+                        let mut sub_state = VMState::new_with_parent(
+                            body_code.clone(),
+                            free_vars_map.clone(),
+                            state.budget,
+                            &state.free_vars_map,
+                            &state.free_vars_bindings,
+                        );
+                        for val in &state.locals {
+                            sub_state.locals.push(val.clone());
+                        }
+                        for var in pattern_vars {
+                            let bound = body_env.get(var).unwrap_or(Atom::sym("()"));
+                            sub_state.locals.push((bound, Env::new()));
+                        }
+                        let (res, sub_budget, cut_executed) = run_vm(sub_state, funcs, &body_env)?;
+                        state.budget = sub_budget;
+                        results.extend(res);
+                        if cut_executed {
+                            state.cut_executed = true;
+                            break;
+                        }
+                    } else {
+                        crate::eval::shared::debug::logical_failure(|| {
+                            format!(
+                                "warn: let pattern {} does not match value {}",
+                                pattern.to_string(),
+                                value.to_sexpr_string(),
+                            )
+                        });
+                    }
+                }
+                state.stack.push(results);
                 state.ip += 1;
             }
             Opcode::Case { branches, local_names } => {
