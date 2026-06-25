@@ -45,7 +45,6 @@ pub enum Opcode {
     Superpose(u8),
     SuperposeUnpack,
     Eval,
-    EvalCEK(Expr, Vec<String>), // Fallback to evaluate expression in CEK machine with local variable names
     Lambda {
         params: Vec<Expr>,
         body: Expr,
@@ -148,4 +147,18 @@ pub enum Opcode {
     /// Evaluates a `(py-call expr)` — raw expression tree, not evaluated args.
     /// Bypasses dispatch.rs string matching and CEK machine entirely.
     PyCall { expr: Expr },
+    PyEval { expr: Expr },
+    ImportDynamic,
+    MapAtomPatternLambda {
+        pattern: Expr,
+        body_code: Arc<[Opcode]>,
+        pattern_vars: Vec<String>,
+        free_vars_map: Vec<String>,
+    },
+    FilterAtomPatternLambda {
+        pattern: Expr,
+        body_code: Arc<[Opcode]>,
+        pattern_vars: Vec<String>,
+        free_vars_map: Vec<String>,
+    },
 }

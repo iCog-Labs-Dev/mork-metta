@@ -47,3 +47,33 @@ pub fn calculate_expr_cost(expr: &crate::parser::Expr) -> i64 {
         }
     }
 }
+
+pub(crate) fn threaded_combinations(sets: &[ResultSet]) -> Vec<(Vec<Atom>, Env)> {
+    // ponytail: fast path for all-singleton result sets (bypasses redundant environment merging and prefix cloning)
+    if sets.iter().all(|s| s.len() == 1) {
+        let mut atoms = Vec::with_capacity(sets.len());
+        let mut acc_env = Env::new();
+        for rs in sets {
+            let (atom, env) = &rs[0];
+            atoms.push(atom.clone());
+            acc_env = crate::eval::shared::pattern::prepend_env(env.clone(), &acc_env);
+        }
+        return vec![(atoms, acc_env)];
+    }
+
+    let mut combos = vec![(Vec::new(), Env::new())];
+    for rs in sets {
+        let mut next = Vec::new();
+        for (prefix, acc_env) in &combos {
+            for (atom, atom_env) in rs {
+                let mut atoms = prefix.clone();
+                atoms.push(atom.clone());
+                let merged = crate::eval::shared::pattern::prepend_env(atom_env.clone(), acc_env);
+                next.push((atoms, merged));
+            }
+        }
+        combos = next;
+    }
+    combos
+}
+

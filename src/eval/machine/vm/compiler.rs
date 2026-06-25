@@ -336,74 +336,80 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "map-atom" if items.len() == 4 => {
-                            // ponytail: map-atom Form 2 (with variable name and body expression).
-                            // Simple variable → optimized MapAtomLambda opcode.
-                            // Compound pattern → fallback to EvalCEK (CEK handles destructuring via try_match_one).
-                            match &items[2] {
-                                Expr::Symbol(var_name) => {
-                                    self.compile(&items[1], code, false)?;
-                                    let mut body_comp = VMCompiler {
-                                        locals: self.locals.clone(),
-                                        free_vars: self.free_vars.clone(),
-                                        fn_name: self.fn_name.clone(),
-                                        arity: self.arity,
-                                    };
-                                    body_comp.locals.push(var_name.clone());
-                                    let mut body_code = Vec::new();
-                                    body_comp.compile(&items[3], &mut body_code, false)?;
+                            // ponytail: map-atom Form 2 (with variable pattern and body expression).
+                            let mut pattern_vars = Vec::new();
+                            collect_pattern_vars(&items[2], &mut pattern_vars);
 
-                                    for v in &body_comp.free_vars {
-                                        if !self.free_vars.contains(v) {
-                                            self.free_vars.push(v.clone());
-                                        }
-                                    }
-                                    code.push(Opcode::MapAtomLambda {
-                                        var_name: var_name.clone(),
-                                        body_code: std::sync::Arc::from(body_code),
-                                        free_vars_map: body_comp.free_vars,
-                                    });
-                                    return Ok(());
-                                }
-                                _ => {
-                                    code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
-                                    return Ok(());
+                            self.compile(&items[1], code, false)?;
+                            let mut body_comp = VMCompiler {
+                                locals: self.locals.clone(),
+                                free_vars: self.free_vars.clone(),
+                                fn_name: self.fn_name.clone(),
+                                arity: self.arity,
+                            };
+                            body_comp.locals.extend(pattern_vars.clone());
+                            let mut body_code = Vec::new();
+                            body_comp.compile(&items[3], &mut body_code, false)?;
+
+                            for v in &body_comp.free_vars {
+                                if !self.free_vars.contains(v) {
+                                    self.free_vars.push(v.clone());
                                 }
                             }
+
+                            if let Expr::Symbol(var_name) = &items[2] {
+                                code.push(Opcode::MapAtomLambda {
+                                    var_name: var_name.clone(),
+                                    body_code: std::sync::Arc::from(body_code),
+                                    free_vars_map: body_comp.free_vars,
+                                });
+                            } else {
+                                code.push(Opcode::MapAtomPatternLambda {
+                                    pattern: items[2].clone(),
+                                    body_code: std::sync::Arc::from(body_code),
+                                    pattern_vars,
+                                    free_vars_map: body_comp.free_vars,
+                                });
+                            }
+                            return Ok(());
                         }
                         "filter-atom" if items.len() == 4 => {
-                            // ponytail: filter-atom Form 2 (with variable name and condition expression).
-                            // Simple variable → optimized FilterAtomLambda opcode.
-                            // Compound pattern → fallback to EvalCEK.
-                            match &items[2] {
-                                Expr::Symbol(var_name) => {
-                                    self.compile(&items[1], code, false)?;
-                                    let mut body_comp = VMCompiler {
-                                        locals: self.locals.clone(),
-                                        free_vars: self.free_vars.clone(),
-                                        fn_name: self.fn_name.clone(),
-                                        arity: self.arity,
-                                    };
-                                    body_comp.locals.push(var_name.clone());
-                                    let mut body_code = Vec::new();
-                                    body_comp.compile(&items[3], &mut body_code, false)?;
+                            // ponytail: filter-atom Form 2 (with variable pattern and condition expression).
+                            let mut pattern_vars = Vec::new();
+                            collect_pattern_vars(&items[2], &mut pattern_vars);
 
-                                    for v in &body_comp.free_vars {
-                                        if !self.free_vars.contains(v) {
-                                            self.free_vars.push(v.clone());
-                                        }
-                                    }
-                                    code.push(Opcode::FilterAtomLambda {
-                                        var_name: var_name.clone(),
-                                        body_code: std::sync::Arc::from(body_code),
-                                        free_vars_map: body_comp.free_vars,
-                                    });
-                                    return Ok(());
-                                }
-                                _ => {
-                                    code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
-                                    return Ok(());
+                            self.compile(&items[1], code, false)?;
+                            let mut body_comp = VMCompiler {
+                                locals: self.locals.clone(),
+                                free_vars: self.free_vars.clone(),
+                                fn_name: self.fn_name.clone(),
+                                arity: self.arity,
+                            };
+                            body_comp.locals.extend(pattern_vars.clone());
+                            let mut body_code = Vec::new();
+                            body_comp.compile(&items[3], &mut body_code, false)?;
+
+                            for v in &body_comp.free_vars {
+                                if !self.free_vars.contains(v) {
+                                    self.free_vars.push(v.clone());
                                 }
                             }
+
+                            if let Expr::Symbol(var_name) = &items[2] {
+                                code.push(Opcode::FilterAtomLambda {
+                                    var_name: var_name.clone(),
+                                    body_code: std::sync::Arc::from(body_code),
+                                    free_vars_map: body_comp.free_vars,
+                                });
+                            } else {
+                                code.push(Opcode::FilterAtomPatternLambda {
+                                    pattern: items[2].clone(),
+                                    body_code: std::sync::Arc::from(body_code),
+                                    pattern_vars,
+                                    free_vars_map: body_comp.free_vars,
+                                });
+                            }
+                            return Ok(());
                         }
                         // For any other special keyword/construct (e.g. once, etc.), fallback to EvalCEK
                         "once" if items.len() == 2 => {
@@ -561,8 +567,10 @@ impl VMCompiler {
                                 code.push(opcode);
                                 return Ok(());
                             }
-                            // Dynamic path — fallback to EvalCEK
-                            code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
+                            // Dynamic path — compile both args and run dynamically
+                            self.compile(&items[1], code, false)?; // evaluate space-ref
+                            self.compile(&items[2], code, false)?; // evaluate path
+                            code.push(Opcode::ImportDynamic);
                             return Ok(());
                         }
                         "add-atom" if items.len() == 3 => {
@@ -650,9 +658,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "py-eval" if items.len() == 2 => {
-                            // py-eval takes a Python code string; keep as CEK fallback (infrequent).
-                            // ponytail: not worth a dedicated opcode — rare in hot paths.
-                            code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
+                            code.push(Opcode::PyEval { expr: items[1].clone() });
                             return Ok(());
                         }
                         _ => {}

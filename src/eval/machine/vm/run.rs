@@ -436,8 +436,8 @@ pub fn run_vm(
                 // ponytail: thread the head results set as part of combos to preserve logic variable environment bindings
                 let mut sets = vec![head_rs];
                 sets.extend(arg_sets);
-                let full_combos = super::super::apply::threaded_combinations(&sets);
-                let mut results = Vec::new();
+                let full_combos = super::super::budget::threaded_combinations(&sets);
+                let mut results: ResultSet = Vec::new();
 
                 let combo_count = full_combos.len();
                 'combos_loop: for (combo, combo_env) in full_combos {
@@ -445,7 +445,7 @@ pub fn run_vm(
                     let args = &combo[1..];
                     match head_atom {
                         Atom::Sym(name) => {
-                            if let Some(function) = funcs.get(name, *arity) {
+                            if let Some(function) = funcs.get(&name, *arity) {
                                 match &function.kind {
                                     FunctionKind::Native { func: native_f } => {
                                         let res = native_f(args, funcs)?;
@@ -456,7 +456,7 @@ pub fn run_vm(
                                 }
                             } else {
                                 // Memo: cache pure single-combo user function results
-                                let memo_key = if combo_count == 1 && funcs.is_pure_fn(name, *arity) {
+                                let memo_key = if combo_count == 1 && funcs.is_pure_fn(&name, *arity) {
                                     let k = (name.to_string(), args.to_vec());
                                     if let Some(cached) = funcs.memo_get(&k) {
                                         results.extend(cached.into_iter().map(|a| (a, combo_env.clone())));
@@ -468,7 +468,7 @@ pub fn run_vm(
                                 };
                                 
                                 // User function call lookup with bytecode cache
-                                if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(name, *arity, funcs) {
+                                if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(&name, *arity, funcs) {
                                     // Check or populate bytecode cache for this (name, arity)
                                     let cache_key = (name.to_string(), *arity);
                                     let cached = FN_BYTECODE_CACHE.with(|cache_ref| {
@@ -546,7 +546,7 @@ pub fn run_vm(
                                         }
                                         break;
                                     }
-                                } else if funcs.has_higher_arity(name, *arity as usize) {
+                                } else if funcs.has_higher_arity(&name, *arity as usize) {
                                     results.push((
                                         Atom::Expr(crate::atom::expr_data([
                                             Atom::sym("partial"),
@@ -557,7 +557,7 @@ pub fn run_vm(
                                     ));
                                 } else {
                                     // Data constructor fallback
-                                    let mut items = vec![Atom::sym(name)];
+                                    let mut items = vec![Atom::sym(&name)];
                                     items.extend(args.to_vec());
                                     let substituted: Vec<Atom> = items
                                         .iter()
@@ -696,28 +696,6 @@ pub fn run_vm(
                 } else {
                     state.stack.push(Vec::new());
                 }
-                state.ip += 1;
-            }
-            Opcode::EvalCEK(expr, local_names) => {
-                // Reconstruct env from active local bindings
-                let mut current_env = base_env.clone();
-                for (i, name) in local_names.iter().enumerate() {
-                    if let Some((val, _val_env)) = state.locals.get(i) {
-                        current_env = crate::eval::shared::env::prepend_chain(
-                            crate::eval::shared::env::bind(&Env::new(), name, val.clone()),
-                            &current_env,
-                        );
-                    }
-                }
-                let body_cost = crate::eval::machine::budget::calculate_expr_cost(expr);
-                if let Some(b) = state.budget {
-                    if b <= body_cost {
-                        return Err("Budget exhausted".into());
-                    }
-                    state.budget = Some(b - body_cost);
-                }
-                let res = super::super::step::run_rs_cek(Arc::new(expr.clone()), current_env, funcs, &mut state.budget)?;
-                state.stack.push(res);
                 state.ip += 1;
             }
             Opcode::ConstEmpty => {
@@ -1606,6 +1584,205 @@ pub fn run_vm(
                 let result = crate::eval::python::eval_py_call(&[expr.clone()], base_env, funcs)?;
                 let atoms: Vec<Atom> = result.collect();
                 state.stack.push(plain(atoms));
+                state.ip += 1;
+            }
+            Opcode::PyEval { expr } => {
+                match crate::eval::python::eval_py_eval(&[expr.clone()], base_env, funcs) {
+                    Ok(nd) => {
+                        state.stack.push(plain(nd.collect()));
+                    }
+                    Err(e) => return Err(e),
+                }
+                state.ip += 1;
+            }
+            Opcode::ImportDynamic => {
+                let path_rs = state.stack.pop().ok_or("VM stack underflow on ImportDynamic path")?;
+                let space_rs = state.stack.pop().ok_or("VM stack underflow on ImportDynamic space")?;
+
+                let path = match path_rs.first().map(|(a, _)| a) {
+                    Some(Atom::Sym(s)) | Some(Atom::Str(s)) => s.clone(),
+                    Some(Atom::Expr(expr)) if expr.len() == 2 => {
+                        if let (Some(Atom::Sym(head)), Some(py_atom)) = (expr.get(0), expr.get(1)) {
+                            if head.as_ref() == "library" {
+                                match py_atom {
+                                    Atom::Sym(py) | Atom::Str(py) => py.clone(),
+                                    _ => return Err("import!: invalid path expression".into()),
+                                }
+                            } else {
+                                return Err("import!: invalid path expression".into());
+                            }
+                        } else {
+                            return Err("import!: invalid path expression".into());
+                        }
+                    }
+                    _ => return Err("import!: path must be a symbol or string".into()),
+                };
+
+                let space_ref = space_rs.first().map(|(a, _)| a).cloned()
+                    .unwrap_or_else(|| Atom::sym("&self"));
+
+                let is_py = path.ends_with(".py");
+                if is_py {
+                    let import_dir = funcs.import_dir.lock().unwrap().clone();
+                    let py_path = std::path::Path::new(path.as_ref());
+                    let resolved = if py_path.exists() {
+                        Some(py_path.to_path_buf())
+                    } else {
+                        let with_ext = format!("{}.py", path);
+                        let py_ext = std::path::Path::new(&with_ext);
+                        if py_ext.exists() {
+                            Some(py_ext.to_path_buf())
+                        } else {
+                            let in_dir = import_dir.join(path.as_ref());
+                            if in_dir.exists() {
+                                Some(in_dir)
+                            } else {
+                                let in_dir_ext = import_dir.join(&with_ext);
+                                if in_dir_ext.exists() {
+                                    Some(in_dir_ext)
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                    }
+                    .ok_or_else(|| {
+                        format!(
+                            "import!: cannot find Python file '{}' (searched CWD and '{}')",
+                            path,
+                            import_dir.display()
+                        )
+                    })?;
+                    crate::eval::python::eval_py_import_library(&resolved)?;
+                    state.stack.push(plain(vec![Atom::sym("true")]));
+                } else {
+                    let import_dir = funcs.import_dir.lock().unwrap().clone();
+                    let resolved = crate::eval::io::resolve_import_path(path.as_ref(), &import_dir)
+                        .ok_or_else(|| {
+                            format!(
+                                "import!: cannot find '{}' (searched CWD and '{}')",
+                                path,
+                                import_dir.display()
+                            )
+                        })?;
+                    let new_dir = resolved
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .to_path_buf();
+                    let prev_dir = std::mem::replace(&mut *funcs.import_dir.lock().unwrap(), new_dir);
+                    let atoms = crate::eval::io::load_metta_file(&resolved, &space_ref, base_env, funcs)?;
+                    *funcs.import_dir.lock().unwrap() = prev_dir;
+                    state.stack.push(plain(atoms));
+                }
+                state.ip += 1;
+            }
+            Opcode::MapAtomPatternLambda {
+                pattern,
+                body_code,
+                pattern_vars,
+                free_vars_map,
+            } => {
+                let list_rs = state.stack.pop().ok_or("VM stack underflow on MapAtomPatternLambda")?;
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                    Some(Atom::Expr(v)) => v.to_vec(),
+                    Some(other) => vec![other],
+                    None => return Err("map-atom: list arg produced no result".to_string()),
+                };
+
+                let mut mapped_results = Vec::with_capacity(items.len());
+                for elem in items {
+                    let matched = crate::eval::shared::pattern::try_match_one(
+                        pattern, &elem, base_env, funcs,
+                    )?;
+                    if let Some(matched_env) = matched {
+                        let mut sub_state = VMState::new_with_parent(
+                            body_code.clone(),
+                            free_vars_map.clone(),
+                            state.budget,
+                            &state.free_vars_map,
+                            &state.free_vars_bindings,
+                        );
+                        for val in &state.locals {
+                            sub_state.locals.push(val.clone());
+                        }
+                        for var in pattern_vars {
+                            let bound = matched_env.get(var).unwrap_or(Atom::sym("()"));
+                            sub_state.locals.push((bound, Env::new()));
+                        }
+                        let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &matched_env)?;
+                        state.budget = sub_budget;
+
+                        if let Some((val, _)) = res.into_iter().next() {
+                            mapped_results.push(val);
+                        }
+                        match exit_status {
+                            VmExit::Cut => {
+                                state.cut_executed = true;
+                                break;
+                            }
+                            VmExit::TailCall(new_locals) => {
+                                return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(mapped_results))]), state.budget, VmExit::TailCall(new_locals)));
+                            }
+                            VmExit::Normal => {}
+                        }
+                    }
+                }
+                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(mapped_results))]));
+                state.ip += 1;
+            }
+            Opcode::FilterAtomPatternLambda {
+                pattern,
+                body_code,
+                pattern_vars,
+                free_vars_map,
+            } => {
+                let list_rs = state.stack.pop().ok_or("VM stack underflow on FilterAtomPatternLambda")?;
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                    Some(Atom::Expr(v)) => v.to_vec(),
+                    Some(other) => vec![other],
+                    None => return Err("filter-atom: list arg produced no result".to_string()),
+                };
+
+                let mut filtered_results = Vec::with_capacity(items.len());
+                for elem in items {
+                    let matched = crate::eval::shared::pattern::try_match_one(
+                        pattern, &elem, base_env, funcs,
+                    )?;
+                    if let Some(matched_env) = matched {
+                        let mut sub_state = VMState::new_with_parent(
+                            body_code.clone(),
+                            free_vars_map.clone(),
+                            state.budget,
+                            &state.free_vars_map,
+                            &state.free_vars_bindings,
+                        );
+                        for val in &state.locals {
+                            sub_state.locals.push(val.clone());
+                        }
+                        for var in pattern_vars {
+                            let bound = matched_env.get(var).unwrap_or(Atom::sym("()"));
+                            sub_state.locals.push((bound, Env::new()));
+                        }
+                        let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &matched_env)?;
+                        state.budget = sub_budget;
+
+                        let is_true = res.into_iter().next().map(|(a, _)| a.is_truthy()).unwrap_or(false);
+                        if is_true {
+                            filtered_results.push(elem);
+                        }
+                        match exit_status {
+                            VmExit::Cut => {
+                                state.cut_executed = true;
+                                break;
+                            }
+                            VmExit::TailCall(new_locals) => {
+                                return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(filtered_results))]), state.budget, VmExit::TailCall(new_locals)));
+                            }
+                            VmExit::Normal => {}
+                        }
+                    }
+                }
+                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(filtered_results))]));
                 state.ip += 1;
             }
             Opcode::TailCallSelf => {
