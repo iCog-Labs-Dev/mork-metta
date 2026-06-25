@@ -529,7 +529,7 @@ pub fn run_vm(
                             }
                             for var in pattern_vars {
                                 let bound = matched.bindings.iter()
-                                    .find(|(k, _)| k == var)
+                                    .find(|(k, _)| k.as_ref() == var.as_str())
                                     .map(|(_, v)| v.clone())
                                     .unwrap_or_else(|| {
                                         if let Some(idx) = local_names.iter().position(|x| x == var) {

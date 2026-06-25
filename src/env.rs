@@ -155,13 +155,13 @@ impl Env {
     ///
     /// # Assumptions
     /// - Each pair is `(name, value)` where name includes the `$` prefix.
-    pub fn extend_all(&self, pairs: &[(String, Atom)]) -> Env {
+    pub fn extend_all(&self, pairs: &[(Arc<str>, Atom)]) -> Env {
         // Prepending in order gives last-pair outermost, which is correct:
         // later bindings in the slice shadow earlier ones for lookups.
         let mut env = self.clone();
         for (name, value) in pairs.iter().rev() {
             env = Env(Arc::new(EnvNode::Cons {
-                name: Arc::from(name.as_str()),
+                name: name.clone(),
                 value: value.clone(),
                 next: env,
             }));
