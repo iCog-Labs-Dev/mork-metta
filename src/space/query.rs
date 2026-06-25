@@ -25,9 +25,9 @@ pub fn match_in_space(
 }
 
 fn merge_match_bindings(
-    left: &[(Arc<str>, Atom)],
-    right: &[(Arc<str>, Atom)],
-) -> Option<Vec<(Arc<str>, Atom)>> {
+    left: &[(Arc<str>, Arc<Atom>)],
+    right: &[(Arc<str>, Arc<Atom>)],
+) -> Option<Vec<(Arc<str>, Arc<Atom>)>> {
     let mut merged = left.to_vec();
     for (name, value) in right {
         if let Some((_, bound)) = merged.iter().find(|(bound_name, _)| bound_name == name) {
@@ -54,7 +54,7 @@ pub fn collect_match_results(
                 let subpatterns = &items[1..];
                 // Evaluate the first subpattern serially to get the initial binding sets.
                 let initial = collect_match_results(funcs, space_ref, &subpatterns[0], env)?;
-                let initial_bindings: Vec<Vec<(Arc<str>, Atom)>> = initial
+                let initial_bindings: Vec<Vec<(Arc<str>, Arc<Atom>)>> = initial
                     .into_iter()
                     .map(|m| m.bindings)
                     .collect();
@@ -64,12 +64,12 @@ pub fn collect_match_results(
                 // tasks with significant work per task (the full remaining conjunction).
                 // RwLock on space allows concurrent readers.
                 let remaining = &subpatterns[1..];
-                let results: Vec<Vec<(Arc<str>, Atom)>> = if !remaining.is_empty()
+                let results: Vec<Vec<(Arc<str>, Arc<Atom>)>> = if !remaining.is_empty()
                     && initial_bindings.len() > 1
                 {
                     initial_bindings
                         .par_iter()
-                        .map(|seed| -> Result<Vec<Vec<(Arc<str>, Atom)>>, String> {
+                        .map(|seed| -> Result<Vec<Vec<(Arc<str>, Arc<Atom>)>>, String> {
                             let mut bindings_sets = vec![seed.clone()];
                             for subpattern in remaining {
                                 let mut next = Vec::new();

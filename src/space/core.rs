@@ -55,7 +55,7 @@ impl Pattern {
 #[derive(Clone, Debug)]
 pub struct MatchResult {
     pub atom: Atom,
-    pub bindings: Vec<(Arc<str>, Atom)>,
+    pub bindings: Vec<(Arc<str>, Arc<Atom>)>,
 }
 
 pub trait Space: Send + Sync {
@@ -425,12 +425,12 @@ fn decode_children(b: &[u8], pos: &mut usize, var_count: &mut u8, n: usize) -> O
 }
 
 fn match_one(pattern: &Pattern, atom: &Atom) -> Option<MatchResult> {
-    let mut query_bindings: Vec<(Arc<str>, Atom)> = Vec::new();
-    let mut stored_bindings: Vec<(Arc<str>, Atom)> = Vec::new();
+    let mut query_bindings: Vec<(Arc<str>, Arc<Atom>)> = Vec::new();
+    let mut stored_bindings: Vec<(Arc<str>, Arc<Atom>)> = Vec::new();
     if unify(pattern, atom, &mut query_bindings, &mut stored_bindings) {
         let bindings = query_bindings
             .into_iter()
-            .map(|(n, v)| (n, substitute_stored(&v, &stored_bindings)))
+            .map(|(n, v)| (n, Arc::new(substitute_stored(&*v, &stored_bindings))))
             .collect();
         Some(MatchResult {
             atom: substitute_stored(atom, &stored_bindings),
@@ -444,8 +444,8 @@ fn match_one(pattern: &Pattern, atom: &Atom) -> Option<MatchResult> {
 fn unify(
     pattern: &Pattern,
     atom: &Atom,
-    query_bindings: &mut Vec<(Arc<str>, Atom)>,
-    stored_bindings: &mut Vec<(Arc<str>, Atom)>,
+    query_bindings: &mut Vec<(Arc<str>, Arc<Atom>)>,
+    stored_bindings: &mut Vec<(Arc<str>, Arc<Atom>)>,
 ) -> bool {
     if let Atom::Sym(s) = atom {
         if s.starts_with('$') && !matches!(pattern, Pattern::Any | Pattern::Var(_)) {
@@ -454,9 +454,9 @@ fn unify(
                 .iter()
                 .find(|(n, _)| n.as_ref() == s.as_ref())
             {
-                return bound == &pat_atom;
+                return **bound == pat_atom;
             }
-            stored_bindings.push((s.clone(), pat_atom));
+            stored_bindings.push((s.clone(), Arc::new(pat_atom)));
             return true;
         }
     }
@@ -464,9 +464,9 @@ fn unify(
         Pattern::Any => true,
         Pattern::Var(name) => {
             if let Some((_, bound)) = query_bindings.iter().find(|(n, _)| n.as_ref() == name.as_str()) {
-                bound == atom
+                **bound == *atom
             } else {
-                query_bindings.push((Arc::from(name.as_str()), atom.clone()));
+                query_bindings.push((Arc::from(name.as_str()), Arc::new(atom.clone())));
                 true
             }
         }
@@ -485,12 +485,12 @@ fn unify(
     }
 }
 
-fn substitute_stored(atom: &Atom, bindings: &[(Arc<str>, Atom)]) -> Atom {
+fn substitute_stored(atom: &Atom, bindings: &[(Arc<str>, Arc<Atom>)]) -> Atom {
     match atom {
         Atom::Sym(s) if s.starts_with('$') => bindings
             .iter()
             .find(|(name, _)| name.as_ref() == s.as_ref())
-            .map(|(_, v)| v.clone())
+            .map(|(_, v)| (**v).clone())
             .unwrap_or_else(|| atom.clone()),
         Atom::Expr(items) => Atom::expr(
             items

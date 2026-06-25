@@ -15,7 +15,7 @@ pub fn bind(env: &Env, name: &str, value: Atom) -> Env {
 }
 
 /// Extend an environment with a list of bindings.
-pub fn bind_all(env: &Env, bindings: &[(Arc<str>, Atom)]) -> Env {
+pub fn bind_all(env: &Env, bindings: &[(Arc<str>, Arc<Atom>)]) -> Env {
     env.extend_all(bindings)
 }
 

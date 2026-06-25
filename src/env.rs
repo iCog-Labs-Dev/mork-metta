@@ -26,7 +26,7 @@ pub(crate) enum EnvNode {
     /// outer environment.
     Cons {
         name: Arc<str>,
-        value: Atom,
+        value: Arc<Atom>,
         next: Env,
     },
     /// A link node prepending one environment chain onto another.
@@ -125,7 +125,7 @@ impl Env {
             EnvNode::Empty => None,
             EnvNode::Cons { name: n, value, next } => {
                 if &**n == name {
-                    Some(value.clone())
+                    Some((**value).clone())
                 } else {
                     next.get(name)
                 }
@@ -137,13 +137,10 @@ impl Env {
     }
 
     /// Return a new environment with one additional binding prepended.
-    ///
-    /// Does NOT mutate `self`. The new environment shares the rest of
-    /// the chain with the original (Arc<str> avoids string copies).
     pub fn extend(&self, name: &str, value: Atom) -> Env {
         Env(Arc::new(EnvNode::Cons {
             name: Arc::from(name),
-            value,
+            value: Arc::new(value),
             next: self.clone(),
         }))
     }
@@ -155,7 +152,7 @@ impl Env {
     ///
     /// # Assumptions
     /// - Each pair is `(name, value)` where name includes the `$` prefix.
-    pub fn extend_all(&self, pairs: &[(Arc<str>, Atom)]) -> Env {
+    pub fn extend_all(&self, pairs: &[(Arc<str>, Arc<Atom>)]) -> Env {
         // Prepending in order gives last-pair outermost, which is correct:
         // later bindings in the slice shadow earlier ones for lookups.
         let mut env = self.clone();

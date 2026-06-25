@@ -394,11 +394,23 @@ pub fn parse_atom_bytes(
 
 fn bytes_token_to_atom(token: &str) -> Atom {
     let s = token.trim_start_matches('-');
-    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
-        if let Ok(n) = token.parse::<dashu::Integer>() {
-            return Atom::Num(crate::atom::Numeric::Int(n));
+    if !s.is_empty() {
+        let first = s.as_bytes()[0];
+        if first.is_ascii_digit() {
+            // Potential integer: check all-digit and try parsing
+            if s.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(n) = token.parse::<dashu::Integer>() {
+                    return Atom::Num(crate::atom::Numeric::Int(n));
+                }
+            }
+        } else if first != b'.' {
+            // Not a digit, not a decimal point — cannot be a number
+            return Atom::sym(token);
         }
-    } else if token.contains('.') || token.contains('e') || token.contains('E') {
+        // Falls through to float check for digit-start or dot-start tokens
+    }
+    // Float or symbol
+    if token.contains('.') || token.contains('e') || token.contains('E') {
         if let Ok(n) = token.parse::<dashu::Decimal>() {
             return Atom::Num(crate::atom::Numeric::Dec(n));
         }
