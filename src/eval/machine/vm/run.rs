@@ -579,6 +579,22 @@ pub fn run_vm(
                         }
                     }
                 }
+                
+                // Extract memo_key for the frame (only valid for single-combo pure calls).
+                let call_memo_key: Option<(String, Vec<Atom>)> = if full_combos.len() == 1 {
+                    let head = &full_combos[0].0[0];
+                    if let Atom::Sym(fn_name) = head {
+                        if funcs.is_pure_fn(fn_name, *arity) {
+                            Some((fn_name.to_string(), full_combos[0].0[1..].to_vec()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 // Ponytail: skip frame when no pending calls (native functions fully resolved).
                 // Pushing an empty frame and immediately popping it would restore an empty
                 // saved_locals, clearing the function's actual state.locals.
@@ -607,6 +623,7 @@ pub fn run_vm(
                         pending_calls,
                         next_idx: 0,
                         results,
+                        memo_key: call_memo_key,
                     },
                 };
                 state.frames.push(frame);
@@ -1714,7 +1731,16 @@ pub fn run_vm(
                     CallFrameKind::Let { results, .. } => { results.extend(sub_results); }
                     CallFrameKind::If { results, .. } => { results.extend(sub_results); }
                     CallFrameKind::Case { results, .. } => { results.extend(sub_results); }
-                    CallFrameKind::Call { results, .. } => { results.extend(sub_results); }
+                    CallFrameKind::Call { results, .. } => {
+                        let merged: Vec<(Atom, Env)> = sub_results
+                            .into_iter()
+                            .map(|(atom, env)| {
+                                let merged_env = crate::eval::shared::env::prepend_chain(env, &base_env);
+                                (atom, merged_env)
+                            })
+                            .collect();
+                        results.extend(merged);
+                    }
                     CallFrameKind::Eval { results, .. } => { results.extend(sub_results); }
                     CallFrameKind::Normal => { state.stack.push(sub_results); }
                 }
@@ -2140,7 +2166,7 @@ fn run_next_case_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
 }
 
 /// ponytail: Run the next iteration of the Call opcode in flat frame-based control flow.
-fn run_next_call_iteration(state: &mut VMState, _funcs: &FnTable) -> Result<Option<Env>, String> {
+fn run_next_call_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Option<Env>, String> {
     let mut to_run = None;
     if let Some(frame) = state.frames.last_mut() {
         if let CallFrameKind::Call {
@@ -2195,7 +2221,11 @@ fn run_next_call_iteration(state: &mut VMState, _funcs: &FnTable) -> Result<Opti
         Ok(Some(body_env))
     } else {
         let frame = state.frames.pop().unwrap();
-        if let CallFrameKind::Call { results, .. } = frame.kind {
+        if let CallFrameKind::Call { results, memo_key, .. } = frame.kind {
+            if let Some(key) = memo_key {
+                let atoms_only: Vec<Atom> = results.iter().map(|(a, _)| a.clone()).collect();
+                funcs.memo_set(key, atoms_only);
+            }
             state.code = frame.return_code;
             state.ip = frame.return_ip + 1;
             state.locals = frame.saved_locals;

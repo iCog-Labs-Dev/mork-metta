@@ -51,6 +51,7 @@ pub enum CallFrameKind {
         pending_calls: Vec<PendingCall>,
         next_idx: usize,
         results: ResultSet,
+        memo_key: Option<(String, Vec<Atom>)>,
     },
     Eval {
         target_rs: Vec<(Expr, Env)>,
