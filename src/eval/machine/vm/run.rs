@@ -7,11 +7,48 @@ use super::op::Opcode;
 use super::state::VMState;
 use std::sync::Arc;
 
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+/// Cached compilation of a user-defined function clause body.
+#[derive(Clone)]
+struct CompiledClause {
+    body_code: Vec<Opcode>,
+    free_vars: Vec<String>,
+    locals: Vec<String>,
+}
+
+thread_local! {
+    static FN_BYTECODE_CACHE: RefCell<HashMap<(String, u8), Vec<CompiledClause>>> = RefCell::new(HashMap::new());
+    static VM_DEPTH: Cell<u32> = Cell::new(0);
+}
+
+struct VmDepthGuard;
+impl VmDepthGuard {
+    fn enter() -> Self {
+        VM_DEPTH.with(|d| {
+            let prev = d.get();
+            d.set(prev + 1);
+            if prev == 0 {
+                FN_BYTECODE_CACHE.with(|c| c.borrow_mut().clear());
+            }
+        });
+        VmDepthGuard
+    }
+}
+impl Drop for VmDepthGuard {
+    fn drop(&mut self) {
+        VM_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
 pub fn run_vm(
     mut state: VMState,
     funcs: &FnTable,
     base_env: &Env,
 ) -> Result<(ResultSet, Option<i64>, bool), String> {
+    let _guard = VmDepthGuard::enter();
     let debug_vm = std::env::var_os("MORK_DEBUG_VM").is_some();
     if debug_vm {
         eprintln!("--- VM CODE ---");
@@ -201,13 +238,33 @@ pub fn run_vm(
                                     }
                                 }
                             } else {
-                                // User function call lookup
+                                // User function call lookup with bytecode cache
                                 if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(name, *arity, funcs) {
-                                    for (patterns, body) in &clauses {
-                                        if let Some((body_env, subst_cost)) = crate::eval::forms::query::match_clause(patterns, args, &combo_env, funcs) {
-                                            let mut comp = super::compiler::VMCompiler::new(patterns, Some(name.to_string()));
+                                    // Check or populate bytecode cache for this (name, arity)
+                                    let cache_key = (name.to_string(), *arity);
+                                    let cached = FN_BYTECODE_CACHE.with(|cache_ref| {
+                                        let mut cache = cache_ref.borrow_mut();
+                                        if let Some(entry) = cache.get(&cache_key) {
+                                            return Ok::<_, String>(entry.clone());
+                                        }
+                                        let mut compiled = Vec::with_capacity(clauses.len());
+                                        for (pat, b) in &clauses {
+                                            let mut comp = super::compiler::VMCompiler::new(pat, Some(name.to_string()));
                                             let mut code = Vec::new();
-                                            comp.compile(body, &mut code, true)?;
+                                            comp.compile(b, &mut code, true)?;
+                                            compiled.push(CompiledClause {
+                                                body_code: code,
+                                                free_vars: comp.free_vars,
+                                                locals: comp.locals,
+                                            });
+                                        }
+                                        cache.insert(cache_key, compiled.clone());
+                                        Ok(compiled)
+                                    })?;
+
+                                    for (i, (patterns, body)) in clauses.iter().enumerate() {
+                                        if let Some((body_env, subst_cost)) = crate::eval::forms::query::match_clause(patterns, args, &combo_env, funcs) {
+                                            let clause = &cached[i];
                                             // Debit structural budget cost prior to body evaluation
                                             let body_cost = crate::eval::machine::budget::calculate_expr_cost(body);
                                             let total_cost = subst_cost + body_cost;
@@ -218,13 +275,13 @@ pub fn run_vm(
                                                 state.budget = Some(b - total_cost);
                                             }
                                             let mut sub_state = VMState::new_with_parent(
-                                                code,
-                                                comp.free_vars,
+                                                clause.body_code.clone(),
+                                                clause.free_vars.clone(),
                                                 state.budget,
                                                 &state.free_vars_map,
                                                 &state.free_vars_bindings,
                                             );
-                                            for var in &comp.locals {
+                                            for var in &clause.locals {
                                                 let val = body_env.get(var).unwrap_or(Atom::sym("()"));
                                                 sub_state.locals.push((val, Env::new()));
                                             }
