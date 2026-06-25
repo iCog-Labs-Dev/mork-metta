@@ -1968,9 +1968,10 @@ pub fn run_vm(
             if let Some(frame) = state.frames.last_mut() {
                 let sub_results = state.stack.pop().unwrap_or_else(|| Vec::new());
                 
-                // For Call frames, restore parent's locals from saved_locals (replaces extend).
+                // For Call and Eval frames, restore parent's locals from saved_locals (replaces extend).
                 // For other frames, truncate by locals_to_pop as before.
-                if matches!(frame.kind, CallFrameKind::Call { .. }) {
+                // ponytail: restore parent's locals for Eval frames too
+                if matches!(frame.kind, CallFrameKind::Call { .. } | CallFrameKind::Eval { .. }) {
                     state.locals = frame.saved_locals.clone();
                 } else {
                     let new_len = state.locals.len().saturating_sub(frame.locals_to_pop);
@@ -2021,11 +2022,12 @@ pub fn run_vm(
                             state.stack.push(final_results);
                         }
                         CallFrameKind::Case { results, .. } => { state.stack.push(results); }
-                        CallFrameKind::Call { results, .. } => {
+                        CallFrameKind::Call { results, .. }
+                        | CallFrameKind::Eval { results, .. } => {
+                            // ponytail: restore parent's locals for Eval as well
                             state.locals = popped.saved_locals;
                             state.stack.push(results);
                         }
-                        CallFrameKind::Eval { results, .. } => { state.stack.push(results); }
                         CallFrameKind::Normal => {}
                     }
                     base_env = restored_env;
@@ -2519,6 +2521,13 @@ fn run_next_eval_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
     }
     
     if let Some((body_code, free_vars_map, body_env)) = to_run {
+        // Save parent's locals before entering dynamic eval body, clear state.locals.
+        // ponytail: prevent Load(0) index contamination by isolating eval locals.
+        if let Some(frame) = state.frames.last_mut() {
+            let parent_locals = std::mem::take(&mut state.locals);
+            frame.saved_locals = parent_locals;
+        }
+        state.locals = Vec::new();
         state.code = body_code;
         state.ip = 0;
         
@@ -2545,6 +2554,7 @@ fn run_next_eval_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
         if let CallFrameKind::Eval { results, .. } = frame.kind {
             state.code = frame.return_code;
             state.ip = frame.return_ip + 1;
+            state.locals = frame.saved_locals; // ponytail: restore parent's locals
             state.free_vars_map = frame.saved_free_vars_map;
             state.free_vars_bindings = frame.saved_free_vars_bindings;
             state.stack.push(results);
