@@ -99,7 +99,7 @@ impl MorkSpace {
 
     fn encode_atom_direct(
         atom: &Atom,
-        inner: &mut mork::space::Space<mork::weightedsweep::UnitHeader>,
+        inner: &mork::space::Space<mork::weightedsweep::UnitHeader>,
         buf: &mut Vec<u8>,
     ) -> Result<usize, String> {
         let cap = approx_size(atom) + 64;
@@ -116,7 +116,7 @@ impl MorkSpace {
 
     fn encode_pattern_direct(
         pattern: &Pattern,
-        inner: &mut mork::space::Space<mork::weightedsweep::UnitHeader>,
+        inner: &mork::space::Space<mork::weightedsweep::UnitHeader>,
         buf: &mut Vec<u8>,
     ) -> Result<usize, String> {
         let cap = approx_pattern_size(pattern) + 64;
@@ -239,7 +239,7 @@ impl Space for MorkSpace {
         MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             let mut inner = self.inner.write().unwrap();
-            let len = Self::encode_atom_direct(atom, &mut inner, &mut buf)?;
+            let len = Self::encode_atom_direct(atom, &*inner, &mut buf)?;
             inner.btm.insert(&buf[..len], Default::default());
             Ok(())
         })
@@ -250,18 +250,18 @@ impl Space for MorkSpace {
         MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             let mut inner = self.inner.write().unwrap();
-            let len = Self::encode_atom_direct(atom, &mut inner, &mut buf)?;
+            let len = Self::encode_atom_direct(atom, &*inner, &mut buf)?;
             Ok(inner.btm.remove(&buf[..len]).is_some())
         })
     }
 
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
         if let Some(atom) = pattern.as_ground_atom() {
-            // Phase 1: encode (write lock, parse_sexpr needs &mut Space).
+            // Phase 1: encode (read lock — concurrent with other readers).
             let encoded: Vec<u8> = MORK_SPACE_ENCODE_BUF.with(|cell| {
                 let mut buf = cell.borrow_mut();
-                let mut inner = self.inner.write().unwrap();
-                match Self::encode_atom_direct(&atom, &mut inner, &mut buf) {
+                let inner = self.inner.read().unwrap();
+                match Self::encode_atom_direct(&atom, &*inner, &mut buf) {
                     Ok(len) => buf[..len].to_vec(),
                     Err(_) => vec![],
                 }
@@ -276,11 +276,11 @@ impl Space for MorkSpace {
             };
         }
 
-        // Phase 1: encode prefix (write lock, short duration).
+        // Phase 1: encode prefix (read lock — concurrent with other readers).
         let prefix_bytes: Vec<u8> = MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
-            let mut inner = self.inner.write().unwrap();
-            match Self::encode_pattern_direct(pattern, &mut inner, &mut buf) {
+            let inner = self.inner.read().unwrap();
+            match Self::encode_pattern_direct(pattern, &*inner, &mut buf) {
                 Ok(len) => {
                     let e = mork_expr::Expr { ptr: buf.as_mut_ptr() };
                     match e.prefix() {
