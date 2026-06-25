@@ -394,6 +394,71 @@ impl VMCompiler {
                             return Ok(());
                         }
                         // For any other special keyword/construct (e.g. once, etc.), fallback to EvalCEK
+                        "once" if items.len() == 2 => {
+                            // ponytail: run body, keep first result only
+                            let mut body_comp = VMCompiler { locals: self.locals.clone(), free_vars: self.free_vars.clone(), fn_name: self.fn_name.clone(), arity: self.arity };
+                            let mut body_code = Vec::new();
+                            body_comp.compile(&items[1], &mut body_code, false)?;
+                            for v in &body_comp.free_vars { if !self.free_vars.contains(v) { self.free_vars.push(v.clone()); } }
+                            code.push(Opcode::Once { body_code, free_vars_map: body_comp.free_vars });
+                            return Ok(());
+                        }
+                        "progn" if items.len() >= 2 => {
+                            // ponytail: eval all, return last; compile each body separately
+                            let mut bodies = Vec::new();
+                            let mut fvs = self.free_vars.clone();
+                            for item in &items[1..] {
+                                let mut bc = VMCompiler { locals: self.locals.clone(), free_vars: fvs.clone(), fn_name: self.fn_name.clone(), arity: self.arity };
+                                let mut bcode = Vec::new();
+                                bc.compile(item, &mut bcode, false)?;
+                                for v in &bc.free_vars { if !fvs.contains(v) { fvs.push(v.clone()); } }
+                                bodies.push(bcode);
+                            }
+                            self.free_vars = fvs.clone();
+                            code.push(Opcode::Progn { bodies, free_vars_map: fvs });
+                            return Ok(());
+                        }
+                        "prog1" if items.len() >= 2 => {
+                            // ponytail: eval all, return first
+                            let mut bodies = Vec::new();
+                            let mut fvs = self.free_vars.clone();
+                            for item in &items[1..] {
+                                let mut bc = VMCompiler { locals: self.locals.clone(), free_vars: fvs.clone(), fn_name: self.fn_name.clone(), arity: self.arity };
+                                let mut bcode = Vec::new();
+                                bc.compile(item, &mut bcode, false)?;
+                                for v in &bc.free_vars { if !fvs.contains(v) { fvs.push(v.clone()); } }
+                                bodies.push(bcode);
+                            }
+                            self.free_vars = fvs.clone();
+                            code.push(Opcode::Prog1 { bodies, free_vars_map: fvs });
+                            return Ok(());
+                        }
+                        "chain" if items.len() >= 4 && items.len() % 2 == 0 => {
+                            // ponytail: (chain e0 $v0 e1 $v1 ... body) — compile each step
+                            let mut fvs = self.free_vars.clone();
+                            let mut steps = Vec::new();
+                            let pairs = (items.len() - 2) / 2;
+                            for i in 0..pairs {
+                                let expr_item = &items[1 + i * 2];
+                                let var_item = &items[2 + i * 2];
+                                let var_name = match var_item {
+                                    Expr::Symbol(s) if s.starts_with('$') => s.clone(),
+                                    _ => return Err(format!("chain: arg {} must be a $variable", 2 + i * 2)),
+                                };
+                                let mut bc = VMCompiler { locals: self.locals.clone(), free_vars: fvs.clone(), fn_name: self.fn_name.clone(), arity: self.arity };
+                                let mut bcode = Vec::new();
+                                bc.compile(expr_item, &mut bcode, false)?;
+                                for v in &bc.free_vars { if !fvs.contains(v) { fvs.push(v.clone()); } }
+                                steps.push((bcode, var_name));
+                            }
+                            let mut fc = VMCompiler { locals: self.locals.clone(), free_vars: fvs.clone(), fn_name: self.fn_name.clone(), arity: self.arity };
+                            let mut final_code = Vec::new();
+                            fc.compile(items.last().unwrap(), &mut final_code, false)?;
+                            for v in &fc.free_vars { if !fvs.contains(v) { fvs.push(v.clone()); } }
+                            self.free_vars = fvs.clone();
+                            code.push(Opcode::Chain { steps, final_code, free_vars_map: fvs });
+                            return Ok(());
+                        }
                         "within" if items.len() == 2 => {
                             // ponytail: evaluate arg, wrap all results into (within ...)
                             let mut body_comp = VMCompiler {
@@ -452,7 +517,7 @@ impl VMCompiler {
                             });
                             return Ok(());
                         }
-                        "|->" | "once" | "progn" | "prog1" | "chain" | "add-atom" | "remove-atom" => {
+                        "|->" | "add-atom" | "remove-atom" => {
                             code.push(Opcode::EvalCEK(expr.clone(), self.locals.clone()));
                             return Ok(());
                         }

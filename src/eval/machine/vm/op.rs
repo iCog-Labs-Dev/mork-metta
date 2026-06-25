@@ -74,6 +74,28 @@ pub enum Opcode {
         body_code: Vec<Opcode>,
         free_vars_map: Vec<String>,
     },
+    /// Returns only the first result from body_code.
+    Once {
+        body_code: Vec<Opcode>,
+        free_vars_map: Vec<String>,
+    },
+    /// Evaluates each body in sequence, discards all but the last result.
+    Progn {
+        bodies: Vec<Vec<Opcode>>,
+        free_vars_map: Vec<String>,
+    },
+    /// Evaluates each body in sequence, discards all but the first result.
+    Prog1 {
+        bodies: Vec<Vec<Opcode>>,
+        free_vars_map: Vec<String>,
+    },
+    /// (chain e0 $v e1 ... body): evaluates e0, binds to $v, evaluates e1, etc.
+    Chain {
+        /// Alternating: [expr_code, var_name, expr_code, var_name, ..., final_body_code]
+        steps: Vec<(Vec<Opcode>, String)>,
+        final_code: Vec<Opcode>,
+        free_vars_map: Vec<String>,
+    },
     /// Wraps all results from body_code into (within result1 result2 ...).
     Within {
         body_code: Vec<Opcode>,

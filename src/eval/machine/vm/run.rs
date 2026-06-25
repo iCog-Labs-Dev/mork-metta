@@ -966,6 +966,65 @@ pub fn run_vm(
                 state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(filtered_results))]));
                 state.ip += 1;
             }
+            Opcode::Once { body_code, free_vars_map } => {
+                // ponytail: run body, take only the first result
+                let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                for val in &state.locals { sub_state.locals.push(val.clone()); }
+                let (res, sub_budget, _) = run_vm(sub_state, funcs, base_env)?;
+                state.budget = sub_budget;
+                state.stack.push(res.into_iter().take(1).collect());
+                state.ip += 1;
+            }
+            Opcode::Progn { bodies, free_vars_map } => {
+                // ponytail: run each body, return last result
+                let mut last = Vec::new();
+                for body_code in bodies {
+                    let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                    for val in &state.locals { sub_state.locals.push(val.clone()); }
+                    let (res, sub_budget, _) = run_vm(sub_state, funcs, base_env)?;
+                    state.budget = sub_budget;
+                    last = res;
+                }
+                state.stack.push(last);
+                state.ip += 1;
+            }
+            Opcode::Prog1 { bodies, free_vars_map } => {
+                // ponytail: run each body, return first result
+                let mut first = Vec::new();
+                for (i, body_code) in bodies.iter().enumerate() {
+                    let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                    for val in &state.locals { sub_state.locals.push(val.clone()); }
+                    let (res, sub_budget, _) = run_vm(sub_state, funcs, base_env)?;
+                    state.budget = sub_budget;
+                    if i == 0 { first = res; }
+                }
+                state.stack.push(first);
+                state.ip += 1;
+            }
+            Opcode::Chain { steps, final_code, free_vars_map } => {
+                // ponytail: evaluate each step, bind result into parent free_vars so new_with_parent threads them through
+                for (step_code, var_name) in steps.iter() {
+                    let mut sub_state = VMState::new_with_parent(step_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                    for val in &state.locals { sub_state.locals.push(val.clone()); }
+                    let (res, sub_budget, _) = run_vm(sub_state, funcs, base_env)?;
+                    state.budget = sub_budget;
+                    let val: Atom = res.into_iter().next().map(|(a, _)| a)
+                        .ok_or_else(|| format!("chain: expression for {} produced no result", var_name))?;
+                    // Inject into parent so subsequent steps and final body inherit the binding
+                    if let Some(pos) = state.free_vars_map.iter().position(|x| x == var_name) {
+                        state.free_vars_bindings[pos] = val;
+                    } else {
+                        state.free_vars_map.push(var_name.clone());
+                        state.free_vars_bindings.push(val);
+                    }
+                }
+                let mut sub_state = VMState::new_with_parent(final_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                for val in &state.locals { sub_state.locals.push(val.clone()); }
+                let (res, sub_budget, _) = run_vm(sub_state, funcs, base_env)?;
+                state.budget = sub_budget;
+                state.stack.push(res);
+                state.ip += 1;
+            }
             Opcode::Within { body_code, free_vars_map } => {
                 // ponytail: run body, collect all results, wrap into (within result1 result2 ...)
                 let mut sub_state = VMState::new_with_parent(
