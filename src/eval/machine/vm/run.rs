@@ -3,7 +3,7 @@ use crate::env::Env;
 use crate::parser::Expr;
 use crate::func::{FnTable, FunctionKind};
 use crate::eval::machine::budget::{ResultSet, plain};
-use super::op::{Opcode, VmExit, CaseBranch};
+use super::op::{Opcode, VmExit, CaseBranch, QuoteVarSource, QuoteVarMatch};
 use super::state::{VMState, CallFrame, CallFrameKind};
 use std::sync::Arc;
 
@@ -34,6 +34,21 @@ fn intern_name(name: &str) -> &'static str {
     })
 }
 
+fn replace_at_path(atom: &mut Atom, path: &[usize], val: Atom) {
+    if path.is_empty() {
+        *atom = val;
+        return;
+    }
+    if let Atom::Expr(expr_data) = atom {
+        let mut items = expr_data.to_vec();
+        if path[0] < items.len() {
+            replace_at_path(&mut items[path[0]], &path[1..], val);
+            *atom = Atom::Expr(crate::atom::expr_data(items));
+        }
+    }
+}
+
+
 struct VmDepthGuard;
 impl VmDepthGuard {
     fn enter() -> Self {
@@ -58,6 +73,7 @@ pub fn run_vm(
     funcs: &FnTable,
     initial_base_env: &Env,
 ) -> Result<(ResultSet, Option<i64>, VmExit), String> {
+    super::compiler::set_current_funcs(funcs);
     let mut base_env = initial_base_env.clone();
     let _guard = VmDepthGuard::enter();
     static DEBUG_VM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -88,6 +104,7 @@ pub fn run_vm(
                         _ => match op {
                             Opcode::Call(_) => "Opcode::Call",
                             Opcode::Const(_) => "Opcode::Const",
+                            Opcode::ConstQuote { .. } => "Opcode::ConstQuote",
                             Opcode::Load(_) => "Opcode::Load",
                             Opcode::Store(_) => "Opcode::Store",
                             Opcode::LoadFree(_) => "Opcode::LoadFree",
@@ -140,6 +157,7 @@ pub fn run_vm(
                     None => match op {
                         Opcode::Call(_) => "Opcode::Call",
                         Opcode::Const(_) => "Opcode::Const",
+                        Opcode::ConstQuote { .. } => "Opcode::ConstQuote",
                         Opcode::Load(_) => "Opcode::Load",
                         Opcode::Store(_) => "Opcode::Store",
                         Opcode::LoadFree(_) => "Opcode::LoadFree",
@@ -199,6 +217,30 @@ pub fn run_vm(
         match op {
             Opcode::Const(atom) => {
                 state.stack.push(plain(vec![atom.clone()]));
+                state.ip += 1;
+            }
+            Opcode::ConstQuote { template, vars } => {
+                let mut result = template.clone();
+                for var in vars {
+                    let val = match var.source {
+                        QuoteVarSource::Local(pos) => {
+                            if (pos as usize) < state.locals.len() {
+                                state.locals[pos as usize].0.clone()
+                            } else {
+                                Atom::sym("()")
+                            }
+                        }
+                        QuoteVarSource::Free(pos) => {
+                            if (pos as usize) < state.free_vars_bindings.len() {
+                                state.free_vars_bindings[pos as usize].clone()
+                            } else {
+                                Atom::sym("()")
+                            }
+                        }
+                    };
+                    replace_at_path(&mut result, &var.path, val);
+                }
+                state.stack.push(plain(vec![result]));
                 state.ip += 1;
             }
             Opcode::Load(idx) => {
@@ -1742,6 +1784,103 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::TailCallSelf => {
+                let mut has_choice_points = false;
+                let mut call_frame_idx = None;
+                for (i, frame) in state.frames.iter().enumerate().rev() {
+                    match &frame.kind {
+                        CallFrameKind::Normal => {}
+                        CallFrameKind::Let { value_rs, next_idx, .. } => {
+                            if *next_idx < value_rs.len() {
+                                has_choice_points = true;
+                            }
+                        }
+                        CallFrameKind::If { condition_rs, next_idx, .. } => {
+                            if *next_idx < condition_rs.len() {
+                                has_choice_points = true;
+                            }
+                        }
+                        CallFrameKind::Case { scrutinee_rs, next_idx, .. } => {
+                            if *next_idx < scrutinee_rs.len() {
+                                has_choice_points = true;
+                            }
+                        }
+                        CallFrameKind::Call { pending_calls, next_idx, .. } => {
+                            call_frame_idx = Some(i);
+                            if *next_idx < pending_calls.len() {
+                                has_choice_points = true;
+                            }
+                            break;
+                        }
+                        CallFrameKind::Eval { target_rs, next_idx, .. } => {
+                            if *next_idx < target_rs.len() {
+                                has_choice_points = true;
+                            }
+                        }
+                    }
+                }
+
+                if has_choice_points {
+                    if let Some(c_idx) = call_frame_idx {
+                        let (arity, name) = match &state.frames[c_idx].kind {
+                            CallFrameKind::Call { arity, name, .. } => (*arity, *name),
+                            _ => unreachable!(),
+                        };
+                        let new_args: Vec<Atom> = state.locals.iter().take(arity as usize).map(|(atom, _)| atom.clone()).collect();
+                        let mut pending_calls = Vec::new();
+                        if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(name, arity, funcs) {
+                            let cache_key = (name.to_string(), arity);
+                            let cached = FN_BYTECODE_CACHE.with(|cache_ref| {
+                                Ok::<_, String>(cache_ref.borrow().get(&cache_key).unwrap().clone())
+                            })?;
+                            
+                            for (i, (patterns, body)) in clauses.iter().enumerate() {
+                                if let Some((body_env, subst_cost)) = crate::eval::forms::query::match_clause(patterns, &new_args, &base_env, funcs) {
+                                    let clause = &cached[i];
+                                    let body_cost = crate::eval::machine::budget::calculate_expr_cost(body);
+                                    let total_cost = subst_cost + body_cost;
+                                    
+                                    let mut locals_to_push = Vec::with_capacity(clause.locals.len());
+                                    for var in &clause.locals {
+                                        let val = body_env.get(var).unwrap_or(Atom::sym("()"));
+                                        locals_to_push.push((val, Env::new()));
+                                    }
+                                    
+                                    pending_calls.push(super::state::PendingCall {
+                                        body_code: clause.body_code.clone(),
+                                        free_vars: clause.free_vars.clone(),
+                                        body_env,
+                                        locals_to_push,
+                                        cost: total_cost,
+                                    });
+                                }
+                            }
+                        }
+                        
+                        let frame = CallFrame {
+                            return_ip: state.ip,
+                            return_code: state.code.clone(),
+                            locals_to_pop: 0,
+                            saved_base_env: base_env.clone(),
+                            saved_locals: Vec::new(),
+                            saved_free_vars_map: state.free_vars_map.clone(),
+                            saved_free_vars_bindings: state.free_vars_bindings.clone(),
+                            kind: CallFrameKind::Call {
+                                name,
+                                arity,
+                                pending_calls,
+                                next_idx: 0,
+                                results: Vec::new(),
+                                memo_key: None,
+                            },
+                        };
+                        state.frames.push(frame);
+                        if let Some(next_env) = run_next_call_iteration(&mut state, funcs)? {
+                            base_env = next_env;
+                        }
+                        continue;
+                    }
+                }
+
                 let mut found_call = false;
                 while let Some(frame) = state.frames.last() {
                     if matches!(frame.kind, CallFrameKind::Call { .. }) {
@@ -1809,10 +1948,9 @@ pub fn run_vm(
                     }
                     
                     // Replace frame's state: new pending calls, cleared results, empty saved_locals
-                    if let CallFrameKind::Call { pending_calls: old_pending, next_idx, results, .. } = &mut frame.kind {
+                    if let CallFrameKind::Call { pending_calls: old_pending, next_idx, .. } = &mut frame.kind {
                         *old_pending = pending_calls;
                         *next_idx = 0;
-                        results.clear();
                     }
                     frame.locals_to_pop = 0;
                     
@@ -2056,7 +2194,9 @@ fn dispatch_call(
             }
 
             let mut matched_any = false;
-            if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(fn_name, arity, funcs) {
+            let user_clauses = crate::eval::forms::query::lookup_user_clauses(fn_name, arity, funcs);
+            let has_clauses = user_clauses.is_some();
+            if let Some(clauses) = user_clauses {
                 let cache_key = (fn_name.to_string(), arity);
                 let cached = FN_BYTECODE_CACHE.with(|cache_ref| {
                     let mut cache = cache_ref.borrow_mut();
@@ -2110,6 +2250,8 @@ fn dispatch_call(
                         Atom::Expr(crate::atom::expr_data(args.to_vec())),
                     ]));
                     results.push((partial_atom, combo_env.clone()));
+                } else if has_clauses {
+                    // ponytail: defined user function with no matching clauses under PeTTa semantics returns empty/fails
                 } else {
                     let mut items = vec![Atom::sym(fn_name)];
                     items.extend(args.to_vec());
@@ -2299,18 +2441,24 @@ fn run_next_if_iteration(state: &mut VMState) -> Result<Option<Env>, String> {
             truthy_count: _,
             results: _,
         } = &mut frame.kind {
-            if *next_idx < condition_rs.len() {
+            while *next_idx < condition_rs.len() {
                 let (cond, cond_env) = &condition_rs[*next_idx];
                 *next_idx += 1;
-                let is_true = cond.is_truthy();
-                let code_to_run = if is_true { then_code } else { else_code };
                 
-                let branch_env = if is_true {
-                    crate::eval::shared::pattern::prepend_env(cond_env.clone(), &frame.saved_base_env)
+                let cond_str = cond.as_sym().map(|s| s.to_string()).unwrap_or_default();
+                let is_true = cond_str.eq_ignore_ascii_case("true");
+                let is_false = cond_str.eq_ignore_ascii_case("false");
+                
+                if is_true {
+                    let branch_env = crate::eval::shared::pattern::prepend_env(cond_env.clone(), &frame.saved_base_env);
+                    to_run = Some((then_code.clone(), free_vars_map.clone(), branch_env));
+                    break;
+                } else if is_false {
+                    to_run = Some((else_code.clone(), free_vars_map.clone(), frame.saved_base_env.clone()));
+                    break;
                 } else {
-                    frame.saved_base_env.clone()
-                };
-                to_run = Some((code_to_run.clone(), free_vars_map.clone(), branch_env));
+                    // ponytail: Ignore/skip unevaluated condition results to fail/backtrack gracefully
+                }
             }
         }
     }

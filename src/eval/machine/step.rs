@@ -42,6 +42,7 @@ pub(crate) fn run_rs(
     budget: &mut Option<i64>,
 ) -> Result<ResultSet, String> {
     crate::env::clear_lookup_cache();
+    super::vm::compiler::set_current_funcs(funcs);
 
     // Compiling with bytecode VM
     let mut comp = super::vm::VMCompiler::new(&[], None);

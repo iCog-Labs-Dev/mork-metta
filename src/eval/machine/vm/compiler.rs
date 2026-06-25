@@ -1,6 +1,26 @@
 use crate::atom::Atom;
 use crate::parser::Expr;
-use super::op::{Opcode, CaseBranch};
+use super::op::{Opcode, CaseBranch, QuoteVarSource, QuoteVarMatch};
+
+use std::cell::Cell;
+use std::cell::RefCell;
+
+thread_local! {
+    pub static CURRENT_FN_TABLE: RefCell<Option<*const crate::func::FnTable>> = const { RefCell::new(None) };
+    pub static IN_USER_ARG: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn set_current_funcs(funcs: &crate::func::FnTable) {
+    CURRENT_FN_TABLE.with(|cell| {
+        *cell.borrow_mut() = Some(funcs as *const crate::func::FnTable);
+    });
+}
+
+pub fn current_funcs() -> Option<&'static crate::func::FnTable> {
+    CURRENT_FN_TABLE.with(|cell| {
+        cell.borrow().map(|ptr| unsafe { &*ptr })
+    })
+}
 
 pub struct VMCompiler {
     pub locals: Vec<String>,
@@ -58,8 +78,31 @@ impl VMCompiler {
                 if let Expr::Symbol(head) = &items[0] {
                     match head.as_str() {
                         "quote" if items.len() == 2 => {
-                            let atom = crate::parser::expr_to_atom(&items[1]);
-                            code.push(Opcode::Const(atom));
+                            let in_user_arg = IN_USER_ARG.get();
+                            if in_user_arg {
+                                let mut vars = Vec::new();
+                                let mut path = vec![1];
+                                collect_quote_vars(&items[1], &mut path, &self.locals, &mut self.free_vars, &mut vars);
+                                if vars.is_empty() {
+                                    let atom = crate::parser::expr_to_atom(expr);
+                                    code.push(Opcode::Const(atom));
+                                } else {
+                                    let template = crate::parser::expr_to_atom(expr);
+                                    code.push(Opcode::ConstQuote { template, vars });
+                                }
+                            } else {
+                                // ponytail: strip the outer quote wrapper during compilation in normal contexts so it evaluates to the inner expression as a constant/ConstQuote
+                                let mut vars = Vec::new();
+                                let mut path = Vec::new();
+                                collect_quote_vars(&items[1], &mut path, &self.locals, &mut self.free_vars, &mut vars);
+                                if vars.is_empty() {
+                                    let atom = crate::parser::expr_to_atom(&items[1]);
+                                    code.push(Opcode::Const(atom));
+                                } else {
+                                    let template = crate::parser::expr_to_atom(&items[1]);
+                                    code.push(Opcode::ConstQuote { template, vars });
+                                }
+                            }
                             return Ok(());
                         }
                         "empty" => {
@@ -667,12 +710,51 @@ impl VMCompiler {
                 }
                 // General application
                 let arity = items.len() - 1;
+                let fname_opt = if let Expr::Symbol(ref fname) = items[0] {
+                    Some(fname.clone())
+                } else {
+                    None
+                };
+
+                let is_user_fn = if let Some(ref fname) = fname_opt {
+                    if let Some(funcs) = current_funcs() {
+                        crate::eval::forms::query::lookup_user_clauses(fname, arity as u8, funcs).is_some()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                let lazy_mask = if let Some(ref fname) = fname_opt {
+                    if let Some(funcs) = current_funcs() {
+                        funcs.get_lazy_mask(fname, arity as u8)
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+
                 if is_tail {
                     if let Some(ref fname) = self.fn_name {
-                        if let Expr::Symbol(hname) = &items[0] {
+                        if let Some(ref hname) = fname_opt {
                             if hname == fname && arity == self.arity {
                                 for i in 1..items.len() {
-                                    self.compile(&items[i], code, false)?;
+                                    let is_lazy = lazy_mask.get(i - 1).copied().unwrap_or(false);
+                                    if is_lazy {
+                                        // ponytail: compile lazy argument as a zero-argument closure
+                                        code.push(Opcode::Lambda {
+                                            params: Vec::new(),
+                                            body: items[i].clone(),
+                                            local_names: self.locals.clone(),
+                                        });
+                                    } else {
+                                        let prev_user_arg = IN_USER_ARG.get();
+                                        IN_USER_ARG.set(is_user_fn);
+                                        self.compile(&items[i], code, false)?;
+                                        IN_USER_ARG.set(prev_user_arg);
+                                    }
                                 }
                                 for i in (1..items.len()).rev() {
                                     code.push(Opcode::Store((i - 1) as u8));
@@ -684,7 +766,20 @@ impl VMCompiler {
                     }
                 }
                 for i in 1..items.len() {
-                    self.compile(&items[i], code, false)?;
+                    let is_lazy = lazy_mask.get(i - 1).copied().unwrap_or(false);
+                    if is_lazy {
+                        // ponytail: compile lazy argument as a zero-argument closure
+                        code.push(Opcode::Lambda {
+                            params: Vec::new(),
+                            body: items[i].clone(),
+                            local_names: self.locals.clone(),
+                        });
+                    } else {
+                        let prev_user_arg = IN_USER_ARG.get();
+                        IN_USER_ARG.set(is_user_fn);
+                        self.compile(&items[i], code, false)?;
+                        IN_USER_ARG.set(prev_user_arg);
+                    }
                 }
                 self.compile(&items[0], code, false)?;
                 code.push(Opcode::Call(arity as u8));
@@ -753,3 +848,40 @@ fn collect_pattern_vars(expr: &Expr, set: &mut Vec<String>) {
         _ => {}
     }
 }
+
+fn collect_quote_vars(
+    expr: &Expr,
+    path: &mut Vec<usize>,
+    locals: &[String],
+    free_vars: &mut Vec<String>,
+    vars: &mut Vec<QuoteVarMatch>,
+) {
+    match expr {
+        Expr::Symbol(s) if s.starts_with('$') => {
+            let source = if let Some(pos) = locals.iter().rposition(|x| x == s) {
+                QuoteVarSource::Local(pos as u8)
+            } else {
+                let pos = if let Some(p) = free_vars.iter().position(|x| x == s) {
+                    p
+                } else {
+                    free_vars.push(s.clone());
+                    free_vars.len() - 1
+                };
+                QuoteVarSource::Free(pos as u8)
+            };
+            vars.push(QuoteVarMatch {
+                path: path.clone(),
+                source,
+            });
+        }
+        Expr::List(items) => {
+            for (i, item) in items.iter().enumerate() {
+                path.push(i);
+                collect_quote_vars(item, path, locals, free_vars, vars);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+

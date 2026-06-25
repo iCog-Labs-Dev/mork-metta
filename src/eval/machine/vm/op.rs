@@ -161,4 +161,21 @@ pub enum Opcode {
         pattern_vars: Vec<String>,
         free_vars_map: Vec<String>,
     },
+    ConstQuote {
+        template: Atom,
+        vars: Vec<QuoteVarMatch>,
+    },
 }
+
+#[derive(Clone, Debug)]
+pub enum QuoteVarSource {
+    Local(u8),
+    Free(u8),
+}
+
+#[derive(Clone, Debug)]
+pub struct QuoteVarMatch {
+    pub path: Vec<usize>,
+    pub source: QuoteVarSource,
+}
+
