@@ -99,7 +99,7 @@ impl VMCompiler {
                                 arity: self.arity,
                             };
                             let mut then_code = Vec::new();
-                            then_comp.compile(&items[2], &mut then_code, is_tail)?;
+                            then_comp.compile(&items[2], &mut then_code, false)?;
                             
                             let mut else_comp = VMCompiler {
                                 locals: self.locals.clone(),
@@ -109,7 +109,7 @@ impl VMCompiler {
                             };
                             let mut else_code = Vec::new();
                             if items.len() == 4 {
-                                else_comp.compile(&items[3], &mut else_code, is_tail)?;
+                                else_comp.compile(&items[3], &mut else_code, false)?;
                             }
                             
                             // Combine free vars
@@ -127,6 +127,27 @@ impl VMCompiler {
                                 else_code,
                                 free_vars_map: union_free_vars,
                             });
+                            return Ok(());
+                        }
+                        // ponytail: desugar and/or to if only when both arguments are expressions (lists) to allow logic variable unification on simple symbols
+                        "and" if items.len() == 3 && matches!(&items[1], Expr::List(_)) && matches!(&items[2], Expr::List(_)) => {
+                            let desugared = Expr::List(std::sync::Arc::from([
+                                Expr::Symbol("if".to_string()),
+                                items[1].clone(),
+                                items[2].clone(),
+                                Expr::Symbol("False".to_string()),
+                            ]));
+                            self.compile(&desugared, code, is_tail)?;
+                            return Ok(());
+                        }
+                        "or" if items.len() == 3 && matches!(&items[1], Expr::List(_)) && matches!(&items[2], Expr::List(_)) => {
+                            let desugared = Expr::List(std::sync::Arc::from([
+                                Expr::Symbol("if".to_string()),
+                                items[1].clone(),
+                                Expr::Symbol("True".to_string()),
+                                items[2].clone(),
+                            ]));
+                            self.compile(&desugared, code, is_tail)?;
                             return Ok(());
                         }
                         "case" if items.len() == 3 => {
@@ -155,7 +176,7 @@ impl VMCompiler {
                                 body_comp.locals.extend(pattern_vars.clone());
                                 
                                 let mut branch_code = Vec::new();
-                                body_comp.compile(body, &mut branch_code, is_tail)?;
+                                body_comp.compile(body, &mut branch_code, false)?;
                                 
                                 for v in &body_comp.free_vars {
                                     if !union_free_vars.contains(v) {
@@ -192,7 +213,7 @@ impl VMCompiler {
                             body_comp.locals.extend(pattern_vars.clone());
                             
                             let mut body_code = Vec::new();
-                            body_comp.compile(&items[3], &mut body_code, true)?;
+                            body_comp.compile(&items[3], &mut body_code, false)?;
                             
                             code.push(Opcode::Match {
                                 pattern: items[2].clone(),
@@ -234,7 +255,7 @@ impl VMCompiler {
                             body_comp.locals.extend(pattern_vars.clone());
 
                             let mut body_code = Vec::new();
-                            body_comp.compile(&items[3], &mut body_code, is_tail)?;
+                            body_comp.compile(&items[3], &mut body_code, false)?;
 
                             for v in &body_comp.free_vars {
                                 if !self.free_vars.contains(v) {
@@ -255,7 +276,7 @@ impl VMCompiler {
                                 Expr::List(b) => b,
                                 _ => return Err("let*: bindings must be a list".into()),
                             };
-                            self.compile_let_star(bindings, 0, &items[2], code, is_tail)?;
+                            self.compile_let_star(bindings, 0, &items[2], code, false)?;
                             return Ok(());
                         }
                         "foldall" if items.len() == 4 => {

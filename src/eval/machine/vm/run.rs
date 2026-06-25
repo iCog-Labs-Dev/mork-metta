@@ -180,30 +180,31 @@ pub fn run_vm(
                 }
                 arg_sets.reverse();
                 
-                let head = head_rs.first().map(|(a, _)| a.clone()).unwrap_or(Atom::sym("()"));
-                match head {
-                    Atom::Sym(ref name) => {
-                        if let Some(function) = funcs.get(name, *arity) {
-                            match &function.kind {
-                                FunctionKind::Native { func: native_f } => {
-                                    let mut buf = Vec::new();
-                                    let mut results = Vec::new();
-                                    super::super::apply::cartesian_product_apply::<String>(&arg_sets, &mut buf, &mut |slice: &[Atom]| {
-                                        let res = native_f(slice, funcs)?;
-                                        results.extend(res.into_iter());
-                                        Ok(())
-                                    })?;
-                                    state.stack.push(plain(results));
+                // ponytail: thread the head results set as part of combos to preserve logic variable environment bindings
+                let mut sets = vec![head_rs];
+                sets.extend(arg_sets);
+                let full_combos = super::super::apply::threaded_combinations(&sets);
+                let mut results = Vec::new();
+
+                'combos_loop: for (combo, combo_env) in full_combos {
+                    let head_atom = &combo[0];
+                    let args = &combo[1..];
+                    match head_atom {
+                        Atom::Sym(name) => {
+                            if let Some(function) = funcs.get(name, *arity) {
+                                match &function.kind {
+                                    FunctionKind::Native { func: native_f } => {
+                                        let res = native_f(args, funcs)?;
+                                        for a in res {
+                                            results.push((a, combo_env.clone()));
+                                        }
+                                    }
                                 }
-                            }
-                        } else {
-                            // User function call lookup
-                            let combos = super::super::apply::threaded_combinations(&arg_sets);
-                            let mut results = Vec::new();
-                            if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(name, *arity, funcs) {
-                                'combos_loop: for (combo, combo_env) in combos {
+                            } else {
+                                // User function call lookup
+                                if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(name, *arity, funcs) {
                                     for (patterns, body) in &clauses {
-                                        if let Some((body_env, subst_cost)) = crate::eval::forms::query::match_clause(patterns, &combo, &combo_env, funcs) {
+                                        if let Some((body_env, subst_cost)) = crate::eval::forms::query::match_clause(patterns, args, &combo_env, funcs) {
                                             let mut comp = super::compiler::VMCompiler::new(patterns, Some(name.to_string()));
                                             let mut code = Vec::new();
                                             comp.compile(body, &mut code, true)?;
@@ -236,40 +237,31 @@ pub fn run_vm(
                                             }
                                         }
                                     }
-                                }
-                            } else if funcs.has_higher_arity(name, *arity as usize) {
-                                let partial_args: Vec<Atom> = arg_sets.iter().flatten().map(|(a, _)| a.clone()).collect();
-                                results.push((
-                                    Atom::Expr(crate::atom::expr_data([
-                                        Atom::sym("partial"),
-                                        Atom::Sym(name.clone()),
-                                        Atom::Expr(crate::atom::expr_data(partial_args)),
-                                    ])),
-                                    Env::new(),
-                                ));
-                            } else {
-                                // Data constructor fallback
-                                for (combo, combo_env) in combos {
+                                } else if funcs.has_higher_arity(name, *arity as usize) {
+                                    results.push((
+                                        Atom::Expr(crate::atom::expr_data([
+                                            Atom::sym("partial"),
+                                            Atom::Sym(name.clone()),
+                                            Atom::Expr(crate::atom::expr_data(args.to_vec())),
+                                        ])),
+                                        combo_env.clone(),
+                                    ));
+                                } else {
+                                    // Data constructor fallback
                                     let mut items = vec![Atom::sym(name)];
-                                    items.extend(combo);
+                                    items.extend(args.to_vec());
                                     let substituted: Vec<Atom> = items
                                         .iter()
                                         .map(|a| crate::eval::shared::subst::subst_atom(a, &combo_env))
                                         .collect();
-                                    results.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env));
+                                    results.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env.clone()));
                                 }
                             }
-                            state.stack.push(results);
                         }
-                    }
-                    Atom::Closure(ref c) => {
-                        // ponytail: apply anonymous closure by matching arguments and running the body in sub-VM
-                        let clauses: Vec<(Vec<Expr>, Expr)> = vec![(c.params.clone(), c.body.clone())];
-                        let combos_with_envs = super::super::apply::threaded_combinations(&arg_sets);
-                        let mut results = Vec::new();
-                        for (combo, combo_env) in combos_with_envs {
+                        Atom::Closure(c) => {
+                            let clauses: Vec<(Vec<Expr>, Expr)> = vec![(c.params.clone(), c.body.clone())];
                             for (patterns, body) in &clauses {
-                                if let Some((body_env, _subst_cost)) = crate::eval::forms::query::match_clause(patterns, &combo, &combo_env, funcs) {
+                                if let Some((body_env, _subst_cost)) = crate::eval::forms::query::match_clause(patterns, args, &combo_env, funcs) {
                                     let body = crate::eval::shared::fresh::rename_apart_unbound_vars(
                                         body,
                                         patterns,
@@ -293,21 +285,16 @@ pub fn run_vm(
                                     results.extend(res);
                                     if cut_executed {
                                         state.cut_executed = true;
-                                        break;
+                                        break 'combos_loop;
                                     }
                                 }
                             }
                         }
-                        state.stack.push(results);
-                    }
-                    Atom::Expr(ref items) if items.len() == 3 && items[0] == Atom::sym("partial") => {
-                        if let Atom::Sym(fn_name) = &items[1] {
-                            if let Atom::Expr(old_args) = &items[2] {
-                                let mut results = Vec::new();
-                                let mut buf = Vec::new();
-                                super::super::apply::cartesian_product_apply(&arg_sets, &mut buf, &mut |combo: &[Atom]| {
+                        Atom::Expr(items) if items.len() == 3 && items[0] == Atom::sym("partial") => {
+                            if let Atom::Sym(fn_name) = &items[1] {
+                                if let Atom::Expr(old_args) = &items[2] {
                                     let mut all_args: Vec<Atom> = old_args.to_vec();
-                                    all_args.extend_from_slice(combo);
+                                    all_args.extend_from_slice(args);
                                     let fn_expr = crate::parser::atom_to_expr(&Atom::Sym(fn_name.clone()))
                                         .unwrap_or(crate::parser::Expr::Symbol(fn_name.to_string()));
                                     let mut call_items = vec![fn_expr];
@@ -320,36 +307,28 @@ pub fn run_vm(
                                     let call_expr = crate::parser::Expr::List(call_items.into());
                                     let body_rs = super::super::step::run_rs(
                                         std::sync::Arc::new(call_expr),
-                                        crate::env::Env::new(),
+                                        combo_env.clone(),
                                         funcs,
                                         &mut state.budget,
                                     )?;
                                     results.extend(body_rs);
-                                    Ok::<(), String>(())
-                                })?;
-                                state.stack.push(results);
+                                } else {
+                                    return Err("partial application second argument must be an expression of old arguments".into());
+                                }
                             } else {
-                                return Err("partial application second argument must be an expression of old arguments".into());
+                                return Err("partial application first argument must be a symbol (function name)".into());
                             }
-                        } else {
-                            return Err("partial application first argument must be a symbol (function name)".into());
                         }
-                    }
-                    _ => {
-                        let mut sets = vec![head_rs];
-                        sets.extend(arg_sets);
-                        let combos = super::super::apply::threaded_combinations(&sets);
-                        let mut lists = Vec::new();
-                        for (combo, combo_env) in combos {
+                        _ => {
                             let substituted: Vec<Atom> = combo
                                 .iter()
                                 .map(|a| crate::eval::shared::subst::subst_atom(a, &combo_env))
                                 .collect();
-                            lists.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env));
+                            results.push((Atom::Expr(crate::atom::expr_data(substituted)), combo_env.clone()));
                         }
-                        state.stack.push(lists);
                     }
                 }
+                state.stack.push(results);
                 state.ip += 1;
             }
             Opcode::DebitBudget(cost) => {
@@ -538,7 +517,12 @@ pub fn run_vm(
             }
             Opcode::If { then_code, else_code, free_vars_map } => {
                 let condition_rs = state.stack.pop().ok_or("VM stack underflow on If")?;
-                let had_bindings = condition_rs.iter().any(|(_, cond_env)| !cond_env.is_empty_env());
+                // ponytail: count truthy branches and check bindings only on truthy ones
+                // Collapse is needed when the condition *itself* was non-det (multiple truthy bindings),
+                // e.g. (if (and (or $x True) $y) ...) — not when the then-branch is recursive.
+                let truthy_condition_count = condition_rs.iter().filter(|(cond, _)| cond.is_truthy()).count();
+                let had_nondet_truthy = truthy_condition_count > 1
+                    && condition_rs.iter().any(|(_, env)| !env.is_empty_env());
                 let mut results = Vec::new();
                 for (cond, cond_env) in condition_rs {
                     let is_true = cond.is_truthy();
@@ -569,7 +553,7 @@ pub fn run_vm(
                         break;
                     }
                 }
-                let final_results = if had_bindings && results.len() > 1 {
+                let final_results = if had_nondet_truthy && results.len() > 1 {
                     let atoms: Vec<Atom> = results
                         .iter()
                         .map(|(atom, env)| crate::eval::shared::subst::subst_atom(atom, env))
