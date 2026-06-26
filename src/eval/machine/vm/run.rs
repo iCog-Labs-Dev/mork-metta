@@ -2212,6 +2212,50 @@ fn dispatch_call(
                         } else {
                             None
                         };
+                        // special case for "member" to bind input variables in the environment
+                        if fn_name.as_ref() == "member" && arity == 2 {
+                            let items = match &args[1] {
+                                Atom::Expr(v) => v.to_vec(),
+                                other => vec![other.clone()],
+                            };
+                            for item in &items {
+                                if args[0] == *item {
+                                    results.push((Atom::sym("True"), combo_env.clone()));
+                                } else if let Some(bindings) = crate::eval::machine::state::unify(&args[0], item) {
+                                    let mut merged_env = combo_env.clone();
+                                    for (name, val) in bindings {
+                                        merged_env = crate::eval::shared::env::bind(&merged_env, &name, val);
+                                    }
+                                    results.push((Atom::sym("True"), merged_env));
+                                }
+                            }
+                            return Ok(());
+                        }
+                        // special case for "is-member" to bind input variables in the environment
+                        if fn_name.as_ref() == "is-member" && arity == 2 {
+                            let items = match &args[1] {
+                                Atom::Expr(v) => v.to_vec(),
+                                other => vec![other.clone()],
+                            };
+                            let mut unifiable_results = Vec::new();
+                            for item in &items {
+                                if args[0] == *item {
+                                    unifiable_results.push((crate::builtins::boolean::bool_atom(true), combo_env.clone()));
+                                } else if let Some(bindings) = crate::eval::machine::state::unify(&args[0], item) {
+                                    let mut merged_env = combo_env.clone();
+                                    for (name, val) in bindings {
+                                        merged_env = crate::eval::shared::env::bind(&merged_env, &name, val);
+                                    }
+                                    unifiable_results.push((crate::builtins::boolean::bool_atom(true), merged_env));
+                                }
+                            }
+                            if unifiable_results.is_empty() {
+                                results.push((crate::builtins::boolean::bool_atom(false), combo_env.clone()));
+                            } else {
+                                results.extend(unifiable_results);
+                            }
+                            return Ok(());
+                        }
                         let res = native_f(args, funcs)?;
                         for a in res {
                             results.push((a, combo_env.clone()));
