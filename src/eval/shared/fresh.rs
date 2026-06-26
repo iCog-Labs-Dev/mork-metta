@@ -52,7 +52,7 @@ fn freshen_symbol(
     if let Some(mapped) = locals.get(symbol) {
         return mapped.clone();
     }
-    // ponytail: query the local bound parameters HashSet (very small!)
+    // query the local bound parameters HashSet (very small!)
     if bound_vars.contains(symbol) {
         return symbol.to_string();
     }
@@ -251,7 +251,7 @@ fn freshen_expr_inner_opt(
 /// Local binders in a few core forms (`let`, `let*`, `|->`) are handled so
 /// shadowing remains correct.
 pub(crate) fn rename_apart_unbound_vars(expr: &Expr, patterns: &[Expr]) -> Expr {
-    // ponytail: check has_variables only at the root entry point
+    // check has_variables only at the root entry point
     if !has_variables(expr) {
         return expr.clone();
     }

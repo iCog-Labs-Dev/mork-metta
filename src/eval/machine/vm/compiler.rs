@@ -168,7 +168,7 @@ impl VMCompiler {
                             code.push(Opcode::If {
                                 then_code: std::sync::Arc::from(then_code),
                                 else_code: std::sync::Arc::from(else_code),
-                                free_vars_map: union_free_vars,
+                                free_vars_map: std::sync::Arc::from(union_free_vars),
                             });
                             return Ok(());
                         }
@@ -231,7 +231,7 @@ impl VMCompiler {
                                     pattern: pattern.clone(),
                                     body_code: std::sync::Arc::from(branch_code),
                                     pattern_vars,
-                                    free_vars_map: body_comp.free_vars,
+                                    free_vars_map: std::sync::Arc::from(body_comp.free_vars),
                                 });
                             }
                             self.free_vars = union_free_vars;
@@ -263,7 +263,7 @@ impl VMCompiler {
                                 body_code: std::sync::Arc::from(body_code),
                                 local_names: self.locals.clone(),
                                 pattern_vars,
-                                free_vars_map: body_comp.free_vars,
+                                free_vars_map: std::sync::Arc::from(body_comp.free_vars),
                             });
                             return Ok(());
                         }
@@ -309,7 +309,7 @@ impl VMCompiler {
                                 pattern: items[1].clone(),
                                 body_code: std::sync::Arc::from(body_code),
                                 pattern_vars,
-                                free_vars_map: body_comp.free_vars,
+                                free_vars_map: std::sync::Arc::from(body_comp.free_vars),
                             });
                             return Ok(());
                         }
@@ -374,7 +374,7 @@ impl VMCompiler {
                             code.push(Opcode::FoldlLambda {
                                 var_names,
                                 body_code: std::sync::Arc::from(body_code),
-                                free_vars_map: body_comp.free_vars,
+                                free_vars_map: std::sync::Arc::from(body_comp.free_vars),
                             });
                             return Ok(());
                         }
@@ -404,14 +404,14 @@ impl VMCompiler {
                                 code.push(Opcode::MapAtomLambda {
                                     var_name: var_name.clone(),
                                     body_code: std::sync::Arc::from(body_code),
-                                    free_vars_map: body_comp.free_vars,
+                                    free_vars_map: std::sync::Arc::from(body_comp.free_vars),
                                 });
                             } else {
                                 code.push(Opcode::MapAtomPatternLambda {
                                     pattern: items[2].clone(),
                                     body_code: std::sync::Arc::from(body_code),
                                     pattern_vars,
-                                    free_vars_map: body_comp.free_vars,
+                                    free_vars_map: std::sync::Arc::from(body_comp.free_vars),
                                 });
                             }
                             return Ok(());
@@ -442,14 +442,14 @@ impl VMCompiler {
                                 code.push(Opcode::FilterAtomLambda {
                                     var_name: var_name.clone(),
                                     body_code: std::sync::Arc::from(body_code),
-                                    free_vars_map: body_comp.free_vars,
+                                    free_vars_map: std::sync::Arc::from(body_comp.free_vars),
                                 });
                             } else {
                                 code.push(Opcode::FilterAtomPatternLambda {
                                     pattern: items[2].clone(),
                                     body_code: std::sync::Arc::from(body_code),
                                     pattern_vars,
-                                    free_vars_map: body_comp.free_vars,
+                                    free_vars_map: std::sync::Arc::from(body_comp.free_vars),
                                 });
                             }
                             return Ok(());
@@ -461,7 +461,7 @@ impl VMCompiler {
                             let mut body_code = Vec::new();
                             body_comp.compile(&items[1], &mut body_code, false)?;
                             for v in &body_comp.free_vars { if !self.free_vars.contains(v) { self.free_vars.push(v.clone()); } }
-                            code.push(Opcode::Once { body_code: std::sync::Arc::from(body_code), free_vars_map: body_comp.free_vars });
+                            code.push(Opcode::Once { body_code: std::sync::Arc::from(body_code), free_vars_map: std::sync::Arc::from(body_comp.free_vars) });
                             return Ok(());
                         }
                         "progn" if items.len() >= 2 => {
@@ -478,7 +478,7 @@ impl VMCompiler {
                                 bodies.push(bcode);
                             }
                             self.free_vars = fvs.clone();
-                            code.push(Opcode::Progn { bodies: bodies.into_iter().map(std::sync::Arc::from).collect(), free_vars_map: fvs });
+                            code.push(Opcode::Progn { bodies: bodies.into_iter().map(std::sync::Arc::from).collect(), free_vars_map: std::sync::Arc::from(fvs) });
                             return Ok(());
                         }
                         "prog1" if items.len() >= 2 => {
@@ -493,7 +493,7 @@ impl VMCompiler {
                                 bodies.push(bcode);
                             }
                             self.free_vars = fvs.clone();
-                            code.push(Opcode::Prog1 { bodies: bodies.into_iter().map(std::sync::Arc::from).collect(), free_vars_map: fvs });
+                            code.push(Opcode::Prog1 { bodies: bodies.into_iter().map(std::sync::Arc::from).collect(), free_vars_map: std::sync::Arc::from(fvs) });
                             return Ok(());
                         }
                         "chain" if items.len() >= 4 && items.len() % 2 == 0 => {
@@ -522,7 +522,7 @@ impl VMCompiler {
                             code.push(Opcode::Chain {
                                 steps: steps.into_iter().map(|(bc, v)| (std::sync::Arc::from(bc), v)).collect(),
                                 final_code: std::sync::Arc::from(final_code),
-                                free_vars_map: fvs,
+                                free_vars_map: std::sync::Arc::from(fvs),
                             });
                             return Ok(());
                         }
@@ -541,7 +541,7 @@ impl VMCompiler {
                             }
                             code.push(Opcode::Within {
                                 body_code: std::sync::Arc::from(body_code),
-                                free_vars_map: body_comp.free_vars,
+                                free_vars_map: std::sync::Arc::from(body_comp.free_vars),
                             });
                             return Ok(());
                         }
@@ -561,7 +561,7 @@ impl VMCompiler {
                             }
                             code.push(Opcode::WithMutex {
                                 body_code: std::sync::Arc::from(body_code),
-                                free_vars_map: body_comp.free_vars,
+                                free_vars_map: std::sync::Arc::from(body_comp.free_vars),
                             });
                             return Ok(());
                         }
@@ -580,7 +580,7 @@ impl VMCompiler {
                             }
                             code.push(Opcode::Transaction {
                                 body_code: std::sync::Arc::from(body_code),
-                                free_vars_map: body_comp.free_vars,
+                                free_vars_map: std::sync::Arc::from(body_comp.free_vars),
                             });
                             return Ok(());
                         }
@@ -689,7 +689,7 @@ impl VMCompiler {
                                 else_code: std::sync::Arc::from(else_code),
                                 pattern_vars,
                                 local_names: self.locals.clone(),
-                                free_vars_map: union_free_vars,
+                                free_vars_map: std::sync::Arc::from(union_free_vars),
                             });
                             return Ok(());
                         }
@@ -835,7 +835,7 @@ impl VMCompiler {
             pattern: pattern.clone(),
             body_code: std::sync::Arc::from(body_code),
             pattern_vars,
-            free_vars_map: body_comp.free_vars,
+            free_vars_map: std::sync::Arc::from(body_comp.free_vars),
         });
         Ok(())
     }

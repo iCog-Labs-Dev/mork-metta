@@ -278,7 +278,7 @@ pub fn run_vm(
                     }
                     _ => fresh,
                 };
-                state.stack.push(plain(vec![resolved]));
+                state.stack.push(vec![(resolved, base_env.clone())]);
                 state.ip += 1;
             }
             Opcode::Pop => {
@@ -732,7 +732,8 @@ pub fn run_vm(
                     None
                 };
                 let val_rs = state.stack.pop().ok_or("VM stack underflow on Collapse")?;
-                let atoms: Vec<Atom> = val_rs.into_iter().map(|(a, _)| a).collect();
+                // substitute environment variables on collapse
+                let atoms: Vec<Atom> = val_rs.into_iter().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)).collect();
                 state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(atoms))]));
                 state.ip += 1;
             }
@@ -748,7 +749,8 @@ pub fn run_vm(
                 let expr_rs = state.stack.pop().ok_or("VM stack underflow on Test expr")?;
 
                 // Collect ALL atoms from the expression result set (like PeTTa's findall)
-                let expr_atoms: Vec<Atom> = expr_rs.into_iter().map(|(a, _)| a).collect();
+                // substitute environments to resolve variables before comparison
+                let expr_atoms: Vec<Atom> = expr_rs.into_iter().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)).collect();
 
                 // If single result, use directly; if multiple or empty, use as list
                 let actual = if expr_atoms.len() == 1 {
@@ -758,7 +760,8 @@ pub fn run_vm(
                 };
 
                 // Expected value: take the first result
-                let expected_atoms: Vec<Atom> = expected_rs.into_iter().map(|(a, _)| a).collect();
+                // substitute expected environment as well
+                let expected_atoms: Vec<Atom> = expected_rs.into_iter().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)).collect();
                 let expected = if expected_atoms.len() == 1 {
                     expected_atoms.into_iter().next().unwrap()
                 } else {
@@ -1083,11 +1086,12 @@ pub fn run_vm(
                 let init_rs = state.stack.pop().ok_or("VM stack underflow on Foldall init")?;
                 let gen_rs = state.stack.pop().ok_or("VM stack underflow on Foldall generator")?;
 
-                let agg_atom = agg_rs.into_iter().next().map(|(a, _)| a)
+                // substitute environments to resolve variables
+                let agg_atom = agg_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
                     .ok_or_else(|| "foldall: agg-func produced no value".to_string())?;
-                let init_atom = init_rs.into_iter().next().map(|(a, _)| a)
+                let init_atom = init_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
                     .ok_or_else(|| "foldall: init produced no result".to_string())?;
-                let gen_values: Vec<Atom> = gen_rs.into_iter().map(|(a, _)| a).collect();
+                let gen_values: Vec<Atom> = gen_rs.into_iter().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)).collect();
 
                 let (agg_head, agg_env) = match &agg_atom {
                     Atom::Sym(name) => {
@@ -1113,7 +1117,8 @@ pub fn run_vm(
                         &state.free_vars_map,
                         &state.free_vars_bindings,
                     )?;
-                    accum = res.into_iter().next().map(|(a, _)| a)
+                    // substitute env
+                    accum = res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
                         .ok_or_else(|| "foldall: agg-func produced no result".to_string())?;
                 }
                 state.stack.push(plain(vec![accum]));
@@ -1124,9 +1129,10 @@ pub fn run_vm(
                 let check_rs = state.stack.pop().ok_or("VM stack underflow on Forall check")?;
                 let gen_rs = state.stack.pop().ok_or("VM stack underflow on Forall generator")?;
 
-                let check_atom = check_rs.into_iter().next().map(|(a, _)| a)
+                // substitute env
+                let check_atom = check_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
                     .ok_or_else(|| "forall: check produced no value".to_string())?;
-                let gen_values: Vec<Atom> = gen_rs.into_iter().map(|(a, _)| a).collect();
+                let gen_values: Vec<Atom> = gen_rs.into_iter().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)).collect();
 
                 let check_head = match &check_atom {
                     Atom::Sym(name) => Expr::Symbol(name.to_string()),
@@ -1150,7 +1156,8 @@ pub fn run_vm(
                         &state.free_vars_map,
                         &state.free_vars_bindings,
                     )?;
-                    let results: Vec<Atom> = res.into_iter().map(|(a, _)| a).collect();
+                    // substitute env
+                    let results: Vec<Atom> = res.into_iter().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)).collect();
                     if results.is_empty() || !results.iter().all(|a| crate::eval::forms::control::is_truthy(a)) {
                         is_forall_true = false;
                         break;
@@ -1166,11 +1173,12 @@ pub fn run_vm(
                 let acc_rs = state.stack.pop().ok_or("VM stack underflow on Foldl acc")?;
                 let list_rs = state.stack.pop().ok_or("VM stack underflow on Foldl list")?;
 
-                let func = func_rs.into_iter().next().map(|(a, _)| a)
+                // substitute environments to resolve variables
+                let func = func_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
                     .ok_or_else(|| "foldl-atom: func arg produced no result".to_string())?;
-                let acc = acc_rs.into_iter().next().map(|(a, _)| a)
+                let acc = acc_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
                     .ok_or_else(|| "foldl-atom: acc arg produced no result".to_string())?;
-                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
                     Some(Atom::Expr(v)) => v.to_vec(),
                     Some(other) => vec![other],
                     None => return Err("foldl-atom: list arg produced no result".to_string()),
@@ -1196,7 +1204,8 @@ pub fn run_vm(
                         &state.free_vars_map,
                         &state.free_vars_bindings,
                     )?;
-                    current_acc = res.into_iter().next().map(|(a, _)| a).unwrap_or(current_acc);
+                    // substitute env
+                    current_acc = res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)).unwrap_or(current_acc);
                 }
                 state.stack.push(plain(vec![current_acc]));
                 state.ip += 1;
@@ -1210,9 +1219,10 @@ pub fn run_vm(
                 let acc_rs = state.stack.pop().ok_or("VM stack underflow on FoldlLambda acc")?;
                 let list_rs = state.stack.pop().ok_or("VM stack underflow on FoldlLambda list")?;
 
-                let acc = acc_rs.into_iter().next().map(|(a, _)| a)
+                // substitute env
+                let acc = acc_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
                     .ok_or_else(|| "foldl-atom: acc arg produced no result".to_string())?;
-                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
                     Some(Atom::Expr(v)) => v.to_vec(),
                     Some(other) => vec![other],
                     None => return Err("foldl-atom: list arg produced no result".to_string()),
@@ -1245,7 +1255,8 @@ pub fn run_vm(
                     }
                     let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &step_env)?;
                     state.budget = sub_budget;
-                    current_acc = res.into_iter().next().map(|(a, _)| a).unwrap_or(current_acc);
+                    // substitute env
+                    current_acc = res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)).unwrap_or(current_acc);
                     match exit_status {
                         VmExit::Cut => {
                             state.cut_executed = true;
@@ -1267,7 +1278,8 @@ pub fn run_vm(
             } => {
                 // MapAtomLambda maps list elements using a precompiled lambda body code for high performance
                 let list_rs = state.stack.pop().ok_or("VM stack underflow on MapAtomLambda")?;
-                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                // substitute env to resolve variables in list argument
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
                     Some(Atom::Expr(v)) => v.to_vec(),
                     Some(other) => vec![other],
                     None => return Err("map-atom: list arg produced no result".to_string()),
@@ -1291,8 +1303,9 @@ pub fn run_vm(
                     let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &sub_env)?;
                     state.budget = sub_budget;
                     
-                    if let Some((val, _)) = res.into_iter().next() {
-                        mapped_results.push(val);
+                    // substitute env for mapped item
+                    if let Some((val, env)) = res.into_iter().next() {
+                        mapped_results.push(crate::eval::shared::subst::subst_atom(&val, &env));
                     }
                     match exit_status {
                         VmExit::Cut => {
@@ -1315,7 +1328,8 @@ pub fn run_vm(
             } => {
                 // FilterAtomLambda filters list elements using a precompiled lambda condition code for high performance
                 let list_rs = state.stack.pop().ok_or("VM stack underflow on FilterAtomLambda")?;
-                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                // substitute env to resolve variables in list argument
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
                     Some(Atom::Expr(v)) => v.to_vec(),
                     Some(other) => vec![other],
                     None => return Err("filter-atom: list arg produced no result".to_string()),
@@ -1339,7 +1353,8 @@ pub fn run_vm(
                     let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &sub_env)?;
                     state.budget = sub_budget;
                     
-                    let is_true = res.into_iter().next().map(|(a, _)| a.is_truthy()).unwrap_or(false);
+                    // substitute env
+                    let is_true = res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env).is_truthy()).unwrap_or(false);
                     if is_true {
                         filtered_results.push(elem);
                     }
@@ -1441,10 +1456,12 @@ pub fn run_vm(
                         }
                         VmExit::Cut => {
                             state.cut_executed = true;
-                            res.into_iter().next().map(|(a, _)| a)
+                            // substitute env to preserve variables
+                            res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
                         }
                         VmExit::Normal => {
-                            res.into_iter().next().map(|(a, _)| a)
+                            // substitute env to preserve variables
+                            res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
                         }
                     }.ok_or_else(|| format!("chain: expression for {} produced no result", var_name))?;
                     
@@ -1452,7 +1469,9 @@ pub fn run_vm(
                     if let Some(pos) = state.free_vars_map.iter().position(|x| x == var_name) {
                         state.free_vars_bindings[pos] = val;
                     } else {
-                        state.free_vars_map.push(var_name.clone());
+                        let mut temp = state.free_vars_map.to_vec();
+                        temp.push(var_name.clone());
+                        state.free_vars_map = std::sync::Arc::from(temp);
                         state.free_vars_bindings.push(val);
                     }
                     if state.cut_executed { break; }
@@ -1500,7 +1519,8 @@ pub fn run_vm(
                     }
                     VmExit::Normal => {}
                 }
-                let atoms: Vec<Atom> = res.into_iter().map(|(a, _)| a).collect();
+                // substitute env on Within to resolve variables
+                let atoms: Vec<Atom> = res.into_iter().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)).collect();
                 if atoms.is_empty() {
                     return Err("within: expression produced no results".into());
                 }
@@ -1513,7 +1533,8 @@ pub fn run_vm(
             Opcode::WithMutex { body_code, free_vars_map } => {
                 // pop evaluated mutex name, acquire named lock, run body, release
                 let name_rs = state.stack.pop().ok_or("VM stack underflow on WithMutex")?;
-                let mutex_name = name_rs.into_iter().next().map(|(a, _)| a.to_sexpr_string()).unwrap_or_default();
+                // substitute env
+                let mutex_name = name_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env).to_sexpr_string()).unwrap_or_default();
                 let mut sub_state = VMState::new_with_parent(
                     body_code.clone(),
                     free_vars_map.clone(),
@@ -1581,8 +1602,9 @@ pub fn run_vm(
             Opcode::ImportFile { path } => {
                 // reuse existing apply.rs Frame::ImportFile logic directly
                 let space_rs = state.stack.pop().ok_or("VM stack underflow on ImportFile")?;
+                // substitute env
                 let space_ref = space_rs
-                    .into_iter().next().map(|(a, _)| a)
+                    .into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
                     .unwrap_or_else(|| Atom::sym("&self"));
                 let import_dir = funcs.import_dir.lock().unwrap().clone();
                 let resolved = crate::eval::io::resolve_import_path(&path, &import_dir)
@@ -1635,7 +1657,8 @@ pub fn run_vm(
                 let path_rs = state.stack.pop().ok_or("VM stack underflow on ImportDynamic path")?;
                 let space_rs = state.stack.pop().ok_or("VM stack underflow on ImportDynamic space")?;
 
-                let path = match path_rs.first().map(|(a, _)| a) {
+                // substitute env
+                let path = match path_rs.first().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
                     Some(Atom::Sym(s)) | Some(Atom::Str(s)) => s.clone(),
                     Some(Atom::Expr(expr)) if expr.len() == 2 => {
                         if let (Some(Atom::Sym(head)), Some(py_atom)) = (expr.get(0), expr.get(1)) {
@@ -1654,7 +1677,8 @@ pub fn run_vm(
                     _ => return Err("import!: path must be a symbol or string".into()),
                 };
 
-                let space_ref = space_rs.first().map(|(a, _)| a).cloned()
+                // substitute env
+                let space_ref = space_rs.first().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
                     .unwrap_or_else(|| Atom::sym("&self"));
 
                 let is_py = path.ends_with(".py");
@@ -1719,7 +1743,8 @@ pub fn run_vm(
                 free_vars_map,
             } => {
                 let list_rs = state.stack.pop().ok_or("VM stack underflow on MapAtomPatternLambda")?;
-                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                // substitute env
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
                     Some(Atom::Expr(v)) => v.to_vec(),
                     Some(other) => vec![other],
                     None => return Err("map-atom: list arg produced no result".to_string()),
@@ -1748,8 +1773,9 @@ pub fn run_vm(
                         let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &matched_env)?;
                         state.budget = sub_budget;
 
-                        if let Some((val, _)) = res.into_iter().next() {
-                            mapped_results.push(val);
+                        // substitute env
+                        if let Some((val, env)) = res.into_iter().next() {
+                            mapped_results.push(crate::eval::shared::subst::subst_atom(&val, &env));
                         }
                         match exit_status {
                             VmExit::Cut => {
@@ -1773,7 +1799,8 @@ pub fn run_vm(
                 free_vars_map,
             } => {
                 let list_rs = state.stack.pop().ok_or("VM stack underflow on FilterAtomPatternLambda")?;
-                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
+                // substitute env
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
                     Some(Atom::Expr(v)) => v.to_vec(),
                     Some(other) => vec![other],
                     None => return Err("filter-atom: list arg produced no result".to_string()),
@@ -1802,7 +1829,8 @@ pub fn run_vm(
                         let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &matched_env)?;
                         state.budget = sub_budget;
 
-                        let is_true = res.into_iter().next().map(|(a, _)| a.is_truthy()).unwrap_or(false);
+                        // substitute env
+                        let is_true = res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env).is_truthy()).unwrap_or(false);
                         if is_true {
                             filtered_results.push(elem);
                         }
@@ -1885,7 +1913,7 @@ pub fn run_vm(
                                     
                                     pending_calls.push(super::state::PendingCall {
                                         body_code: clause.body_code.clone(),
-                                        free_vars: clause.free_vars.clone(),
+                                        free_vars: Arc::from(clause.free_vars.clone()),
                                         body_env,
                                         locals_to_push,
                                         cost: total_cost,
@@ -1976,7 +2004,7 @@ pub fn run_vm(
                                 
                                 pending_calls.push(super::state::PendingCall {
                                     body_code: clause.body_code.clone(),
-                                    free_vars: clause.free_vars.clone(),
+                                    free_vars: Arc::from(clause.free_vars.clone()),
                                     body_env,
                                     locals_to_push,
                                     cost: total_cost,
@@ -2170,7 +2198,7 @@ fn eval_call_vm(
     if comp.compile(&call, &mut code, false).is_ok() {
         let sub_state = VMState::new_with_parent(
             std::sync::Arc::from(code),
-            comp.free_vars.clone(),
+            std::sync::Arc::from(comp.free_vars.clone()),
             *budget,
             free_vars_map,
             free_vars_bindings,
@@ -2214,6 +2242,17 @@ fn dispatch_call(
                         };
                         // special case for "member" to bind input variables in the environment
                         if fn_name.as_ref() == "member" && arity == 2 {
+                            if let Atom::Sym(ref s) = args[1] {
+                                if s.starts_with('$') && combo_env.get(s).is_none() {
+                                    let id = crate::eval::machine::vm::state::next_fresh_id();
+                                    let fresh_tail = format!("$__fresh_tail_{}", id);
+                                    let list_val = Atom::Expr(crate::atom::expr_data(vec![args[0].clone(), Atom::sym(&fresh_tail)]));
+                                    let mut merged_env = combo_env.clone();
+                                    merged_env = crate::eval::shared::env::bind(&merged_env, s, list_val);
+                                    results.push((Atom::sym("True"), merged_env));
+                                    return Ok(());
+                                }
+                            }
                             let items = match &args[1] {
                                 Atom::Expr(v) => v.to_vec(),
                                 other => vec![other.clone()],
@@ -2233,6 +2272,17 @@ fn dispatch_call(
                         }
                         // special case for "is-member" to bind input variables in the environment
                         if fn_name.as_ref() == "is-member" && arity == 2 {
+                            if let Atom::Sym(ref s) = args[1] {
+                                if s.starts_with('$') && combo_env.get(s).is_none() {
+                                    let id = crate::eval::machine::vm::state::next_fresh_id();
+                                    let fresh_tail = format!("$__fresh_tail_{}", id);
+                                    let list_val = Atom::Expr(crate::atom::expr_data(vec![args[0].clone(), Atom::sym(&fresh_tail)]));
+                                    let mut merged_env = combo_env.clone();
+                                    merged_env = crate::eval::shared::env::bind(&merged_env, s, list_val);
+                                    results.push((crate::builtins::boolean::bool_atom(true), merged_env));
+                                    return Ok(());
+                                }
+                            }
                             let items = match &args[1] {
                                 Atom::Expr(v) => v.to_vec(),
                                 other => vec![other.clone()],
@@ -2315,7 +2365,7 @@ fn dispatch_call(
 
                         pending_calls.push(super::state::PendingCall {
                             body_code: clause.body_code.clone(),
-                            free_vars: clause.free_vars.clone(),
+                            free_vars: Arc::from(clause.free_vars.clone()),
                             body_env,
                             locals_to_push,
                             cost: total_cost,
@@ -2367,7 +2417,7 @@ fn dispatch_call(
 
                     pending_calls.push(super::state::PendingCall {
                         body_code: std::sync::Arc::from(code),
-                        free_vars: comp.free_vars,
+                        free_vars: Arc::from(comp.free_vars),
                         body_env,
                         locals_to_push,
                         cost: 0,
@@ -2472,6 +2522,12 @@ fn run_next_let_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Option
     }
     
     if let Some((body_code, free_vars_map, body_env, locals_to_push)) = to_run {
+        // propagate let value bindings to existing local variables
+        for (val, env) in &mut state.locals {
+            let substituted = crate::eval::shared::subst::subst_atom(val, &body_env);
+            *val = substituted;
+            *env = crate::eval::shared::env::prepend_chain(body_env.clone(), env);
+        }
         state.locals.extend(locals_to_push);
         state.code = body_code;
         state.ip = 0;
@@ -2515,7 +2571,7 @@ fn run_next_if_iteration(state: &mut VMState) -> Result<Option<Env>, String> {
     // from the condition (e.g. $M bound by a called function) propagate into
     // the branch code's free_vars_bindings. Without this, LoadFree gets the
     // stale fresh-variable name instead of the value myf produced.
-    let mut to_run: Option<(Arc<[Opcode]>, Vec<String>, Env, Option<Env>)> = None;
+    let mut to_run: Option<(Arc<[Opcode]>, Arc<[String]>, Env, Option<Env>)> = None;
     if let Some(frame) = state.frames.last_mut() {
         if let CallFrameKind::If {
             condition_rs,
@@ -2550,6 +2606,14 @@ fn run_next_if_iteration(state: &mut VMState) -> Result<Option<Env>, String> {
     }
     
     if let Some((code_to_run, free_vars_map, branch_env, cond_env_opt)) = to_run {
+        // propagate condition bindings to existing local variables
+        if let Some(ref cond_env) = cond_env_opt {
+            for (val, env) in &mut state.locals {
+                let substituted = crate::eval::shared::subst::subst_atom(val, cond_env);
+                *val = substituted;
+                *env = crate::eval::shared::env::prepend_chain(cond_env.clone(), env);
+            }
+        }
         state.code = code_to_run;
         state.ip = 0;
         
@@ -2674,6 +2738,12 @@ fn run_next_case_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
     }
     
     if let Some((body_code, free_vars_map, body_env, locals_to_push)) = to_run {
+        // propagate case scrutinee/match bindings to existing local variables
+        for (val, env) in &mut state.locals {
+            let substituted = crate::eval::shared::subst::subst_atom(val, &body_env);
+            *val = substituted;
+            *env = crate::eval::shared::env::prepend_chain(body_env.clone(), env);
+        }
         state.locals.extend(locals_to_push);
         state.code = body_code;
         state.ip = 0;
@@ -2769,7 +2839,8 @@ fn run_next_call_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
         let frame = state.frames.pop().unwrap();
         if let CallFrameKind::Call { results, memo_key, .. } = frame.kind {
             if let Some(key) = memo_key {
-                let atoms_only: Vec<Atom> = results.iter().map(|(a, _)| a.clone()).collect();
+                // substitute environments on memoization results
+                let atoms_only: Vec<Atom> = results.iter().map(|(a, env)| crate::eval::shared::subst::subst_atom(a, env)).collect();
                 funcs.memo_set(key, atoms_only);
             }
             state.code = frame.return_code;
@@ -2787,7 +2858,7 @@ fn run_next_call_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
 
 /// Run the next iteration of the Eval opcode in flat frame-based control flow.
 fn run_next_eval_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Option<Env>, String> {
-    let mut to_run = None;
+    let mut to_run: Option<(Arc<[Opcode]>, Arc<[String]>, Env)> = None;
     if let Some(frame) = state.frames.last_mut() {
         if let CallFrameKind::Eval {
             target_rs,
@@ -2801,7 +2872,7 @@ fn run_next_eval_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
                 let mut comp = super::compiler::VMCompiler::new(&[], None);
                 let mut code = Vec::new();
                 if comp.compile(target_expr, &mut code, false).is_ok() {
-                    to_run = Some((std::sync::Arc::from(code), comp.free_vars, target_env.clone()));
+                    to_run = Some((std::sync::Arc::from(code), Arc::from(comp.free_vars), target_env.clone()));
                     break;
                 } else {
                     let mut budget = state.budget;

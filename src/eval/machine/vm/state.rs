@@ -11,7 +11,7 @@ use crate::parser::Expr;
 #[derive(Clone)]
 pub struct PendingCall {
     pub body_code: Arc<[Opcode]>,
-    pub free_vars: Vec<String>,
+    pub free_vars: Arc<[String]>,
     pub body_env: Env,
     pub locals_to_push: Vec<(Atom, Env)>,
     pub cost: i64,
@@ -25,7 +25,7 @@ pub enum CallFrameKind {
         next_idx: usize,
         pattern: Expr,
         pattern_vars: Vec<String>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
         body_code: Arc<[Opcode]>,
         results: ResultSet,
     },
@@ -34,7 +34,7 @@ pub enum CallFrameKind {
         next_idx: usize,
         then_code: Arc<[Opcode]>,
         else_code: Arc<[Opcode]>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
         had_nondet_truthy: bool,
         truthy_count: usize,
         results: ResultSet,
@@ -71,7 +71,7 @@ pub struct CallFrame {
     pub locals_to_pop: usize,
     pub saved_base_env: Env,
     pub saved_locals: Vec<(Atom, Env)>,  // parent's locals for Call frames
-    pub saved_free_vars_map: Vec<String>,
+    pub saved_free_vars_map: Arc<[String]>,
     pub saved_free_vars_bindings: Vec<Atom>,
     pub kind: CallFrameKind,
 }
@@ -81,7 +81,7 @@ pub struct VMState {
     pub ip: usize,
     pub stack: Vec<ResultSet>,
     pub locals: Vec<(Atom, Env)>,
-    pub free_vars_map: Vec<String>,     // Index to original free var name
+    pub free_vars_map: Arc<[String]>,     // Index to original free var name
     pub free_vars_bindings: Vec<Atom>,  // Index to instantiated fresh Atom
     pub frames: Vec<CallFrame>,
     pub budget: Option<i64>,
@@ -89,7 +89,7 @@ pub struct VMState {
 }
 
 impl VMState {
-    pub fn new(code: Arc<[Opcode]>, free_vars_map: Vec<String>, budget: Option<i64>) -> Self {
+    pub fn new(code: Arc<[Opcode]>, free_vars_map: Arc<[String]>, budget: Option<i64>) -> Self {
         let free_vars_bindings = free_vars_map
             .iter()
             .map(|name| {
@@ -119,7 +119,7 @@ impl VMState {
 
     pub fn new_with_parent(
         code: Arc<[Opcode]>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
         budget: Option<i64>,
         parent_map: &[String],
         parent_bindings: &[Atom],

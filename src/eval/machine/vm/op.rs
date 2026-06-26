@@ -15,7 +15,7 @@ pub struct CaseBranch {
     pub pattern: Expr,
     pub body_code: Arc<[Opcode]>,
     pub pattern_vars: Vec<String>,
-    pub free_vars_map: Vec<String>,
+    pub free_vars_map: Arc<[String]>,
 }
 
 #[derive(Clone, Debug)]
@@ -57,7 +57,7 @@ pub enum Opcode {
         else_code: Arc<[Opcode]>,
         pattern_vars: Vec<String>,
         local_names: Vec<String>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     ConstEmpty,
     Cut,
@@ -67,12 +67,12 @@ pub enum Opcode {
         pattern: Expr,
         body_code: Arc<[Opcode]>,
         pattern_vars: Vec<String>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     If {
         then_code: Arc<[Opcode]>,
         else_code: Arc<[Opcode]>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     Case {
         branches: Vec<CaseBranch>,
@@ -83,7 +83,7 @@ pub enum Opcode {
         body_code: Arc<[Opcode]>,
         local_names: Vec<String>,
         pattern_vars: Vec<String>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     Foldall,
     Forall,
@@ -91,54 +91,54 @@ pub enum Opcode {
     FoldlLambda {
         var_names: Vec<String>,
         body_code: Arc<[Opcode]>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     MapAtomLambda {
         var_name: String,
         body_code: Arc<[Opcode]>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     FilterAtomLambda {
         var_name: String,
         body_code: Arc<[Opcode]>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     /// Returns only the first result from body_code.
     Once {
         body_code: Arc<[Opcode]>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     /// Evaluates each body in sequence, discards all but the last result.
     Progn {
         bodies: Vec<Arc<[Opcode]>>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     /// Evaluates each body in sequence, discards all but the first result.
     Prog1 {
         bodies: Vec<Arc<[Opcode]>>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     /// (chain e0 $v e1 ... body): evaluates e0, binds to $v, evaluates e1, etc.
     Chain {
         /// Alternating: [expr_code, var_name, expr_code, var_name, ..., final_body_code]
         steps: Vec<(Arc<[Opcode]>, String)>,
         final_code: Arc<[Opcode]>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     /// Wraps all results from body_code into (within result1 result2 ...).
     Within {
         body_code: Arc<[Opcode]>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     /// Pops mutex-name result from stack, runs body_code under that named mutex.
     WithMutex {
         body_code: Arc<[Opcode]>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     /// Snapshots space state, runs body_code; restores on empty result or error.
     Transaction {
         body_code: Arc<[Opcode]>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     /// Pops space-ref from stack, loads a .metta file into it.
     ImportFile { path: String },
@@ -157,13 +157,13 @@ pub enum Opcode {
         pattern: Expr,
         body_code: Arc<[Opcode]>,
         pattern_vars: Vec<String>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     FilterAtomPatternLambda {
         pattern: Expr,
         body_code: Arc<[Opcode]>,
         pattern_vars: Vec<String>,
-        free_vars_map: Vec<String>,
+        free_vars_map: Arc<[String]>,
     },
     ConstQuote {
         template: Atom,
