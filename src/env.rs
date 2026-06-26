@@ -14,7 +14,7 @@
 /// The prior HashMap-based implementation caused fib(30) to take >30s due to
 /// 2.7 million HashMap clones. The linked-list approach completes in ~0.3s.
 use crate::atom::Atom;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 /// Inner node of the environment chain. Arc-wrapped by `Env` so the
 /// outer clone is always O(1).
@@ -72,12 +72,13 @@ impl PartialEq for Env {
 }
 impl Eq for Env {}
 
-static EMPTY_ENV: OnceLock<Env> = OnceLock::new();
+static EMPTY_ENV: LazyLock<Env> = LazyLock::new(|| Env(Arc::new(EnvNode::Empty)));
 
 const CACHE_SIZE: usize = 512;
 
 thread_local! {
-    static LOOKUP_CACHE: RefCell<[Option<(usize, String, Option<Atom>)>; CACHE_SIZE]> = const { RefCell::new([const { None }; CACHE_SIZE]) };
+    static LOOKUP_CACHE: std::cell::RefCell<[Option<(usize, String, Option<Atom>)>; CACHE_SIZE]> =
+        const { std::cell::RefCell::new([const { None }; CACHE_SIZE]) };
 }
 
 /// Clear the thread-local environment lookup cache.
@@ -90,13 +91,11 @@ pub fn clear_lookup_cache() {
     });
 }
 
-use std::cell::RefCell;
-
 impl Env {
     /// Create an empty environment. Returns the shared singleton (no allocation
     /// after first call — subsequent calls are a single Arc ref-count bump).
     pub fn new() -> Self {
-        EMPTY_ENV.get_or_init(|| Env(Arc::new(EnvNode::Empty))).clone()
+        EMPTY_ENV.clone()
     }
 
     /// Access the inner node for pattern matching inside this crate.
@@ -119,19 +118,26 @@ impl Env {
     /// # Assumptions
     /// - Variable name includes the `$` prefix, e.g. `"$x"`.
     pub fn get(&self, name: &str) -> Option<Atom> {
-        let _profile = crate::profile::ProfileGuard::new_owned("Env::get");
-        // ponytail: lookup cache removed because of pointer reuse/cache invalidation bugs across recursive executions.
-        match self.inner() {
-            EnvNode::Empty => None,
-            EnvNode::Cons { name: n, value, next } => {
-                if &**n == name {
-                    Some((**value).clone())
-                } else {
-                    next.get(name)
+        let mut curr = self.clone();
+        // explicit stack for iterative traversal of Link chains
+        // instead of C-stack recursion, avoiding stack overflow on deep chains.
+        let mut todo: Vec<Env> = Vec::new();
+        loop {
+            match curr.inner() {
+                EnvNode::Empty => {
+                    curr = todo.pop()?;
+                    continue;
                 }
-            }
-            EnvNode::Link { prefix, base } => {
-                prefix.get(name).or_else(|| base.get(name))
+                EnvNode::Cons { name: n, value, next } => {
+                    if &**n == name {
+                        return Some((**value).clone());
+                    }
+                    curr = next.clone();
+                }
+                EnvNode::Link { prefix, base } => {
+                    todo.push(base.clone());
+                    curr = prefix.clone();
+                }
             }
         }
     }
@@ -164,5 +170,106 @@ impl Env {
             }));
         }
         env
+    }
+
+    /// Filter out bindings of names in `skip_names` that were added on top of `boundary`.
+    pub fn clean_and_merge(&self, boundary: &Env, skip_names: &[String]) -> Env {
+        let mut bindings = Vec::new();
+        self.collect_new_bindings(boundary, skip_names, &mut bindings);
+
+        let mut res = boundary.clone();
+        for (name, value) in bindings.into_iter().rev() {
+            res = Env(Arc::new(EnvNode::Cons {
+                name,
+                value,
+                next: res,
+            }));
+        }
+        res
+    }
+
+    /// Collect bindings added above `boundary`, then walk `prefix` chains
+    /// iteratively via an explicit worklist instead of C-stack recursion.
+    fn collect_new_bindings(
+        &self,
+        boundary: &Env,
+        skip_names: &[String],
+        bindings: &mut Vec<(Arc<str>, Arc<Atom>)>,
+    ) {
+        // worklist flattens Link chains iteratively.
+        // For a chain of N Link nodes the Vec grows to at most N (bounds to function call depth).
+        let mut worklist: Vec<Env> = Vec::new();
+        let mut curr = self.clone();
+        loop {
+            if Arc::ptr_eq(&curr.0, &boundary.0) {
+                // This branch done, try the next from the worklist
+                if let Some(next) = worklist.pop() {
+                    curr = next;
+                    continue;
+                }
+                return;
+            }
+            match &*curr.0 {
+                EnvNode::Empty => {
+                    if let Some(next) = worklist.pop() {
+                        curr = next;
+                        continue;
+                    }
+                    return;
+                }
+                EnvNode::Cons { name, value, next } => {
+                    let skip = skip_names.iter().any(|s| s.as_str() == &**name);
+                    if !skip {
+                        bindings.push((name.clone(), value.clone()));
+                    }
+                    curr = next.clone();
+                }
+                EnvNode::Link { prefix, base } => {
+                    worklist.push(base.clone());
+                    curr = prefix.clone();
+                }
+            }
+        }
+    }
+
+    /// Collect all bindings from this environment, walking `Link` chains
+    /// iteratively via an explicit worklist instead of C-stack recursion.
+    fn collect_all_bindings(
+        &self,
+        skip_names: &[String],
+        bindings: &mut Vec<(Arc<str>, Arc<Atom>)>,
+    ) {
+        // worklist flattens Link chains iteratively.
+        let mut worklist: Vec<Env> = Vec::new();
+        let mut curr = self.clone();
+        loop {
+            if curr.is_empty_env() {
+                if let Some(next) = worklist.pop() {
+                    curr = next;
+                    continue;
+                }
+                return;
+            }
+            match &*curr.0 {
+                EnvNode::Empty => {
+                    if let Some(next) = worklist.pop() {
+                        curr = next;
+                        continue;
+                    }
+                    return;
+                }
+                EnvNode::Cons { name, value, next } => {
+                    let skip = skip_names.iter().any(|s| s.as_str() == &**name);
+                    if !skip {
+                        bindings.push((name.clone(), value.clone()));
+                    }
+                    curr = next.clone();
+                }
+                EnvNode::Link { prefix, base } => {
+                    worklist.push(base.clone());
+                    curr = prefix.clone();
+                }
+            }
+        }
     }
 }

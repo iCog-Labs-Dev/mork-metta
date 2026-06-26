@@ -132,6 +132,7 @@ pub fn run_vm(
                             Opcode::If { .. } => "Opcode::If",
                             Opcode::Case { .. } => "Opcode::Case",
                             Opcode::Match { .. } => "Opcode::Match",
+                            Opcode::Test => "Opcode::Test",
                             Opcode::Foldall => "Opcode::Foldall",
                             Opcode::Forall => "Opcode::Forall",
                             Opcode::Foldl => "Opcode::Foldl",
@@ -184,6 +185,7 @@ pub fn run_vm(
                         Opcode::Let { .. } => "Opcode::Let",
                         Opcode::If { .. } => "Opcode::If",
                         Opcode::Case { .. } => "Opcode::Case",
+                        Opcode::Test => "Opcode::Test",
                         Opcode::Match { .. } => "Opcode::Match",
                         Opcode::Foldall => "Opcode::Foldall",
                         Opcode::Forall => "Opcode::Forall",
@@ -677,7 +679,7 @@ pub fn run_vm(
                     }
                 }
                 
-                // Ponytail: skip frame when no pending calls (native functions / partial applications fully resolved).
+                // skip frame when no pending calls (native functions / partial applications fully resolved).
                 // Pushing an empty frame and immediately popping it would restore an empty
                 // saved_locals, clearing the function's actual state.locals.
                 if pending_calls.is_empty() {
@@ -732,6 +734,42 @@ pub fn run_vm(
                 let val_rs = state.stack.pop().ok_or("VM stack underflow on Collapse")?;
                 let atoms: Vec<Atom> = val_rs.into_iter().map(|(a, _)| a).collect();
                 state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(atoms))]));
+                state.ip += 1;
+            }
+            Opcode::Test => {
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("Test"))
+                } else {
+                    None
+                };
+                // Pop expected (evaluated second, so on top)
+                let expected_rs = state.stack.pop().ok_or("VM stack underflow on Test expected")?;
+                // Pop expression results (evaluated first)
+                let expr_rs = state.stack.pop().ok_or("VM stack underflow on Test expr")?;
+
+                // Collect ALL atoms from the expression result set (like PeTTa's findall)
+                let expr_atoms: Vec<Atom> = expr_rs.into_iter().map(|(a, _)| a).collect();
+
+                // If single result, use directly; if multiple or empty, use as list
+                let actual = if expr_atoms.len() == 1 {
+                    expr_atoms.into_iter().next().unwrap()
+                } else {
+                    Atom::Expr(crate::atom::expr_data(expr_atoms))
+                };
+
+                // Expected value: take the first result
+                let expected_atoms: Vec<Atom> = expected_rs.into_iter().map(|(a, _)| a).collect();
+                let expected = if expected_atoms.len() == 1 {
+                    expected_atoms.into_iter().next().unwrap()
+                } else {
+                    Atom::Expr(crate::atom::expr_data(expected_atoms))
+                };
+
+                let eq = actual == expected;
+                let emoji = if eq { "✅" } else { "❌" };
+                eprintln!("is {}, should {}. {} ", actual.to_sexpr_string(), expected.to_sexpr_string(), emoji);
+
+                state.stack.push(plain(vec![crate::atom::Atom::sym("true")]));
                 state.ip += 1;
             }
             Opcode::Superpose(count) => {
@@ -1040,7 +1078,7 @@ pub fn run_vm(
                 continue;
             }
             Opcode::Foldall => {
-                // ponytail: Foldall pops agg-func, init, and generator, then loops using eval_call_vm
+                // Foldall pops agg-func, init, and generator, then loops using eval_call_vm
                 let agg_rs = state.stack.pop().ok_or("VM stack underflow on Foldall agg-func")?;
                 let init_rs = state.stack.pop().ok_or("VM stack underflow on Foldall init")?;
                 let gen_rs = state.stack.pop().ok_or("VM stack underflow on Foldall generator")?;
@@ -1082,7 +1120,7 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::Forall => {
-                // ponytail: Forall pops check-expr and generator, then verifies truthiness for all values
+                // Forall pops check-expr and generator, then verifies truthiness for all values
                 let check_rs = state.stack.pop().ok_or("VM stack underflow on Forall check")?;
                 let gen_rs = state.stack.pop().ok_or("VM stack underflow on Forall generator")?;
 
@@ -1123,7 +1161,7 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::Foldl => {
-                // ponytail: Foldl pops func, acc, and list, and folds dynamically
+                // Foldl pops func, acc, and list, and folds dynamically
                 let func_rs = state.stack.pop().ok_or("VM stack underflow on Foldl func")?;
                 let acc_rs = state.stack.pop().ok_or("VM stack underflow on Foldl acc")?;
                 let list_rs = state.stack.pop().ok_or("VM stack underflow on Foldl list")?;
@@ -1168,7 +1206,7 @@ pub fn run_vm(
                 body_code,
                 free_vars_map,
             } => {
-                // ponytail: FoldlLambda aggregates list elements using a precompiled lambda body code for high performance
+                // FoldlLambda aggregates list elements using a precompiled lambda body code for high performance
                 let acc_rs = state.stack.pop().ok_or("VM stack underflow on FoldlLambda acc")?;
                 let list_rs = state.stack.pop().ok_or("VM stack underflow on FoldlLambda list")?;
 
@@ -1227,7 +1265,7 @@ pub fn run_vm(
                 body_code,
                 free_vars_map,
             } => {
-                // ponytail: MapAtomLambda maps list elements using a precompiled lambda body code for high performance
+                // MapAtomLambda maps list elements using a precompiled lambda body code for high performance
                 let list_rs = state.stack.pop().ok_or("VM stack underflow on MapAtomLambda")?;
                 let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
                     Some(Atom::Expr(v)) => v.to_vec(),
@@ -1275,7 +1313,7 @@ pub fn run_vm(
                 body_code,
                 free_vars_map,
             } => {
-                // ponytail: FilterAtomLambda filters list elements using a precompiled lambda condition code for high performance
+                // FilterAtomLambda filters list elements using a precompiled lambda condition code for high performance
                 let list_rs = state.stack.pop().ok_or("VM stack underflow on FilterAtomLambda")?;
                 let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, _)| a) {
                     Some(Atom::Expr(v)) => v.to_vec(),
@@ -1320,7 +1358,7 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::Once { body_code, free_vars_map } => {
-                // ponytail: run body, take only the first result
+                // run body, take only the first result
                 let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
                 for val in &state.locals { sub_state.locals.push(val.clone()); }
                 let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &base_env)?;
@@ -1340,7 +1378,7 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::Progn { bodies, free_vars_map } => {
-                // ponytail: run each body, return last result
+                // run each body, return last result
                 let mut last = Vec::new();
                 for body_code in bodies {
                     let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
@@ -1365,7 +1403,7 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::Prog1 { bodies, free_vars_map } => {
-                // ponytail: run each body, return first result
+                // run each body, return first result
                 let mut first = Vec::new();
                 for (i, body_code) in bodies.iter().enumerate() {
                     let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
@@ -1390,7 +1428,7 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::Chain { steps, final_code, free_vars_map } => {
-                // ponytail: evaluate each step, bind result into parent free_vars so new_with_parent threads them through
+                // evaluate each step, bind result into parent free_vars so new_with_parent threads them through
                 for (step_code, var_name) in steps.iter() {
                     let mut sub_state = VMState::new_with_parent(step_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
                     for val in &state.locals { sub_state.locals.push(val.clone()); }
@@ -1442,7 +1480,7 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::Within { body_code, free_vars_map } => {
-                // ponytail: run body, collect all results, wrap into (within result1 result2 ...)
+                // run body, collect all results, wrap into (within result1 result2 ...)
                 let mut sub_state = VMState::new_with_parent(
                     body_code.clone(),
                     free_vars_map.clone(),
@@ -1473,7 +1511,7 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::WithMutex { body_code, free_vars_map } => {
-                // ponytail: pop evaluated mutex name, acquire named lock, run body, release
+                // pop evaluated mutex name, acquire named lock, run body, release
                 let name_rs = state.stack.pop().ok_or("VM stack underflow on WithMutex")?;
                 let mutex_name = name_rs.into_iter().next().map(|(a, _)| a.to_sexpr_string()).unwrap_or_default();
                 let mut sub_state = VMState::new_with_parent(
@@ -1502,7 +1540,7 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::Transaction { body_code, free_vars_map } => {
-                // ponytail: snapshot state, run body in sub-VM, rollback on empty result or error
+                // snapshot state, run body in sub-VM, rollback on empty result or error
                 let snapshot = crate::space::mutate::snapshot_transaction_state(funcs);
                 let mut sub_state = VMState::new_with_parent(
                     body_code.clone(),
@@ -1541,7 +1579,7 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::ImportFile { path } => {
-                // ponytail: reuse existing apply.rs Frame::ImportFile logic directly
+                // reuse existing apply.rs Frame::ImportFile logic directly
                 let space_rs = state.stack.pop().ok_or("VM stack underflow on ImportFile")?;
                 let space_ref = space_rs
                     .into_iter().next().map(|(a, _)| a)
@@ -1557,7 +1595,7 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::PythonImport { path } => {
-                // ponytail: reuse existing apply.rs Frame::PythonImport logic directly
+                // reuse existing apply.rs Frame::PythonImport logic directly
                 let _space_rs = state.stack.pop(); // space-ref consumed but unused for Python
                 let import_dir = funcs.import_dir.lock().unwrap().clone();
                 let py_path = std::path::Path::new(&path);
@@ -1972,7 +2010,7 @@ pub fn run_vm(
                 
                 // For Call and Eval frames, restore parent's locals from saved_locals (replaces extend).
                 // For other frames, truncate by locals_to_pop as before.
-                // ponytail: restore parent's locals for Eval frames too
+                // restore parent's locals for Eval frames too
                 if matches!(frame.kind, CallFrameKind::Call { .. } | CallFrameKind::Eval { .. }) {
                     state.locals = frame.saved_locals.clone();
                 } else {
@@ -2026,7 +2064,7 @@ pub fn run_vm(
                         CallFrameKind::Case { results, .. } => { state.stack.push(results); }
                         CallFrameKind::Call { results, .. }
                         | CallFrameKind::Eval { results, .. } => {
-                            // ponytail: restore parent's locals for Eval as well
+                            // restore parent's locals for Eval as well
                             state.locals = popped.saved_locals;
                             state.stack.push(results);
                         }
@@ -2163,7 +2201,7 @@ fn dispatch_call(
     pending_calls: &mut Vec<super::state::PendingCall>,
     memo_key_out: &mut Option<(String, Vec<Atom>)>,
 ) -> Result<(), String> {
-    // ponytail: recursively resolve and evaluate function calls and partial applications (currying)
+    // recursively resolve and evaluate function calls and partial applications (currying)
     match head_atom {
         Atom::Sym(fn_name) => {
             if let Some(function) = funcs.get(fn_name, arity) {
@@ -2183,7 +2221,7 @@ fn dispatch_call(
                 }
             }
 
-            // ponytail: retrieve cached result if user function is pure and already computed
+            // retrieve cached result if user function is pure and already computed
             if funcs.is_pure_fn(fn_name, arity) {
                 let k = (fn_name.to_string(), args.to_vec());
                 if let Some(cached) = funcs.memo_get(&k) {
@@ -2251,7 +2289,7 @@ fn dispatch_call(
                     ]));
                     results.push((partial_atom, combo_env.clone()));
                 } else if has_clauses {
-                    // ponytail: defined user function with no matching clauses under PeTTa semantics returns empty/fails
+                    // defined user function with no matching clauses under PeTTa semantics returns empty/fails
                 } else {
                     let mut items = vec![Atom::sym(fn_name)];
                     items.extend(args.to_vec());
@@ -2345,7 +2383,7 @@ fn dispatch_call(
     Ok(())
 }
 
-/// ponytail: Run the next iteration of the Let opcode in flat frame-based control flow.
+/// Run the next iteration of the Let opcode in flat frame-based control flow.
 fn run_next_let_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Option<Env>, String> {
     let mut to_run = None;
     if let Some(frame) = state.frames.last_mut() {
@@ -2427,9 +2465,13 @@ fn run_next_let_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Option
     }
 }
 
-/// ponytail: Run the next iteration of the If opcode in flat frame-based control flow.
+/// Run the next iteration of the If opcode in flat frame-based control flow.
 fn run_next_if_iteration(state: &mut VMState) -> Result<Option<Env>, String> {
-    let mut to_run = None;
+    // cond_env passed alongside branch_env so free-variable bindings
+    // from the condition (e.g. $M bound by a called function) propagate into
+    // the branch code's free_vars_bindings. Without this, LoadFree gets the
+    // stale fresh-variable name instead of the value myf produced.
+    let mut to_run: Option<(Arc<[Opcode]>, Vec<String>, Env, Option<Env>)> = None;
     if let Some(frame) = state.frames.last_mut() {
         if let CallFrameKind::If {
             condition_rs,
@@ -2451,25 +2493,32 @@ fn run_next_if_iteration(state: &mut VMState) -> Result<Option<Env>, String> {
                 
                 if is_true {
                     let branch_env = crate::eval::shared::pattern::prepend_env(cond_env.clone(), &frame.saved_base_env);
-                    to_run = Some((then_code.clone(), free_vars_map.clone(), branch_env));
+                    to_run = Some((then_code.clone(), free_vars_map.clone(), branch_env, Some(cond_env.clone())));
                     break;
                 } else if is_false {
-                    to_run = Some((else_code.clone(), free_vars_map.clone(), frame.saved_base_env.clone()));
+                    to_run = Some((else_code.clone(), free_vars_map.clone(), frame.saved_base_env.clone(), None));
                     break;
                 } else {
-                    // ponytail: Ignore/skip unevaluated condition results to fail/backtrack gracefully
+                    // Ignore/skip unevaluated condition results to fail/backtrack gracefully
                 }
             }
         }
     }
     
-    if let Some((code_to_run, free_vars_map, branch_env)) = to_run {
+    if let Some((code_to_run, free_vars_map, branch_env, cond_env_opt)) = to_run {
         state.code = code_to_run;
         state.ip = 0;
         
         let free_vars_bindings = free_vars_map
             .iter()
             .map(|name| {
+                // resolve free vars from cond_env first so bindings
+                // created during condition evaluation propagate to branch code
+                if let Some(ref cond_env) = cond_env_opt {
+                    if let Some(atom) = cond_env.get(name) {
+                        return atom;
+                    }
+                }
                 if let Some(pos) = state.free_vars_map.iter().position(|x| x == name) {
                     state.free_vars_bindings[pos].clone()
                 } else if crate::eval::shared::fresh::is_generated_var_name(name) {
@@ -2514,7 +2563,7 @@ fn run_next_if_iteration(state: &mut VMState) -> Result<Option<Env>, String> {
     }
 }
 
-/// ponytail: Run the next iteration of the Case opcode in flat frame-based control flow.
+/// Run the next iteration of the Case opcode in flat frame-based control flow.
 fn run_next_case_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Option<Env>, String> {
     let mut to_run = None;
     if let Some(frame) = state.frames.last_mut() {
@@ -2618,7 +2667,7 @@ fn run_next_case_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
     }
 }
 
-/// ponytail: Run the next iteration of the Call opcode in flat frame-based control flow.
+/// Run the next iteration of the Call opcode in flat frame-based control flow.
 fn run_next_call_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Option<Env>, String> {
     let mut to_run = None;
     if let Some(frame) = state.frames.last_mut() {
@@ -2692,7 +2741,7 @@ fn run_next_call_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
     }
 }
 
-/// ponytail: Run the next iteration of the Eval opcode in flat frame-based control flow.
+/// Run the next iteration of the Eval opcode in flat frame-based control flow.
 fn run_next_eval_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Option<Env>, String> {
     let mut to_run = None;
     if let Some(frame) = state.frames.last_mut() {
@@ -2722,7 +2771,7 @@ fn run_next_eval_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
     
     if let Some((body_code, free_vars_map, body_env)) = to_run {
         // Save parent's locals before entering dynamic eval body, clear state.locals.
-        // ponytail: prevent Load(0) index contamination by isolating eval locals.
+        // prevent Load(0) index contamination by isolating eval locals.
         if let Some(frame) = state.frames.last_mut() {
             let parent_locals = std::mem::take(&mut state.locals);
             frame.saved_locals = parent_locals;
@@ -2754,7 +2803,7 @@ fn run_next_eval_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
         if let CallFrameKind::Eval { results, .. } = frame.kind {
             state.code = frame.return_code;
             state.ip = frame.return_ip + 1;
-            state.locals = frame.saved_locals; // ponytail: restore parent's locals
+            state.locals = frame.saved_locals; // restore parent's locals
             state.free_vars_map = frame.saved_free_vars_map;
             state.free_vars_bindings = frame.saved_free_vars_bindings;
             state.stack.push(results);

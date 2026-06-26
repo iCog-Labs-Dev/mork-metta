@@ -17,7 +17,7 @@ pub struct PendingCall {
     pub cost: i64,
 }
 
-/// ponytail: Loop and execution state for frame-based control flow.
+///  Loop and execution state for frame-based control flow.
 pub enum CallFrameKind {
     Normal,
     Let {
@@ -60,7 +60,7 @@ pub enum CallFrameKind {
     },
 }
 
-/// ponytail: Frame-based return state for flat control flow.
+///  Frame-based return state for flat control flow.
 /// When Let/If execute their body inline (same VMState), a CallFrame
 /// saves the parent's code, ip, env, and free-var context so we can
 /// restore after the body completes. This avoids C-stack recursion

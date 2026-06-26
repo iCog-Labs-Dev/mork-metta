@@ -49,7 +49,7 @@ pub fn calculate_expr_cost(expr: &crate::parser::Expr) -> i64 {
 }
 
 pub(crate) fn threaded_combinations(sets: &[ResultSet]) -> Vec<(Vec<Atom>, Env)> {
-    // ponytail: fast path for all-singleton result sets (bypasses redundant environment merging and prefix cloning)
+    // fast path for all-singleton result sets (bypasses redundant environment merging and prefix cloning)
     if sets.iter().all(|s| s.len() == 1) {
         let mut atoms = Vec::with_capacity(sets.len());
         let mut acc_env = Env::new();

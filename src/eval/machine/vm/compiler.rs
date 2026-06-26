@@ -91,7 +91,7 @@ impl VMCompiler {
                                     code.push(Opcode::ConstQuote { template, vars });
                                 }
                             } else {
-                                // ponytail: strip the outer quote wrapper during compilation in normal contexts so it evaluates to the inner expression as a constant/ConstQuote
+                                // strip the outer quote wrapper during compilation in normal contexts so it evaluates to the inner expression as a constant/ConstQuote
                                 let mut vars = Vec::new();
                                 let mut path = Vec::new();
                                 collect_quote_vars(&items[1], &mut path, &self.locals, &mut self.free_vars, &mut vars);
@@ -128,7 +128,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "call" | "reduce" if items.len() == 2 => {
-                            // ponytail: call and reduce are compiled by directly compiling their argument as they have the same evaluation result.
+                            // call and reduce are compiled by directly compiling their argument as they have the same evaluation result.
                             self.compile(&items[1], code, is_tail)?;
                             return Ok(());
                         }
@@ -172,7 +172,7 @@ impl VMCompiler {
                             });
                             return Ok(());
                         }
-                        // ponytail: desugar and/or to if only when both arguments are expressions (lists) to allow logic variable unification on simple symbols
+                        // desugar and/or to if only when both arguments are expressions (lists) to allow logic variable unification on simple symbols
                         "and" if items.len() == 3 && matches!(&items[1], Expr::List(_)) && matches!(&items[2], Expr::List(_)) => {
                             let desugared = Expr::List(std::sync::Arc::from([
                                 Expr::Symbol("if".to_string()),
@@ -285,7 +285,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "let" if items.len() == 4 => {
-                            // ponytail: Let matches value and binds pattern variables to locals before executing body
+                            // Let matches value and binds pattern variables to locals before executing body
                             self.compile(&items[2], code, false)?;
                             let mut body_comp = VMCompiler {
                                 locals: self.locals.clone(),
@@ -314,7 +314,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "let*" if items.len() == 3 => {
-                            // ponytail: let* desugared into nested let instructions recursively
+                            // let* desugared into nested let instructions recursively
                             let bindings = match &items[1] {
                                 Expr::List(b) => b,
                                 _ => return Err("let*: bindings must be a list".into()),
@@ -323,7 +323,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "foldall" if items.len() == 4 => {
-                            // ponytail: foldall aggregates values from generator over initial value
+                            // foldall aggregates values from generator over initial value
                             self.compile(&items[2], code, false)?;
                             self.compile(&items[3], code, false)?;
                             self.compile(&items[1], code, false)?;
@@ -331,14 +331,14 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "forall" if items.len() == 3 => {
-                            // ponytail: forall checks if all values of generator satisfy condition
+                            // forall checks if all values of generator satisfy condition
                             self.compile(&items[1], code, false)?;
                             self.compile(&items[2], code, false)?;
                             code.push(Opcode::Forall);
                             return Ok(());
                         }
                         "foldl-atom" if items.len() == 4 => {
-                            // ponytail: foldl-atom Form 1 (with accumulator function)
+                            // foldl-atom Form 1 (with accumulator function)
                             self.compile(&items[1], code, false)?;
                             self.compile(&items[2], code, false)?;
                             self.compile(&items[3], code, false)?;
@@ -346,7 +346,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "foldl-atom" if items.len() >= 5 => {
-                            // ponytail: foldl-atom Form 2 (with variable names and body expression)
+                            // foldl-atom Form 2 (with variable names and body expression)
                             self.compile(&items[1], code, false)?;
                             self.compile(&items[2], code, false)?;
                             let mut var_names = Vec::new();
@@ -379,7 +379,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "map-atom" if items.len() == 4 => {
-                            // ponytail: map-atom Form 2 (with variable pattern and body expression).
+                            // map-atom Form 2 (with variable pattern and body expression).
                             let mut pattern_vars = Vec::new();
                             collect_pattern_vars(&items[2], &mut pattern_vars);
 
@@ -417,7 +417,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "filter-atom" if items.len() == 4 => {
-                            // ponytail: filter-atom Form 2 (with variable pattern and condition expression).
+                            // filter-atom Form 2 (with variable pattern and condition expression).
                             let mut pattern_vars = Vec::new();
                             collect_pattern_vars(&items[2], &mut pattern_vars);
 
@@ -456,7 +456,7 @@ impl VMCompiler {
                         }
                         // For any other special keyword/construct (e.g. once, etc.), fallback to EvalCEK
                         "once" if items.len() == 2 => {
-                            // ponytail: run body, keep first result only
+                            // run body, keep first result only
                             let mut body_comp = VMCompiler { locals: self.locals.clone(), free_vars: self.free_vars.clone(), fn_name: self.fn_name.clone(), arity: self.arity };
                             let mut body_code = Vec::new();
                             body_comp.compile(&items[1], &mut body_code, false)?;
@@ -465,7 +465,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "progn" if items.len() >= 2 => {
-                            // ponytail: eval all, return last; compile each body separately
+                            // eval all, return last; compile each body separately
                             let mut bodies = Vec::new();
                             let mut fvs = self.free_vars.clone();
                             let len = items.len() - 1;
@@ -482,7 +482,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "prog1" if items.len() >= 2 => {
-                            // ponytail: eval all, return first
+                            // eval all, return first
                             let mut bodies = Vec::new();
                             let mut fvs = self.free_vars.clone();
                             for item in &items[1..] {
@@ -497,7 +497,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "chain" if items.len() >= 4 && items.len() % 2 == 0 => {
-                            // ponytail: (chain e0 $v0 e1 $v1 ... body) — compile each step
+                            // (chain e0 $v0 e1 $v1 ... body) — compile each step
                             let mut fvs = self.free_vars.clone();
                             let mut steps = Vec::new();
                             let pairs = (items.len() - 2) / 2;
@@ -527,7 +527,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "within" if items.len() == 2 => {
-                            // ponytail: evaluate arg, wrap all results into (within ...)
+                            // evaluate arg, wrap all results into (within ...)
                             let mut body_comp = VMCompiler {
                                 locals: self.locals.clone(),
                                 free_vars: self.free_vars.clone(),
@@ -546,7 +546,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "with_mutex" if items.len() == 3 => {
-                            // ponytail: compile mutex-name arg, then run body under the named lock
+                            // compile mutex-name arg, then run body under the named lock
                             self.compile(&items[1], code, false)?;
                             let mut body_comp = VMCompiler {
                                 locals: self.locals.clone(),
@@ -566,7 +566,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "transaction" if items.len() == 2 => {
-                            // ponytail: snapshot state, run body, rollback on empty/error
+                            // snapshot state, run body, rollback on empty/error
                             let mut body_comp = VMCompiler {
                                 locals: self.locals.clone(),
                                 free_vars: self.free_vars.clone(),
@@ -585,7 +585,7 @@ impl VMCompiler {
                             return Ok(());
                         }
                         "import!" if items.len() == 3 => {
-                            // ponytail: path is always a compile-time literal; compile space-ref arg only
+                            // path is always a compile-time literal; compile space-ref arg only
                             // Performance: avoids a full CEK round-trip just to eval &self
                             let path_opcode = match &items[2] {
                                 // (library path.py) — Python import, space-ref is still evaluated but unused
@@ -704,6 +704,14 @@ impl VMCompiler {
                             code.push(Opcode::PyEval { expr: items[1].clone() });
                             return Ok(());
                         }
+                        "test" if items.len() == 3 => {
+                            // compile expression and expected value, then use Test opcode
+                            // which collects ALL non-deterministic results (like PeTTa's findall).
+                            self.compile(&items[1], code, false)?;
+                            self.compile(&items[2], code, false)?;
+                            code.push(Opcode::Test);
+                            return Ok(());
+                        }
                         _ => {}
                     }
 
@@ -743,7 +751,7 @@ impl VMCompiler {
                                 for i in 1..items.len() {
                                     let is_lazy = lazy_mask.get(i - 1).copied().unwrap_or(false);
                                     if is_lazy {
-                                        // ponytail: compile lazy argument as a zero-argument closure
+                                        // compile lazy argument as a zero-argument closure
                                         code.push(Opcode::Lambda {
                                             params: Vec::new(),
                                             body: items[i].clone(),
@@ -768,7 +776,7 @@ impl VMCompiler {
                 for i in 1..items.len() {
                     let is_lazy = lazy_mask.get(i - 1).copied().unwrap_or(false);
                     if is_lazy {
-                        // ponytail: compile lazy argument as a zero-argument closure
+                        // compile lazy argument as a zero-argument closure
                         code.push(Opcode::Lambda {
                             params: Vec::new(),
                             body: items[i].clone(),

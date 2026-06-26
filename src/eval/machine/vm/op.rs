@@ -149,6 +149,10 @@ pub enum Opcode {
     PyCall { expr: Expr },
     PyEval { expr: Expr },
     ImportDynamic,
+    /// Test special form: evaluates expression, collects ALL non-deterministic results,
+    /// compares with expected value (structural equality), prints "is X, should Y. ✅/❌",
+    /// and always returns True. Matches PeTTa's `test` keyword behavior.
+    Test,
     MapAtomPatternLambda {
         pattern: Expr,
         body_code: Arc<[Opcode]>,
