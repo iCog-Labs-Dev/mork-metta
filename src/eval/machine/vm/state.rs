@@ -35,8 +35,6 @@ pub enum CallFrameKind {
         then_code: Arc<[Opcode]>,
         else_code: Arc<[Opcode]>,
         free_vars_map: Arc<[String]>,
-        had_nondet_truthy: bool,
-        truthy_count: usize,
         results: ResultSet,
     },
     Case {

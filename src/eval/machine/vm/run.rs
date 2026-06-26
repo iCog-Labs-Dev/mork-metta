@@ -988,9 +988,6 @@ pub fn run_vm(
                     None
                 };
                 let condition_rs = state.stack.pop().ok_or("VM stack underflow on If")?;
-                let truthy_condition_count = condition_rs.iter().filter(|(cond, _)| cond.is_truthy()).count();
-                let had_nondet_truthy = truthy_condition_count > 1
-                    && condition_rs.iter().any(|(_, env)| !env.is_empty_env());
                 let frame = CallFrame {
                     return_ip: state.ip,
                     return_code: state.code.clone(),
@@ -1005,8 +1002,6 @@ pub fn run_vm(
                         then_code: then_code.clone(),
                         else_code: else_code.clone(),
                         free_vars_map: free_vars_map.clone(),
-                        had_nondet_truthy,
-                        truthy_count: truthy_condition_count,
                         results: Vec::new(),
                     },
                 };
@@ -2077,17 +2072,8 @@ pub fn run_vm(
                     
                     match popped.kind {
                         CallFrameKind::Let { results, .. } => { state.stack.push(results); }
-                        CallFrameKind::If { results, had_nondet_truthy, .. } => {
-                            let final_results = if had_nondet_truthy && results.len() > 1 {
-                                let atoms: Vec<Atom> = results
-                                    .iter()
-                                    .map(|(atom, env)| crate::eval::shared::subst::subst_atom(atom, env))
-                                    .collect();
-                                plain(vec![Atom::Expr(crate::atom::expr_data(atoms))])
-                            } else {
-                                results
-                            };
-                            state.stack.push(final_results);
+                        CallFrameKind::If { results, .. } => {
+                            state.stack.push(results);
                         }
                         CallFrameKind::Case { results, .. } => { state.stack.push(results); }
                         CallFrameKind::Call { results, .. }
@@ -2579,27 +2565,24 @@ fn run_next_if_iteration(state: &mut VMState) -> Result<Option<Env>, String> {
             then_code,
             else_code,
             free_vars_map,
-            had_nondet_truthy: _,
-            truthy_count: _,
             results: _,
         } = &mut frame.kind {
             while *next_idx < condition_rs.len() {
                 let (cond, cond_env) = &condition_rs[*next_idx];
                 *next_idx += 1;
                 
-                let cond_str = cond.as_sym().map(|s| s.to_string()).unwrap_or_default();
-                let is_true = cond_str.eq_ignore_ascii_case("true");
-                let is_false = cond_str.eq_ignore_ascii_case("false");
+                let is_true = match cond {
+                    Atom::Sym(s) => s.as_ref().eq_ignore_ascii_case("true"),
+                    _ => false,
+                };
                 
                 if is_true {
                     let branch_env = crate::eval::shared::pattern::prepend_env(cond_env.clone(), &frame.saved_base_env);
                     to_run = Some((then_code.clone(), free_vars_map.clone(), branch_env, Some(cond_env.clone())));
                     break;
-                } else if is_false {
+                } else {
                     to_run = Some((else_code.clone(), free_vars_map.clone(), frame.saved_base_env.clone(), None));
                     break;
-                } else {
-                    // Ignore/skip unevaluated condition results to fail/backtrack gracefully
                 }
             }
         }
@@ -2645,7 +2628,6 @@ fn run_next_if_iteration(state: &mut VMState) -> Result<Option<Env>, String> {
     } else {
         let frame = state.frames.pop().unwrap();
         if let CallFrameKind::If {
-            had_nondet_truthy,
             results,
             ..
         } = frame.kind {
@@ -2654,16 +2636,7 @@ fn run_next_if_iteration(state: &mut VMState) -> Result<Option<Env>, String> {
             state.free_vars_map = frame.saved_free_vars_map;
             state.free_vars_bindings = frame.saved_free_vars_bindings;
             
-            let final_results = if had_nondet_truthy && results.len() > 1 {
-                let atoms: Vec<Atom> = results
-                    .iter()
-                    .map(|(atom, env)| crate::eval::shared::subst::subst_atom(atom, env))
-                    .collect();
-                plain(vec![Atom::Expr(crate::atom::expr_data(atoms))])
-            } else {
-                results
-            };
-            state.stack.push(final_results);
+            state.stack.push(results);
             Ok(None)
         } else {
             unreachable!()
