@@ -640,7 +640,7 @@ fn run_vm_inner(
 
                 // Drain pending sub-VMs one at a time via yield.
                 while !resume.pending.is_empty() && !state.cut_executed {
-                    let (sub_state, sub_env) = resume.pending.remove(0);
+                    let (sub_state, sub_env) = resume.pending.swap_remove(0);
                     state.resume_data = Some(Box::new(resume));
                     yield_vm!(state, sub_state, sub_env);
                 }
@@ -934,7 +934,7 @@ fn run_vm_inner(
                     }
                 };
                 while !resume.pending.is_empty() && !state.cut_executed {
-                    let (sub_state, sub_env) = resume.pending.remove(0);
+                    let (sub_state, sub_env) = resume.pending.swap_remove(0);
                     state.resume_data = Some(Box::new(resume));
                     yield_vm!(state, sub_state, sub_env);
                 }
@@ -2362,7 +2362,8 @@ fn dispatch_call(
                 }
             }
 
-            // retrieve cached result if user function is pure and already computed
+            // Memoize pure functions (native AND user-defined).
+            // is_pure_fn returns false for unknown symbols — safe for all callers.
             if funcs.is_pure_fn(fn_name, arity) {
                 let k = (fn_name.to_string(), args.to_vec());
                 if let Some(cached) = funcs.memo_get(&k) {
