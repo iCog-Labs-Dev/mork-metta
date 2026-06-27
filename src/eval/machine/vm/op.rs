@@ -3,11 +3,30 @@ use crate::parser::Expr;
 use crate::env::Env;
 use std::sync::Arc;
 
-#[derive(Clone, Debug)]
 pub enum VmExit {
     Normal,
     Cut,
     TailCall(Vec<(Atom, Env)>),
+    /// Trampoline: yield execution to a sub-VM. Both states are boxed to
+    /// break the layout cycle (VMState contains VmExit via last_sub_result).
+    YieldCall {
+        parent_state: Box<super::state::VMState>,
+        parent_env:   Env,
+        sub_state:    Box<super::state::VMState>,
+        sub_env:      Env,
+    },
+}
+
+// Manual Debug so we don't require Debug on VMState (which holds Box<dyn Any>).
+impl std::fmt::Debug for VmExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VmExit::Normal => write!(f, "VmExit::Normal"),
+            VmExit::Cut => write!(f, "VmExit::Cut"),
+            VmExit::TailCall(locals) => write!(f, "VmExit::TailCall({} locals)", locals.len()),
+            VmExit::YieldCall { .. } => write!(f, "VmExit::YieldCall {{ .. }}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

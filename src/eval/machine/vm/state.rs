@@ -2,9 +2,10 @@ use crate::atom::Atom;
 use crate::env::Env;
 use crate::eval::shared::fresh;
 use crate::eval::machine::budget::{ResultSet, plain};
-use super::op::{Opcode, CaseBranch};
+use super::op::{Opcode, VmExit, CaseBranch};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::any::Any;
 
 use crate::parser::Expr;
 
@@ -84,6 +85,11 @@ pub struct VMState {
     pub frames: Vec<CallFrame>,
     pub budget: Option<i64>,
     pub cut_executed: bool,
+    /// Opcode-loop state saved across a trampoline yield. Erased to Any
+    /// so each opcode can store its own struct without boxing enums.
+    pub resume_data: Option<Box<dyn Any + Send>>,
+    /// Result delivered back from the sub-VM that was yielded to.
+    pub last_sub_result: Option<(ResultSet, VmExit)>,
 }
 
 impl VMState {
@@ -112,6 +118,8 @@ impl VMState {
             frames: Vec::with_capacity(8),
             budget,
             cut_executed: false,
+            resume_data: None,
+            last_sub_result: None,
         }
     }
 
@@ -148,6 +156,8 @@ impl VMState {
             frames: Vec::with_capacity(8),
             budget,
             cut_executed: false,
+            resume_data: None,
+            last_sub_result: None,
         }
     }
 }

@@ -68,14 +68,75 @@ impl Drop for VmDepthGuard {
     }
 }
 
+/// Trampoline entry point. Runs the VM without ever growing the C stack;
+/// all sub-VM calls are dispatched through a heap-allocated call stack.
 pub fn run_vm(
-    mut state: VMState,
+    initial_state: VMState,
     funcs: &FnTable,
     initial_base_env: &Env,
 ) -> Result<(ResultSet, Option<i64>, VmExit), String> {
     super::compiler::set_current_funcs(funcs);
-    let mut base_env = initial_base_env.clone();
     let _guard = VmDepthGuard::enter();
+
+    // Each entry is a suspended parent frame waiting for a sub-VM result.
+    // We push (parent, parent_env) when yielding, then pop when the sub finishes.
+    let mut call_stack: Vec<(Box<VMState>, Env)> = Vec::new();
+    let mut current_state = Box::new(initial_state);
+    let mut current_env  = initial_base_env.clone();
+
+    loop {
+        match run_vm_inner(*current_state, funcs, &current_env)? {
+            (res, budget, VmExit::YieldCall { parent_state, parent_env, sub_state, sub_env }) => {
+                // The inner loop yielded: push the suspended parent and descend into the sub-VM.
+                call_stack.push((parent_state, parent_env));
+                current_state = sub_state;
+                current_env   = sub_env;
+                // (budget already propagated into parent_state by the yield macro)
+                let _ = budget;
+            }
+            (res, budget, terminal_exit) => {
+                // A VM finished normally (Normal/Cut/TailCall).
+                if let Some((mut parent, parent_env)) = call_stack.pop() {
+                    // Deliver result to parent's last_sub_result, re-run the same opcode.
+                    parent.budget = budget;
+                    parent.last_sub_result = Some((res, terminal_exit));
+                    current_state = parent;
+                    current_env   = parent_env;
+                } else {
+                    // Stack empty — this is the final result.
+                    return Ok((res, budget, terminal_exit));
+                }
+            }
+        }
+    }
+}
+
+/// Inner VM interpreter. Never calls itself recursively. Uses `yield_vm!`
+/// to suspend and hand control back to the trampoline in `run_vm`.
+fn run_vm_inner(
+    mut state: VMState,
+    funcs: &FnTable,
+    initial_base_env: &Env,
+) -> Result<(ResultSet, Option<i64>, VmExit), String> {
+    // Suspend this VM: save state, hand sub-VM to trampoline.
+    // On next invocation the same opcode checks state.last_sub_result.
+    macro_rules! yield_vm {
+        ($state:expr, $sub_state:expr, $sub_env:expr) => {
+            return Ok((
+                Vec::new(),
+                $state.budget,
+                VmExit::YieldCall {
+                    parent_env:   initial_base_env.clone(),
+                    parent_state: Box::new($state),
+                    sub_state:    Box::new($sub_state),
+                    sub_env:      $sub_env,
+                },
+            ))
+        };
+    }
+
+
+    let mut base_env = initial_base_env.clone();
     static DEBUG_VM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     let debug_vm = match DEBUG_VM.load(std::sync::atomic::Ordering::Relaxed) {
         0 => {
@@ -442,122 +503,48 @@ pub fn run_vm(
                 local_names,
                 free_vars_map,
             } => {
-                let val_b_rs = state.stack.pop().ok_or("VM stack underflow on Unify B")?;
-                let val_a_rs = state.stack.pop().ok_or("VM stack underflow on Unify A")?;
-
-                let mut current_env = base_env.clone();
-                for (i, name) in local_names.iter().enumerate() {
-                    if let Some((val, _val_env)) = state.locals.get(i) {
-                        current_env = crate::eval::shared::env::prepend_chain(
-                            crate::eval::shared::env::bind(&Env::new(), name, val.clone()),
-                            &current_env,
-                        );
-                    }
+                // Resume struct for the Unify opcode loop.
+                struct UnifyResume {
+                    results: Vec<(crate::atom::Atom, Env)>,
+                    // remaining sub-VMs to run: (sub_state, sub_env)
+                    pending: Vec<(VMState, Env)>,
+                    matched_any: bool,
+                    current_env: Env,
                 }
 
-                let first_a = val_a_rs.first().map(|(a, _)| a);
-                let is_space = match first_a {
-                    Some(Atom::Sym(s)) => s.starts_with('&'),
-                    _ => false,
-                };
-
-                let mut matched_any = false;
-                let mut results = Vec::new();
-
-                if is_space {
-                    let space_ref = first_a.unwrap();
-                    let matches = crate::space::query::collect_match_results(
-                        funcs, space_ref, pattern_b, &current_env,
-                    )?;
-                    // Precompute bindings once for the entire Unify block
-                    let precomputed_bindings: Vec<Atom> = free_vars_map
-                        .iter()
-                        .map(|name| {
-                            if let Some(pos) = state.free_vars_map.iter().position(|x| x == name) {
-                                state.free_vars_bindings[pos].clone()
-                            } else if crate::eval::shared::fresh::is_generated_var_name(name) {
-                                Atom::sym(name)
-                            } else {
-                                let id = crate::eval::machine::vm::state::next_fresh_id();
-                                let hint = name.strip_prefix('$').unwrap_or(name);
-                                let fresh_name = format!("$__fresh_{hint}_{id}");
-                                Atom::sym(&fresh_name)
-                            }
-                        })
-                        .collect();
-
-                    if matches.is_empty() {
-                        let mut sub_state_locals = Vec::with_capacity(state.locals.len());
-                        for val in &state.locals {
-                            sub_state_locals.push(val.clone());
-                        }
-                        let sub_state = VMState {
-                            code: else_code.clone(),
-                            ip: 0,
-                            stack: Vec::new(),
-                            locals: sub_state_locals,
-                            free_vars_map: free_vars_map.clone(),
-                            free_vars_bindings: precomputed_bindings.clone(),
-                            frames: Vec::new(),
-                            budget: state.budget,
-                            cut_executed: false,
-                        };
-                        let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &current_env)?;
-                        state.budget = sub_budget;
-                        results.extend(res);
-                        match exit_status {
-                            VmExit::Cut => { state.cut_executed = true; }
-                            VmExit::TailCall(new_locals) => {
-                                return Ok((results, state.budget, VmExit::TailCall(new_locals)));
-                            }
-                            VmExit::Normal => {}
-                        }
-                    } else {
-                        matched_any = true;
-                        for m in matches {
-                            let mut sub_state_locals = Vec::with_capacity(state.locals.len() + pattern_vars.len());
-                            for val in &state.locals {
-                                sub_state_locals.push(val.clone());
-                            }
-                            for var in pattern_vars {
-                                let bound = m.bindings.iter()
-                                    .find(|(k, _)| k.as_ref() == var.as_str())
-                                    .map(|(_, v)| (**v).clone())
-                                    .unwrap_or_else(|| Atom::sym("()"));
-                                sub_state_locals.push((bound, Env::new()));
-                            }
-                            let sub_state = VMState {
-                                code: then_code.clone(),
-                                ip: 0,
-                                stack: Vec::new(),
-                                locals: sub_state_locals,
-                                free_vars_map: free_vars_map.clone(),
-                                free_vars_bindings: precomputed_bindings.clone(),
-                                frames: Vec::new(),
-                                budget: state.budget,
-                                cut_executed: false,
-                            };
-                            let sub_env = crate::eval::shared::env::bind_all(&current_env, &m.bindings);
-                            let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &sub_env)?;
-                            state.budget = sub_budget;
-                            results.extend(res);
-                            match exit_status {
-                                VmExit::Cut => {
-                                    state.cut_executed = true;
-                                    break;
-                                }
-                                VmExit::TailCall(new_locals) => {
-                                    return Ok((results, state.budget, VmExit::TailCall(new_locals)));
+                let mut resume = match state.resume_data.take().and_then(|r| r.downcast::<UnifyResume>().ok()) {
+                    Some(r) => {
+                        // Returning from a sub-VM: collect its result.
+                        let mut r = *r;
+                        if let Some((sub_res, sub_exit)) = state.last_sub_result.take() {
+                            r.results.extend(sub_res);
+                            match sub_exit {
+                                VmExit::Cut => { state.cut_executed = true; r.pending.clear(); }
+                                VmExit::TailCall(locs) => {
+                                    return Ok((r.results, state.budget, VmExit::TailCall(locs)));
                                 }
                                 VmExit::Normal => {}
+                                VmExit::YieldCall { .. } => unreachable!(),
                             }
                         }
+                        r
                     }
-                } else {
-                    // Precompute bindings once for the else branch's loop
-                    let precomputed_bindings: Vec<Atom> = free_vars_map
-                        .iter()
-                        .map(|name| {
+                    None => {
+                        // First entry: build pending list.
+                        let val_b_rs = state.stack.pop().ok_or("VM stack underflow on Unify B")?;
+                        let val_a_rs = state.stack.pop().ok_or("VM stack underflow on Unify A")?;
+
+                        let mut current_env = base_env.clone();
+                        for (i, name) in local_names.iter().enumerate() {
+                            if let Some((val, _)) = state.locals.get(i) {
+                                current_env = crate::eval::shared::env::prepend_chain(
+                                    crate::eval::shared::env::bind(&Env::new(), name, val.clone()),
+                                    &current_env,
+                                );
+                            }
+                        }
+
+                        let precomputed_bindings: Vec<Atom> = free_vars_map.iter().map(|name| {
                             if let Some(pos) = state.free_vars_map.iter().position(|x| x == name) {
                                 state.free_vars_bindings[pos].clone()
                             } else if crate::eval::shared::fresh::is_generated_var_name(name) {
@@ -565,81 +552,100 @@ pub fn run_vm(
                             } else {
                                 let id = crate::eval::machine::vm::state::next_fresh_id();
                                 let hint = name.strip_prefix('$').unwrap_or(name);
-                                let fresh_name = format!("$__fresh_{hint}_{id}");
-                                Atom::sym(&fresh_name)
+                                Atom::sym(&format!("$__fresh_{hint}_{id}"))
                             }
-                        })
-                        .collect();
+                        }).collect();
 
-                    for (val_b, env_b) in val_b_rs {
-                        if let Some((val_a, env_a)) = val_a_rs.first() {
-                            let match_env = crate::eval::shared::pattern::prepend_env(env_b, &current_env);
-                            match crate::eval::shared::pattern::try_match_one(pattern_a, &val_b, &match_env, funcs)? {
-                                Some(matched_env) => {
-                                    matched_any = true;
-                                    let mut sub_state_locals = Vec::with_capacity(state.locals.len() + pattern_vars.len());
-                                    for val in &state.locals {
-                                        sub_state_locals.push(val.clone());
-                                    }
+                        let first_a = val_a_rs.first().map(|(a, _)| a);
+                        let is_space = matches!(first_a, Some(Atom::Sym(s)) if s.starts_with('&'));
+
+                        let mut pending: Vec<(VMState, Env)> = Vec::new();
+                        let mut matched_any = false;
+
+                        if is_space {
+                            let space_ref = first_a.unwrap();
+                            let matches = crate::space::query::collect_match_results(
+                                funcs, space_ref, pattern_b, &current_env,
+                            )?;
+                            if matches.is_empty() {
+                                let mut sub_locals = state.locals.clone();
+                                let sub_state = VMState {
+                                    code: else_code.clone(), ip: 0,
+                                    stack: Vec::new(), locals: sub_locals,
+                                    free_vars_map: free_vars_map.clone(),
+                                    free_vars_bindings: precomputed_bindings.clone(),
+                                    frames: Vec::new(), budget: state.budget,
+                                    cut_executed: false, resume_data: None, last_sub_result: None,
+                                };
+                                pending.push((sub_state, current_env.clone()));
+                            } else {
+                                matched_any = true;
+                                for m in matches {
+                                    let mut sub_locals = state.locals.clone();
                                     for var in pattern_vars {
-                                        let bound = matched_env.get(var).unwrap_or(Atom::sym("()"));
-                                        sub_state_locals.push((bound, Env::new()));
+                                        let bound = m.bindings.iter()
+                                            .find(|(k, _)| k.as_ref() == var.as_str())
+                                            .map(|(_, v)| (**v).clone())
+                                            .unwrap_or_else(|| Atom::sym("()"));
+                                        sub_locals.push((bound, Env::new()));
                                     }
+                                    let sub_env = crate::eval::shared::env::bind_all(&current_env, &m.bindings);
                                     let sub_state = VMState {
-                                        code: then_code.clone(),
-                                        ip: 0,
-                                        stack: Vec::new(),
-                                        locals: sub_state_locals,
+                                        code: then_code.clone(), ip: 0,
+                                        stack: Vec::new(), locals: sub_locals,
                                         free_vars_map: free_vars_map.clone(),
                                         free_vars_bindings: precomputed_bindings.clone(),
-                                        frames: Vec::new(),
-                                        budget: state.budget,
-                                        cut_executed: false,
+                                        frames: Vec::new(), budget: state.budget,
+                                        cut_executed: false, resume_data: None, last_sub_result: None,
                                     };
-                                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &matched_env)?;
-                                    state.budget = sub_budget;
-                                    results.extend(res);
-                                    match exit_status {
-                                        VmExit::Cut => {
-                                            state.cut_executed = true;
-                                            break;
+                                    pending.push((sub_state, sub_env));
+                                }
+                            }
+                        } else {
+                            for (val_b, env_b) in val_b_rs {
+                                if let Some((val_a, _)) = val_a_rs.first() {
+                                    let match_env = crate::eval::shared::pattern::prepend_env(env_b, &current_env);
+                                    if let Some(matched_env) = crate::eval::shared::pattern::try_match_one(pattern_a, &val_b, &match_env, funcs)? {
+                                        matched_any = true;
+                                        let mut sub_locals = state.locals.clone();
+                                        for var in pattern_vars {
+                                            let bound = matched_env.get(var).unwrap_or(Atom::sym("()"));
+                                            sub_locals.push((bound, Env::new()));
                                         }
-                                        VmExit::TailCall(new_locals) => {
-                                            return Ok((results, state.budget, VmExit::TailCall(new_locals)));
-                                        }
-                                        VmExit::Normal => {}
+                                        let sub_state = VMState {
+                                            code: then_code.clone(), ip: 0,
+                                            stack: Vec::new(), locals: sub_locals,
+                                            free_vars_map: free_vars_map.clone(),
+                                            free_vars_bindings: precomputed_bindings.clone(),
+                                            frames: Vec::new(), budget: state.budget,
+                                            cut_executed: false, resume_data: None, last_sub_result: None,
+                                        };
+                                        pending.push((sub_state, matched_env));
                                     }
                                 }
-                                None => {}
+                            }
+                            if !matched_any {
+                                let mut sub_state = VMState::new_with_parent(
+                                    else_code.clone(), free_vars_map.clone(), state.budget,
+                                    &state.free_vars_map, &state.free_vars_bindings,
+                                );
+                                sub_state.locals = state.locals.clone();
+                                pending.push((sub_state, current_env.clone()));
                             }
                         }
-                    }
 
-                    if !matched_any {
-                        let mut sub_state = VMState::new_with_parent(
-                            else_code.clone(),
-                            free_vars_map.clone(),
-                            state.budget,
-                            &state.free_vars_map,
-                            &state.free_vars_bindings,
-                        );
-                        for val in &state.locals {
-                            sub_state.locals.push(val.clone());
-                        }
-                        let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &current_env)?;
-                        state.budget = sub_budget;
-                        results.extend(res);
-                        match exit_status {
-                            VmExit::Cut => { state.cut_executed = true; }
-                            VmExit::TailCall(new_locals) => {
-                                return Ok((results, state.budget, VmExit::TailCall(new_locals)));
-                            }
-                            VmExit::Normal => {}
-                        }
+                        UnifyResume { results: Vec::new(), pending, matched_any, current_env }
                     }
+                };
+
+                // Drain pending sub-VMs one at a time via yield.
+                while !resume.pending.is_empty() && !state.cut_executed {
+                    let (sub_state, sub_env) = resume.pending.remove(0);
+                    state.resume_data = Some(Box::new(resume));
+                    yield_vm!(state, sub_state, sub_env);
                 }
 
-                state.stack.push(results);
+                state.stack.push(resume.results);
                 state.ip += 1;
             }
             Opcode::Call(arity) => {
@@ -856,88 +862,83 @@ pub fn run_vm(
                 } else {
                     None
                 };
-                let space_rs = state.stack.pop().ok_or("VM stack underflow on Match space")?;
-                let mut results = Vec::new();
-                if let Some((space_ref, _)) = space_rs.first() {
-                    let mut match_env = Env::new();
-                    for (name, val) in local_names.iter().zip(state.locals.iter()) {
-                        match_env = match_env.extend(name, val.0.clone());
+                // Resume struct for Match loop over space query results.
+                struct MatchResume {
+                    results: Vec<(crate::atom::Atom, Env)>,
+                    pending: Vec<(VMState, Env)>,
+                }
+                let mut resume = match state.resume_data.take().and_then(|r| r.downcast::<MatchResume>().ok()) {
+                    Some(r) => {
+                        let mut r = *r;
+                        if let Some((sub_res, sub_exit)) = state.last_sub_result.take() {
+                            r.results.extend(sub_res);
+                            match sub_exit {
+                                VmExit::Cut => { state.cut_executed = true; r.pending.clear(); }
+                                VmExit::TailCall(locs) => return Ok((r.results, state.budget, VmExit::TailCall(locs))),
+                                VmExit::Normal => {}
+                                VmExit::YieldCall { .. } => unreachable!(),
+                            }
+                        }
+                        r
                     }
-                    
-                    if let Ok(matches) = crate::space::query::collect_match_results(
-                        funcs,
-                        space_ref,
-                        pattern,
-                        &match_env,
-                    ) {
-                        if !matches.is_empty() {
-                            // Precompute bindings once for the entire Match block
-                            let precomputed_bindings: Vec<Atom> = free_vars_map
-                                .iter()
-                                .map(|name| {
-                                    if let Some(pos) = state.free_vars_map.iter().position(|x| x == name) {
-                                        state.free_vars_bindings[pos].clone()
-                                    } else if crate::eval::shared::fresh::is_generated_var_name(name) {
-                                        Atom::sym(name)
-                                    } else {
-                                        let id = crate::eval::machine::vm::state::next_fresh_id();
-                                        let hint = name.strip_prefix('$').unwrap_or(name);
-                                        let fresh_name = format!("$__fresh_{hint}_{id}");
-                                        Atom::sym(&fresh_name)
+                    None => {
+                        let space_rs = state.stack.pop().ok_or("VM stack underflow on Match space")?;
+                        let mut results = Vec::new();
+                        let mut pending: Vec<(VMState, Env)> = Vec::new();
+                        if let Some((space_ref, _)) = space_rs.first() {
+                            let mut match_env = Env::new();
+                            for (name, val) in local_names.iter().zip(state.locals.iter()) {
+                                match_env = match_env.extend(name, val.0.clone());
+                            }
+                            if let Ok(matches) = crate::space::query::collect_match_results(funcs, space_ref, pattern, &match_env) {
+                                if !matches.is_empty() {
+                                    let precomputed_bindings: Vec<Atom> = free_vars_map.iter().map(|name| {
+                                        if let Some(pos) = state.free_vars_map.iter().position(|x| x == name) {
+                                            state.free_vars_bindings[pos].clone()
+                                        } else if crate::eval::shared::fresh::is_generated_var_name(name) {
+                                            Atom::sym(name)
+                                        } else {
+                                            let id = crate::eval::machine::vm::state::next_fresh_id();
+                                            let hint = name.strip_prefix('$').unwrap_or(name);
+                                            Atom::sym(&format!("$__fresh_{hint}_{id}"))
+                                        }
+                                    }).collect();
+                                    for matched in matches {
+                                        let mut sub_locals = state.locals.clone();
+                                        for var in pattern_vars {
+                                            let bound = matched.bindings.iter()
+                                                .find(|(k, _)| k.as_ref() == var.as_str())
+                                                .map(|(_, v)| (**v).clone())
+                                                .unwrap_or_else(|| {
+                                                    if let Some(idx) = local_names.iter().position(|x| x == var) {
+                                                        state.locals[idx].0.clone()
+                                                    } else { Atom::sym("()") }
+                                                });
+                                            sub_locals.push((bound, Env::new()));
+                                        }
+                                        let sub_state = VMState {
+                                            code: body_code.clone(), ip: 0,
+                                            stack: Vec::new(), locals: sub_locals,
+                                            free_vars_map: free_vars_map.clone(),
+                                            free_vars_bindings: precomputed_bindings.clone(),
+                                            frames: Vec::new(), budget: state.budget,
+                                            cut_executed: false, resume_data: None, last_sub_result: None,
+                                        };
+                                        let sub_env = crate::eval::shared::env::bind_all(&match_env, &matched.bindings);
+                                        pending.push((sub_state, sub_env));
                                     }
-                                })
-                                .collect();
-
-                            for matched in matches {
-                                let mut sub_state_locals = Vec::with_capacity(state.locals.len() + pattern_vars.len());
-                                for val in &state.locals {
-                                    sub_state_locals.push(val.clone());
-                                }
-                                for var in pattern_vars {
-                                    let bound = matched.bindings.iter()
-                                        .find(|(k, _)| k.as_ref() == var.as_str())
-                                        .map(|(_, v)| (**v).clone())
-                                        .unwrap_or_else(|| {
-                                            if let Some(idx) = local_names.iter().position(|x| x == var) {
-                                                state.locals[idx].0.clone()
-                                            } else {
-                                                Atom::sym("()")
-                                            }
-                                        });
-                                    sub_state_locals.push((bound, Env::new()));
-                                }
-                                
-                                let sub_state = VMState {
-                                    code: body_code.clone(),
-                                    ip: 0,
-                                    stack: Vec::new(),
-                                    locals: sub_state_locals,
-                                    free_vars_map: free_vars_map.clone(),
-                                    free_vars_bindings: precomputed_bindings.clone(),
-                                    frames: Vec::new(),
-                                    budget: state.budget,
-                                    cut_executed: false,
-                                };
-                                
-                                let sub_env = crate::eval::shared::env::bind_all(&match_env, &matched.bindings);
-                                let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &sub_env)?;
-                                state.budget = sub_budget;
-                                results.extend(res);
-                                match exit_status {
-                                    VmExit::Cut => {
-                                        state.cut_executed = true;
-                                        break;
-                                    }
-                                    VmExit::TailCall(new_locals) => {
-                                        return Ok((results, state.budget, VmExit::TailCall(new_locals)));
-                                    }
-                                    VmExit::Normal => {}
                                 }
                             }
                         }
+                        MatchResume { results, pending }
                     }
+                };
+                while !resume.pending.is_empty() && !state.cut_executed {
+                    let (sub_state, sub_env) = resume.pending.remove(0);
+                    state.resume_data = Some(Box::new(resume));
+                    yield_vm!(state, sub_state, sub_env);
                 }
-                state.stack.push(results);
+                state.stack.push(resume.results);
                 state.ip += 1;
             }
             Opcode::Eval => {
@@ -1210,32 +1211,47 @@ pub fn run_vm(
                 body_code,
                 free_vars_map,
             } => {
-                // FoldlLambda aggregates list elements using a precompiled lambda body code for high performance
-                let acc_rs = state.stack.pop().ok_or("VM stack underflow on FoldlLambda acc")?;
-                let list_rs = state.stack.pop().ok_or("VM stack underflow on FoldlLambda list")?;
-
-                // substitute env
-                let acc = acc_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
-                    .ok_or_else(|| "foldl-atom: acc arg produced no result".to_string())?;
-                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
-                    Some(Atom::Expr(v)) => v.to_vec(),
-                    Some(other) => vec![other],
-                    None => return Err("foldl-atom: list arg produced no result".to_string()),
-                };
-
-                let mut current_acc = acc;
-                for elem in items {
-                    let mut sub_state = VMState::new_with_parent(
-                        body_code.clone(),
-                        free_vars_map.clone(),
-                        state.budget,
-                        &state.free_vars_map,
-                        &state.free_vars_bindings,
-                    );
-                    for val in &state.locals {
-                        sub_state.locals.push(val.clone());
+                // FoldlLambda: resumable loop over list elements.
+                struct FoldlLambdaResume {
+                    current_acc: Atom,
+                    items: Vec<Atom>,
+                    next_item_idx: usize,
+                }
+                let mut resume = match state.resume_data.take().and_then(|r| r.downcast::<FoldlLambdaResume>().ok()) {
+                    Some(r) => {
+                        let mut r = *r;
+                        if let Some((sub_res, sub_exit)) = state.last_sub_result.take() {
+                            r.current_acc = sub_res.into_iter().next()
+                                .map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
+                                .unwrap_or(r.current_acc);
+                            match sub_exit {
+                                VmExit::Cut => { state.cut_executed = true; }
+                                VmExit::TailCall(locs) => return Ok((plain(vec![r.current_acc]), state.budget, VmExit::TailCall(locs))),
+                                VmExit::Normal => {}
+                                VmExit::YieldCall { .. } => unreachable!(),
+                            }
+                        }
+                        r
                     }
-                    let vals_to_bind = [current_acc.clone(), elem];
+                    None => {
+                        let acc_rs = state.stack.pop().ok_or("VM stack underflow on FoldlLambda acc")?;
+                        let list_rs = state.stack.pop().ok_or("VM stack underflow on FoldlLambda list")?;
+                        let acc = acc_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
+                            .ok_or_else(|| "foldl-atom: acc arg produced no result".to_string())?;
+                        let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
+                            Some(Atom::Expr(v)) => v.to_vec(),
+                            Some(other) => vec![other],
+                            None => return Err("foldl-atom: list arg produced no result".to_string()),
+                        };
+                        FoldlLambdaResume { current_acc: acc, items, next_item_idx: 0 }
+                    }
+                };
+                while resume.next_item_idx < resume.items.len() && !state.cut_executed {
+                    let elem = resume.items[resume.next_item_idx].clone();
+                    resume.next_item_idx += 1;
+                    let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                    sub_state.locals = state.locals.clone();
+                    let vals_to_bind = [resume.current_acc.clone(), elem];
                     for (var, val) in var_names.iter().zip(vals_to_bind.iter()) {
                         sub_state.locals.push((val.clone(), Env::new()));
                     }
@@ -1248,22 +1264,10 @@ pub fn run_vm(
                     for (var, val) in var_names.iter().zip(vals_to_bind.iter()) {
                         step_env = step_env.extend(var, val.clone());
                     }
-                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &step_env)?;
-                    state.budget = sub_budget;
-                    // substitute env
-                    current_acc = res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)).unwrap_or(current_acc);
-                    match exit_status {
-                        VmExit::Cut => {
-                            state.cut_executed = true;
-                            break;
-                        }
-                        VmExit::TailCall(new_locals) => {
-                            return Ok((plain(vec![current_acc]), state.budget, VmExit::TailCall(new_locals)));
-                        }
-                        VmExit::Normal => {}
-                    }
+                    state.resume_data = Some(Box::new(resume));
+                    yield_vm!(state, sub_state, step_env);
                 }
-                state.stack.push(plain(vec![current_acc]));
+                state.stack.push(plain(vec![resume.current_acc]));
                 state.ip += 1;
             }
             Opcode::MapAtomLambda {
@@ -1271,49 +1275,50 @@ pub fn run_vm(
                 body_code,
                 free_vars_map,
             } => {
-                // MapAtomLambda maps list elements using a precompiled lambda body code for high performance
-                let list_rs = state.stack.pop().ok_or("VM stack underflow on MapAtomLambda")?;
-                // substitute env to resolve variables in list argument
-                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
-                    Some(Atom::Expr(v)) => v.to_vec(),
-                    Some(other) => vec![other],
-                    None => return Err("map-atom: list arg produced no result".to_string()),
-                };
-
-                let mut mapped_results = Vec::with_capacity(items.len());
-                for elem in items {
-                    let mut sub_state = VMState::new_with_parent(
-                        body_code.clone(),
-                        free_vars_map.clone(),
-                        state.budget,
-                        &state.free_vars_map,
-                        &state.free_vars_bindings,
-                    );
-                    for val in &state.locals {
-                        sub_state.locals.push(val.clone());
-                    }
-                    sub_state.locals.push((elem.clone(), Env::new()));
-                    
-                    let sub_env = base_env.extend(&var_name, elem.clone());
-                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &sub_env)?;
-                    state.budget = sub_budget;
-                    
-                    // substitute env for mapped item
-                    if let Some((val, env)) = res.into_iter().next() {
-                        mapped_results.push(crate::eval::shared::subst::subst_atom(&val, &env));
-                    }
-                    match exit_status {
-                        VmExit::Cut => {
-                            state.cut_executed = true;
-                            break;
-                        }
-                        VmExit::TailCall(new_locals) => {
-                            return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(mapped_results))]), state.budget, VmExit::TailCall(new_locals)));
-                        }
-                        VmExit::Normal => {}
-                    }
+                // MapAtomLambda: resumable loop, one yield per element.
+                struct MapAtomLambdaResume {
+                    items: Vec<Atom>,
+                    next_item_idx: usize,
+                    mapped_results: Vec<Atom>,
                 }
-                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(mapped_results))]));
+                let mut resume = match state.resume_data.take().and_then(|r| r.downcast::<MapAtomLambdaResume>().ok()) {
+                    Some(r) => {
+                        let mut r = *r;
+                        if let Some((sub_res, sub_exit)) = state.last_sub_result.take() {
+                            if let Some((val, env)) = sub_res.into_iter().next() {
+                                r.mapped_results.push(crate::eval::shared::subst::subst_atom(&val, &env));
+                            }
+                            match sub_exit {
+                                VmExit::Cut => { state.cut_executed = true; }
+                                VmExit::TailCall(locs) => return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(r.mapped_results))]), state.budget, VmExit::TailCall(locs))),
+                                VmExit::Normal => {}
+                                VmExit::YieldCall { .. } => unreachable!(),
+                            }
+                        }
+                        r
+                    }
+                    None => {
+                        let list_rs = state.stack.pop().ok_or("VM stack underflow on MapAtomLambda")?;
+                        let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
+                            Some(Atom::Expr(v)) => v.to_vec(),
+                            Some(other) => vec![other],
+                            None => return Err("map-atom: list arg produced no result".to_string()),
+                        };
+                        let cap = items.len();
+                        MapAtomLambdaResume { items, next_item_idx: 0, mapped_results: Vec::with_capacity(cap) }
+                    }
+                };
+                while resume.next_item_idx < resume.items.len() && !state.cut_executed {
+                    let elem = resume.items[resume.next_item_idx].clone();
+                    resume.next_item_idx += 1;
+                    let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                    sub_state.locals = state.locals.clone();
+                    sub_state.locals.push((elem.clone(), Env::new()));
+                    let sub_env = base_env.extend(&var_name, elem);
+                    state.resume_data = Some(Box::new(resume));
+                    yield_vm!(state, sub_state, sub_env);
+                }
+                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(resume.mapped_results))]));
                 state.ip += 1;
             }
             Opcode::FilterAtomLambda {
@@ -1321,204 +1326,247 @@ pub fn run_vm(
                 body_code,
                 free_vars_map,
             } => {
-                // FilterAtomLambda filters list elements using a precompiled lambda condition code for high performance
-                let list_rs = state.stack.pop().ok_or("VM stack underflow on FilterAtomLambda")?;
-                // substitute env to resolve variables in list argument
-                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
-                    Some(Atom::Expr(v)) => v.to_vec(),
-                    Some(other) => vec![other],
-                    None => return Err("filter-atom: list arg produced no result".to_string()),
-                };
-
-                let mut filtered_results = Vec::with_capacity(items.len());
-                for elem in items {
-                    let mut sub_state = VMState::new_with_parent(
-                        body_code.clone(),
-                        free_vars_map.clone(),
-                        state.budget,
-                        &state.free_vars_map,
-                        &state.free_vars_bindings,
-                    );
-                    for val in &state.locals {
-                        sub_state.locals.push(val.clone());
-                    }
-                    sub_state.locals.push((elem.clone(), Env::new()));
-                    
-                    let sub_env = base_env.extend(&var_name, elem.clone());
-                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &sub_env)?;
-                    state.budget = sub_budget;
-                    
-                    // substitute env
-                    let is_true = res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env).is_truthy()).unwrap_or(false);
-                    if is_true {
-                        filtered_results.push(elem);
-                    }
-                    match exit_status {
-                        VmExit::Cut => {
-                            state.cut_executed = true;
-                            break;
-                        }
-                        VmExit::TailCall(new_locals) => {
-                            return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(filtered_results))]), state.budget, VmExit::TailCall(new_locals)));
-                        }
-                        VmExit::Normal => {}
-                    }
+                // FilterAtomLambda: resumable loop.
+                struct FilterAtomLambdaResume {
+                    items: Vec<Atom>,
+                    next_item_idx: usize,
+                    filtered_results: Vec<Atom>,
                 }
-                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(filtered_results))]));
+                let mut resume = match state.resume_data.take().and_then(|r| r.downcast::<FilterAtomLambdaResume>().ok()) {
+                    Some(r) => {
+                        let mut r = *r;
+                        if let Some((sub_res, sub_exit)) = state.last_sub_result.take() {
+                            let is_true = sub_res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env).is_truthy()).unwrap_or(false);
+                            if is_true {
+                                // item at previous index passed the filter
+                                r.filtered_results.push(r.items[r.next_item_idx - 1].clone());
+                            }
+                            match sub_exit {
+                                VmExit::Cut => { state.cut_executed = true; }
+                                VmExit::TailCall(locs) => return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(r.filtered_results))]), state.budget, VmExit::TailCall(locs))),
+                                VmExit::Normal => {}
+                                VmExit::YieldCall { .. } => unreachable!(),
+                            }
+                        }
+                        r
+                    }
+                    None => {
+                        let list_rs = state.stack.pop().ok_or("VM stack underflow on FilterAtomLambda")?;
+                        let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
+                            Some(Atom::Expr(v)) => v.to_vec(),
+                            Some(other) => vec![other],
+                            None => return Err("filter-atom: list arg produced no result".to_string()),
+                        };
+                        let cap = items.len();
+                        FilterAtomLambdaResume { items, next_item_idx: 0, filtered_results: Vec::with_capacity(cap) }
+                    }
+                };
+                while resume.next_item_idx < resume.items.len() && !state.cut_executed {
+                    let elem = resume.items[resume.next_item_idx].clone();
+                    resume.next_item_idx += 1;
+                    let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                    sub_state.locals = state.locals.clone();
+                    sub_state.locals.push((elem.clone(), Env::new()));
+                    let sub_env = base_env.extend(&var_name, elem);
+                    state.resume_data = Some(Box::new(resume));
+                    yield_vm!(state, sub_state, sub_env);
+                }
+                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(resume.filtered_results))]));
                 state.ip += 1;
             }
             Opcode::Once { body_code, free_vars_map } => {
-                // run body, take only the first result
-                let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
-                for val in &state.locals { sub_state.locals.push(val.clone()); }
-                let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &base_env)?;
-                state.budget = sub_budget;
+                // Once: single sub-VM, no loop state needed.
+                struct OnceResume;
+                let (res, exit_status) = match state.resume_data.take().and_then(|r| r.downcast::<OnceResume>().ok()) {
+                    Some(_) => {
+                        let (r, e) = state.last_sub_result.take().unwrap_or_else(|| (Vec::new(), VmExit::Normal));
+                        (r, e)
+                    }
+                    None => {
+                        let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                        sub_state.locals = state.locals.clone();
+                        state.resume_data = Some(Box::new(OnceResume));
+                        yield_vm!(state, sub_state, base_env.clone());
+                    }
+                };
+                state.budget = state.budget; // budget already updated by trampoline
                 match exit_status {
-                    VmExit::TailCall(new_locals) => {
-                        return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
-                    }
-                    VmExit::Cut => {
-                        state.stack.push(res.into_iter().take(1).collect());
-                        state.cut_executed = true;
-                    }
-                    VmExit::Normal => {
-                        state.stack.push(res.into_iter().take(1).collect());
-                    }
+                    VmExit::TailCall(locs) => return Ok((Vec::new(), state.budget, VmExit::TailCall(locs))),
+                    VmExit::Cut => { state.stack.push(res.into_iter().take(1).collect()); state.cut_executed = true; }
+                    VmExit::Normal => { state.stack.push(res.into_iter().take(1).collect()); }
+                    VmExit::YieldCall { .. } => unreachable!(),
                 }
                 state.ip += 1;
             }
             Opcode::Progn { bodies, free_vars_map } => {
-                // run each body, return last result
-                let mut last = Vec::new();
-                for body_code in bodies {
-                    let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
-                    for val in &state.locals { sub_state.locals.push(val.clone()); }
-                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &base_env)?;
-                    state.budget = sub_budget;
-                    match exit_status {
-                        VmExit::TailCall(new_locals) => {
-                            return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
-                        }
-                        VmExit::Cut => {
-                            last = res;
-                            state.cut_executed = true;
-                            break;
-                        }
-                        VmExit::Normal => {
-                            last = res;
-                        }
-                    }
+                // Progn: run each body sequentially, resuming after each.
+                struct PrognResume {
+                    bodies: Vec<Arc<[Opcode]>>,
+                    next_body_idx: usize,
+                    last: ResultSet,
+                    free_vars_map: Arc<[String]>,
                 }
-                state.stack.push(last);
+                let mut resume = match state.resume_data.take().and_then(|r| r.downcast::<PrognResume>().ok()) {
+                    Some(r) => {
+                        let mut r = *r;
+                        if let Some((sub_res, sub_exit)) = state.last_sub_result.take() {
+                            match sub_exit {
+                                VmExit::TailCall(locs) => return Ok((Vec::new(), state.budget, VmExit::TailCall(locs))),
+                                VmExit::Cut => { r.last = sub_res; state.cut_executed = true; r.next_body_idx = r.bodies.len(); }
+                                VmExit::Normal => { r.last = sub_res; }
+                                VmExit::YieldCall { .. } => unreachable!(),
+                            }
+                        }
+                        r
+                    }
+                    None => {
+                        PrognResume { bodies: bodies.clone(), next_body_idx: 0, last: Vec::new(), free_vars_map: free_vars_map.clone() }
+                    }
+                };
+                while resume.next_body_idx < resume.bodies.len() && !state.cut_executed {
+                    let body_code = resume.bodies[resume.next_body_idx].clone();
+                    resume.next_body_idx += 1;
+                    let mut sub_state = VMState::new_with_parent(body_code, resume.free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                    sub_state.locals = state.locals.clone();
+                    state.resume_data = Some(Box::new(resume));
+                    yield_vm!(state, sub_state, base_env.clone());
+                }
+                state.stack.push(resume.last);
                 state.ip += 1;
             }
             Opcode::Prog1 { bodies, free_vars_map } => {
-                // run each body, return first result
-                let mut first = Vec::new();
-                for (i, body_code) in bodies.iter().enumerate() {
-                    let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
-                    for val in &state.locals { sub_state.locals.push(val.clone()); }
-                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &base_env)?;
-                    state.budget = sub_budget;
-                    match exit_status {
-                        VmExit::TailCall(new_locals) => {
-                            return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
-                        }
-                        VmExit::Cut => {
-                            if i == 0 { first = res; }
-                            state.cut_executed = true;
-                            break;
-                        }
-                        VmExit::Normal => {
-                            if i == 0 { first = res; }
-                        }
-                    }
+                // Prog1: run each body, return first result.
+                struct Prog1Resume {
+                    bodies: Vec<Arc<[Opcode]>>,
+                    next_body_idx: usize,
+                    first: ResultSet,
+                    free_vars_map: Arc<[String]>,
                 }
-                state.stack.push(first);
+                let mut resume = match state.resume_data.take().and_then(|r| r.downcast::<Prog1Resume>().ok()) {
+                    Some(r) => {
+                        let mut r = *r;
+                        if let Some((sub_res, sub_exit)) = state.last_sub_result.take() {
+                            match sub_exit {
+                                VmExit::TailCall(locs) => return Ok((Vec::new(), state.budget, VmExit::TailCall(locs))),
+                                VmExit::Cut => {
+                                    if r.next_body_idx == 1 { r.first = sub_res; }
+                                    state.cut_executed = true;
+                                    r.next_body_idx = r.bodies.len();
+                                }
+                                VmExit::Normal => {
+                                    if r.next_body_idx == 1 { r.first = sub_res; }
+                                }
+                                VmExit::YieldCall { .. } => unreachable!(),
+                            }
+                        }
+                        r
+                    }
+                    None => {
+                        Prog1Resume { bodies: bodies.clone(), next_body_idx: 0, first: Vec::new(), free_vars_map: free_vars_map.clone() }
+                    }
+                };
+                while resume.next_body_idx < resume.bodies.len() && !state.cut_executed {
+                    let body_code = resume.bodies[resume.next_body_idx].clone();
+                    resume.next_body_idx += 1;
+                    let mut sub_state = VMState::new_with_parent(body_code, resume.free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                    sub_state.locals = state.locals.clone();
+                    state.resume_data = Some(Box::new(resume));
+                    yield_vm!(state, sub_state, base_env.clone());
+                }
+                state.stack.push(resume.first);
                 state.ip += 1;
             }
             Opcode::Chain { steps, final_code, free_vars_map } => {
-                // evaluate each step, bind result into parent free_vars so new_with_parent threads them through
-                for (step_code, var_name) in steps.iter() {
-                    let mut sub_state = VMState::new_with_parent(step_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
-                    for val in &state.locals { sub_state.locals.push(val.clone()); }
-                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &base_env)?;
-                    state.budget = sub_budget;
-                    
-                    let val: Atom = match exit_status {
-                        VmExit::TailCall(new_locals) => {
-                            return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
-                        }
-                        VmExit::Cut => {
-                            state.cut_executed = true;
-                            // substitute env to preserve variables
-                            res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
-                        }
-                        VmExit::Normal => {
-                            // substitute env to preserve variables
-                            res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env))
-                        }
-                    }.ok_or_else(|| format!("chain: expression for {} produced no result", var_name))?;
-                    
-                    // Inject into parent so subsequent steps and final body inherit the binding
-                    if let Some(pos) = state.free_vars_map.iter().position(|x| x == var_name) {
-                        state.free_vars_bindings[pos] = val;
-                    } else {
-                        let mut temp = state.free_vars_map.to_vec();
-                        temp.push(var_name.clone());
-                        state.free_vars_map = std::sync::Arc::from(temp);
-                        state.free_vars_bindings.push(val);
-                    }
-                    if state.cut_executed { break; }
+                // Chain: evaluate each step, bind result, then run final body.
+                struct ChainResume {
+                    steps: Vec<(Arc<[Opcode]>, String)>,
+                    final_code: Arc<[Opcode]>,
+                    free_vars_map: Arc<[String]>,
+                    next_step_idx: usize,  // 0..steps.len() = steps; steps.len() = final body
+                    done: bool,
                 }
+                let mut resume = match state.resume_data.take().and_then(|r| r.downcast::<ChainResume>().ok()) {
+                    Some(r) => {
+                        let mut r = *r;
+                        if let Some((sub_res, sub_exit)) = state.last_sub_result.take() {
+                            let is_final = r.next_step_idx > r.steps.len();
+                            let val_opt = match sub_exit {
+                                VmExit::TailCall(locs) => return Ok((Vec::new(), state.budget, VmExit::TailCall(locs))),
+                                VmExit::Cut => { state.cut_executed = true; sub_res.into_iter().next().map(|(a,env)| crate::eval::shared::subst::subst_atom(&a,&env)) }
+                                VmExit::Normal => sub_res.into_iter().next().map(|(a,env)| crate::eval::shared::subst::subst_atom(&a,&env)),
+                                VmExit::YieldCall { .. } => unreachable!(),
+                            };
+                            if is_final {
+                                // Final body just finished — push result and finish.
+                                let rs = val_opt.map(|v| plain(vec![v])).unwrap_or_default();
+                                state.stack.push(rs);
+                                state.ip += 1;
+                                continue;
+                            } else {
+                                // A step finished: bind the var.
+                                let step_idx = r.next_step_idx - 1;
+                                let var_name = &r.steps[step_idx].1;
+                                let val = val_opt.ok_or_else(|| format!("chain: step {} produced no result", var_name))?;
+                                if let Some(pos) = state.free_vars_map.iter().position(|x| x == var_name) {
+                                    state.free_vars_bindings[pos] = val;
+                                } else {
+                                    let mut temp = state.free_vars_map.to_vec();
+                                    temp.push(var_name.clone());
+                                    state.free_vars_map = Arc::from(temp);
+                                    state.free_vars_bindings.push(val);
+                                }
+                            }
+                        }
+                        r
+                    }
+                    None => {
+                        ChainResume { steps: steps.clone(), final_code: final_code.clone(), free_vars_map: free_vars_map.clone(), next_step_idx: 0, done: false }
+                    }
+                };
                 if !state.cut_executed {
-                    let mut sub_state = VMState::new_with_parent(final_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
-                    for val in &state.locals { sub_state.locals.push(val.clone()); }
-                    let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &base_env)?;
-                    state.budget = sub_budget;
-                    match exit_status {
-                        VmExit::TailCall(new_locals) => {
-                            return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
-                        }
-                        VmExit::Cut => {
-                            state.cut_executed = true;
-                            state.stack.push(res);
-                        }
-                        VmExit::Normal => {
-                            state.stack.push(res);
-                        }
+                    if resume.next_step_idx < resume.steps.len() {
+                        let (step_code, _) = resume.steps[resume.next_step_idx].clone();
+                        resume.next_step_idx += 1;
+                        let mut sub_state = VMState::new_with_parent(step_code, resume.free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                        sub_state.locals = state.locals.clone();
+                        state.resume_data = Some(Box::new(resume));
+                        yield_vm!(state, sub_state, base_env.clone());
+                    } else {
+                        // All steps done, run final body.
+                        resume.next_step_idx += 1; // mark as final
+                        let mut sub_state = VMState::new_with_parent(resume.final_code.clone(), resume.free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                        sub_state.locals = state.locals.clone();
+                        state.resume_data = Some(Box::new(resume));
+                        yield_vm!(state, sub_state, base_env.clone());
                     }
                 } else {
                     state.stack.push(Vec::new());
+                    state.ip += 1;
                 }
-                state.ip += 1;
             }
             Opcode::Within { body_code, free_vars_map } => {
-                // run body, collect all results, wrap into (within result1 result2 ...)
-                let mut sub_state = VMState::new_with_parent(
-                    body_code.clone(),
-                    free_vars_map.clone(),
-                    state.budget,
-                    &state.free_vars_map,
-                    &state.free_vars_bindings,
-                );
-                for val in &state.locals { sub_state.locals.push(val.clone()); }
-                let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &base_env)?;
-                state.budget = sub_budget;
+                // Within: single sub-VM.
+                struct WithinResume;
+                let (res, exit_status) = match state.resume_data.take().and_then(|r| r.downcast::<WithinResume>().ok()) {
+                    Some(_) => {
+                        let (r, e) = state.last_sub_result.take().unwrap_or_else(|| (Vec::new(), VmExit::Normal));
+                        (r, e)
+                    }
+                    None => {
+                        let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                        sub_state.locals = state.locals.clone();
+                        state.resume_data = Some(Box::new(WithinResume));
+                        yield_vm!(state, sub_state, base_env.clone());
+                    }
+                };
                 match exit_status {
-                    VmExit::TailCall(new_locals) => {
-                        return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
-                    }
-                    VmExit::Cut => {
-                        state.cut_executed = true;
-                    }
+                    VmExit::TailCall(locs) => return Ok((Vec::new(), state.budget, VmExit::TailCall(locs))),
+                    VmExit::Cut => { state.cut_executed = true; }
                     VmExit::Normal => {}
+                    VmExit::YieldCall { .. } => unreachable!(),
                 }
-                // substitute env on Within to resolve variables
                 let atoms: Vec<Atom> = res.into_iter().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)).collect();
-                if atoms.is_empty() {
-                    return Err("within: expression produced no results".into());
-                }
+                if atoms.is_empty() { return Err("within: expression produced no results".into()); }
                 let wrapped = Atom::Expr(crate::atom::expr_data(
                     std::iter::once(Atom::sym("within")).chain(atoms).collect::<Vec<_>>()
                 ));
@@ -1526,72 +1574,81 @@ pub fn run_vm(
                 state.ip += 1;
             }
             Opcode::WithMutex { body_code, free_vars_map } => {
-                // pop evaluated mutex name, acquire named lock, run body, release
-                let name_rs = state.stack.pop().ok_or("VM stack underflow on WithMutex")?;
-                // substitute env
-                let mutex_name = name_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env).to_sexpr_string()).unwrap_or_default();
-                let mut sub_state = VMState::new_with_parent(
-                    body_code.clone(),
-                    free_vars_map.clone(),
-                    state.budget,
-                    &state.free_vars_map,
-                    &state.free_vars_bindings,
-                );
-                for val in &state.locals { sub_state.locals.push(val.clone()); }
-                let result = crate::space::mutate::with_named_mutex(&mutex_name, || {
-                    run_vm(sub_state, funcs, &base_env)
-                })?;
-                let (res, sub_budget, exit_status) = result;
-                state.budget = sub_budget;
+                // WithMutex: single sub-VM under a named mutex.
+                struct WithMutexResume { mutex_name: String }
+                let (res, exit_status) = match state.resume_data.take().and_then(|r| r.downcast::<WithMutexResume>().ok()) {
+                    Some(_) => {
+                        let (r, e) = state.last_sub_result.take().unwrap_or_else(|| (Vec::new(), VmExit::Normal));
+                        (r, e)
+                    }
+                    None => {
+                        let name_rs = state.stack.pop().ok_or("VM stack underflow on WithMutex")?;
+                        let mutex_name = name_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env).to_sexpr_string()).unwrap_or_default();
+                        let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                        sub_state.locals = state.locals.clone();
+                        // WithMutex: the mutex guard spans across the trampoline yield.
+                        // We acquire before yield, release after return.
+                        // Use a thread-local guard slot to hold it across the yield boundary.
+                        // ponytail: mutex held for the duration of the sub-VM via thread-local.
+                        let sub_env = base_env.clone();
+                        let result = crate::space::mutate::with_named_mutex(&mutex_name, || {
+                            // Since we're inside the closure we must run synchronously here.
+                            // This is the one site that can't fully trampoline (mutex semantics require
+                            // the body to complete before the lock drops). We call run_vm directly.
+                            run_vm(sub_state, funcs, &sub_env)
+                        })?;
+                        state.budget = result.1;
+                        state.last_sub_result = Some((result.0, result.2));
+                        // Fall through to the resume path below.
+                        let (r, e) = state.last_sub_result.take().unwrap_or_else(|| (Vec::new(), VmExit::Normal));
+                        (r, e)
+                    }
+                };
                 match exit_status {
-                    VmExit::TailCall(new_locals) => {
-                        return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
-                    }
-                    VmExit::Cut => {
-                        state.cut_executed = true;
-                    }
+                    VmExit::TailCall(locs) => return Ok((Vec::new(), state.budget, VmExit::TailCall(locs))),
+                    VmExit::Cut => { state.cut_executed = true; }
                     VmExit::Normal => {}
+                    VmExit::YieldCall { .. } => unreachable!(),
                 }
                 state.stack.push(res);
                 state.ip += 1;
             }
             Opcode::Transaction { body_code, free_vars_map } => {
-                // snapshot state, run body in sub-VM, rollback on empty result or error
-                let snapshot = crate::space::mutate::snapshot_transaction_state(funcs);
-                let mut sub_state = VMState::new_with_parent(
-                    body_code.clone(),
-                    free_vars_map.clone(),
-                    state.budget,
-                    &state.free_vars_map,
-                    &state.free_vars_bindings,
-                );
-                for val in &state.locals { sub_state.locals.push(val.clone()); }
-                match run_vm(sub_state, funcs, &base_env) {
-                    Ok((res, sub_budget, exit_status)) => {
-                        state.budget = sub_budget;
-                        match exit_status {
-                            VmExit::TailCall(new_locals) => {
-                                crate::space::mutate::restore_transaction_state(snapshot, funcs)
+                // Transaction: snapshot, run body; rollback on empty/error.
+                struct TransactionResume { snapshot: crate::space::mutate::TransactionSnapshot }
+                let (res, exit_status) = match state.resume_data.take().and_then(|r| r.downcast::<TransactionResume>().ok()) {
+                    Some(r) => {
+                        let r = *r;
+                        let (res, e) = state.last_sub_result.take().unwrap_or_else(|| (Vec::new(), VmExit::Normal));
+                        // Handle rollback on the return path.
+                        match &e {
+                            VmExit::TailCall(_) => {
+                                crate::space::mutate::restore_transaction_state(r.snapshot, funcs)
                                     .map_err(|e| format!("transaction: rollback failed: {e}"))?;
-                                return Ok((Vec::new(), state.budget, VmExit::TailCall(new_locals)));
                             }
-                            VmExit::Cut => {
-                                state.cut_executed = true;
+                            _ if res.is_empty() => {
+                                crate::space::mutate::restore_transaction_state(r.snapshot, funcs)
+                                    .map_err(|e| format!("transaction: rollback failed: {e}"))?;
                             }
-                            VmExit::Normal => {}
+                            _ => {}
                         }
-                        if res.is_empty() {
-                            crate::space::mutate::restore_transaction_state(snapshot, funcs)
-                                .map_err(|e| format!("transaction: rollback failed: {e}"))?;
-                        }
-                        state.stack.push(res);
+                        (res, e)
                     }
-                    Err(err) => {
-                        crate::space::mutate::restore_transaction_state(snapshot, funcs)
-                            .map_err(|e| format!("transaction: rollback failed: {e}"))?;
-                        return Err(format!("transaction: {err}"));
+                    None => {
+                        let snapshot = crate::space::mutate::snapshot_transaction_state(funcs);
+                        let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                        sub_state.locals = state.locals.clone();
+                        state.resume_data = Some(Box::new(TransactionResume { snapshot }));
+                        yield_vm!(state, sub_state, base_env.clone());
                     }
+                };
+                match exit_status {
+                    VmExit::TailCall(locs) => return Ok((Vec::new(), state.budget, VmExit::TailCall(locs))),
+                    VmExit::Cut => { state.cut_executed = true; }
+                    VmExit::Normal => {}
+                    VmExit::YieldCall { .. } => unreachable!(),
                 }
+                state.stack.push(res);
                 state.ip += 1;
             }
             Opcode::ImportFile { path } => {
@@ -1737,54 +1794,56 @@ pub fn run_vm(
                 pattern_vars,
                 free_vars_map,
             } => {
-                let list_rs = state.stack.pop().ok_or("VM stack underflow on MapAtomPatternLambda")?;
-                // substitute env
-                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
-                    Some(Atom::Expr(v)) => v.to_vec(),
-                    Some(other) => vec![other],
-                    None => return Err("map-atom: list arg produced no result".to_string()),
-                };
-
-                let mut mapped_results = Vec::with_capacity(items.len());
-                for elem in items {
-                    let matched = crate::eval::shared::pattern::try_match_one(
-                        pattern, &elem, &base_env, funcs,
-                    )?;
-                    if let Some(matched_env) = matched {
-                        let mut sub_state = VMState::new_with_parent(
-                            body_code.clone(),
-                            free_vars_map.clone(),
-                            state.budget,
-                            &state.free_vars_map,
-                            &state.free_vars_bindings,
-                        );
-                        for val in &state.locals {
-                            sub_state.locals.push(val.clone());
+                // MapAtomPatternLambda: resumable pattern-filtered map.
+                struct MapAtomPatternResume {
+                    items: Vec<Atom>,
+                    next_item_idx: usize,
+                    mapped_results: Vec<Atom>,
+                }
+                let mut resume = match state.resume_data.take().and_then(|r| r.downcast::<MapAtomPatternResume>().ok()) {
+                    Some(r) => {
+                        let mut r = *r;
+                        if let Some((sub_res, sub_exit)) = state.last_sub_result.take() {
+                            if let Some((val, env)) = sub_res.into_iter().next() {
+                                r.mapped_results.push(crate::eval::shared::subst::subst_atom(&val, &env));
+                            }
+                            match sub_exit {
+                                VmExit::Cut => { state.cut_executed = true; }
+                                VmExit::TailCall(locs) => return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(r.mapped_results))]), state.budget, VmExit::TailCall(locs))),
+                                VmExit::Normal => {}
+                                VmExit::YieldCall { .. } => unreachable!(),
+                            }
                         }
+                        r
+                    }
+                    None => {
+                        let list_rs = state.stack.pop().ok_or("VM stack underflow on MapAtomPatternLambda")?;
+                        let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
+                            Some(Atom::Expr(v)) => v.to_vec(),
+                            Some(other) => vec![other],
+                            None => return Err("map-atom: list arg produced no result".to_string()),
+                        };
+                        let cap = items.len();
+                        MapAtomPatternResume { items, next_item_idx: 0, mapped_results: Vec::with_capacity(cap) }
+                    }
+                };
+                while resume.next_item_idx < resume.items.len() && !state.cut_executed {
+                    let elem = resume.items[resume.next_item_idx].clone();
+                    resume.next_item_idx += 1;
+                    let matched = crate::eval::shared::pattern::try_match_one(pattern, &elem, &base_env, funcs)?;
+                    if let Some(matched_env) = matched {
+                        let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                        sub_state.locals = state.locals.clone();
                         for var in pattern_vars {
                             let bound = matched_env.get(var).unwrap_or(Atom::sym("()"));
                             sub_state.locals.push((bound, Env::new()));
                         }
-                        let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &matched_env)?;
-                        state.budget = sub_budget;
-
-                        // substitute env
-                        if let Some((val, env)) = res.into_iter().next() {
-                            mapped_results.push(crate::eval::shared::subst::subst_atom(&val, &env));
-                        }
-                        match exit_status {
-                            VmExit::Cut => {
-                                state.cut_executed = true;
-                                break;
-                            }
-                            VmExit::TailCall(new_locals) => {
-                                return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(mapped_results))]), state.budget, VmExit::TailCall(new_locals)));
-                            }
-                            VmExit::Normal => {}
-                        }
+                        state.resume_data = Some(Box::new(resume));
+                        yield_vm!(state, sub_state, matched_env);
                     }
+                    // no match: skip element, continue loop without yielding
                 }
-                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(mapped_results))]));
+                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(resume.mapped_results))]));
                 state.ip += 1;
             }
             Opcode::FilterAtomPatternLambda {
@@ -1793,55 +1852,57 @@ pub fn run_vm(
                 pattern_vars,
                 free_vars_map,
             } => {
-                let list_rs = state.stack.pop().ok_or("VM stack underflow on FilterAtomPatternLambda")?;
-                // substitute env
-                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
-                    Some(Atom::Expr(v)) => v.to_vec(),
-                    Some(other) => vec![other],
-                    None => return Err("filter-atom: list arg produced no result".to_string()),
-                };
-
-                let mut filtered_results = Vec::with_capacity(items.len());
-                for elem in items {
-                    let matched = crate::eval::shared::pattern::try_match_one(
-                        pattern, &elem, &base_env, funcs,
-                    )?;
-                    if let Some(matched_env) = matched {
-                        let mut sub_state = VMState::new_with_parent(
-                            body_code.clone(),
-                            free_vars_map.clone(),
-                            state.budget,
-                            &state.free_vars_map,
-                            &state.free_vars_bindings,
-                        );
-                        for val in &state.locals {
-                            sub_state.locals.push(val.clone());
+                // FilterAtomPatternLambda: resumable pattern-filtered filter.
+                struct FilterAtomPatternResume {
+                    items: Vec<Atom>,
+                    next_item_idx: usize,
+                    filtered_results: Vec<Atom>,
+                }
+                let mut resume = match state.resume_data.take().and_then(|r| r.downcast::<FilterAtomPatternResume>().ok()) {
+                    Some(r) => {
+                        let mut r = *r;
+                        if let Some((sub_res, sub_exit)) = state.last_sub_result.take() {
+                            let is_true = sub_res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env).is_truthy()).unwrap_or(false);
+                            if is_true {
+                                r.filtered_results.push(r.items[r.next_item_idx - 1].clone());
+                            }
+                            match sub_exit {
+                                VmExit::Cut => { state.cut_executed = true; }
+                                VmExit::TailCall(locs) => return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(r.filtered_results))]), state.budget, VmExit::TailCall(locs))),
+                                VmExit::Normal => {}
+                                VmExit::YieldCall { .. } => unreachable!(),
+                            }
                         }
+                        r
+                    }
+                    None => {
+                        let list_rs = state.stack.pop().ok_or("VM stack underflow on FilterAtomPatternLambda")?;
+                        let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
+                            Some(Atom::Expr(v)) => v.to_vec(),
+                            Some(other) => vec![other],
+                            None => return Err("filter-atom: list arg produced no result".to_string()),
+                        };
+                        let cap = items.len();
+                        FilterAtomPatternResume { items, next_item_idx: 0, filtered_results: Vec::with_capacity(cap) }
+                    }
+                };
+                while resume.next_item_idx < resume.items.len() && !state.cut_executed {
+                    let elem = resume.items[resume.next_item_idx].clone();
+                    resume.next_item_idx += 1;
+                    let matched = crate::eval::shared::pattern::try_match_one(pattern, &elem, &base_env, funcs)?;
+                    if let Some(matched_env) = matched {
+                        let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
+                        sub_state.locals = state.locals.clone();
                         for var in pattern_vars {
                             let bound = matched_env.get(var).unwrap_or(Atom::sym("()"));
                             sub_state.locals.push((bound, Env::new()));
                         }
-                        let (res, sub_budget, exit_status) = run_vm(sub_state, funcs, &matched_env)?;
-                        state.budget = sub_budget;
-
-                        // substitute env
-                        let is_true = res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env).is_truthy()).unwrap_or(false);
-                        if is_true {
-                            filtered_results.push(elem);
-                        }
-                        match exit_status {
-                            VmExit::Cut => {
-                                state.cut_executed = true;
-                                break;
-                            }
-                            VmExit::TailCall(new_locals) => {
-                                return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(filtered_results))]), state.budget, VmExit::TailCall(new_locals)));
-                            }
-                            VmExit::Normal => {}
-                        }
+                        state.resume_data = Some(Box::new(resume));
+                        yield_vm!(state, sub_state, matched_env);
                     }
+                    // no match: skip, continue
                 }
-                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(filtered_results))]));
+                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(resume.filtered_results))]));
                 state.ip += 1;
             }
             Opcode::TailCallSelf => {
