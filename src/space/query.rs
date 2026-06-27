@@ -96,9 +96,21 @@ pub fn collect_match_results(
                 let remaining = &subpatterns[1..];
                 let remaining_compiled: Vec<Pattern> = remaining.iter().map(pattern_from_expr).collect();
 
-                let results: Vec<Vec<(Arc<str>, Arc<Atom>)>> = if !remaining.is_empty()
+                // ponytail: compute parallelism decision once, before allocating the vec.
+                // Conditions: work must exceed thread-spawn overhead (~100μs), and we must
+                // not double-parallelize when remaining subpatterns are pure space lookups
+                // (those are better parallelized at the match_atoms level inside the space).
+                let all_remaining_pure = remaining_compiled.iter().all(|p| p.is_pure_space_lookup());
+                let n_workers = rayon::current_num_threads();
+                // Minimum ~8 results per thread to justify parallel dispatch overhead.
+                // When all remaining subpatterns are pure space lookups, skip par_iter here —
+                // match_atoms (space/core.rs) already parallelizes space traversals.
+                let use_parallel = !remaining.is_empty()
                     && initial_bindings.len() > 1
-                {
+                    && (initial_bindings.len() as usize) >= n_workers * 4
+                    && (!all_remaining_pure || initial_bindings.len() > 256);
+
+                let results: Vec<Vec<(Arc<str>, Arc<Atom>)>> = if use_parallel {
                     initial_bindings
                         .par_iter()
                         .map(|seed| -> Result<Vec<Vec<(Arc<str>, Arc<Atom>)>>, String> {

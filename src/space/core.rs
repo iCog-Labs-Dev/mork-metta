@@ -6,6 +6,7 @@
 
 use crate::atom::Atom;
 use crate::parser::Expr;
+use rayon::prelude::*;
 use std::sync::Arc;
 use mork_frontend::bytestring_parser::Parser;
 
@@ -48,6 +49,16 @@ impl Pattern {
             Atom::Sym(_) | Atom::Num(_) => Pattern::Exact(atom.clone()),
             Atom::Expr(items) => Pattern::Expr(items.iter().map(Self::from_atom).collect()),
             _ => Pattern::Exact(atom.clone()),
+        }
+    }
+
+    /// True if this pattern contains no variables — a pure space lookup with no unification.
+    /// Such patterns can be parallelized aggressively since each branch is cheap.
+    pub fn is_pure_space_lookup(&self) -> bool {
+        match self {
+            Pattern::Any | Pattern::Var(_) => false,
+            Pattern::Exact(_) => true,
+            Pattern::Expr(items) => items.iter().all(|p| p.is_pure_space_lookup()),
         }
     }
 }
@@ -299,29 +310,49 @@ impl Space for MorkSpace {
         });
 
         // Phase 2: traverse (read lock — concurrent with other readers).
+        // ponytail: collect candidates cheaply (pointer chase), then parallel-verify.
+        // Traversal is fast O(n) pointer ops; verification is the expensive part.
+        // Using two-pass: 1) collect paths sequentially, 2) verify in parallel.
         let inner = self.inner.read().unwrap();
-        let mut results = Vec::new();
+        let mut candidate_paths: Vec<Vec<u8>> = Vec::new();
         let mut z = inner.btm.read_zipper_at_path(&prefix_bytes);
         while z.to_next_val() {
-            if let Some(stored) = decode_expr_bytes(z.origin_path()) {
-                if let Some(mr) = match_one(pattern, &stored) {
-                    results.push(mr);
-                }
-            }
+            candidate_paths.push(z.origin_path().to_vec());
         }
 
-        if results.is_empty() && !prefix_bytes.is_empty() {
+        if candidate_paths.is_empty() && !prefix_bytes.is_empty() {
             let mut z = inner.btm.read_zipper();
             while z.to_next_val() {
-                if let Some(stored) = decode_expr_bytes(z.origin_path()) {
-                    if let Some(mr) = match_one(pattern, &stored) {
-                        results.push(mr);
-                    }
-                }
+                candidate_paths.push(z.origin_path().to_vec());
             }
         }
+        drop(inner); // release read lock before parallel verification
 
-        results
+        // Phase 3: parallel verification of candidates — each thread decodes and matches
+        // independently. Thread-local symbol table and pure decoding = no locks needed.
+        let n_workers = rayon::current_num_threads();
+        let pattern = pattern.clone();
+        let use_parallel = candidate_paths.len() >= n_workers * 4;
+        if use_parallel {
+            let verified: Vec<MatchResult> = candidate_paths
+                .into_par_iter()
+                .filter_map(|path| {
+                    decode_expr_bytes(&path).and_then(|stored| {
+                        match_one(&pattern, &stored)
+                    })
+                })
+                .collect();
+            verified
+        } else {
+            candidate_paths
+                .into_iter()
+                .filter_map(|path| {
+                    decode_expr_bytes(&path).and_then(|stored| {
+                        match_one(&pattern, &stored)
+                    })
+                })
+                .collect()
+        }
     }
 
     fn get_atoms(&self) -> Vec<Atom> {

@@ -3,6 +3,7 @@ use crate::env::Env;
 use crate::parser::Expr;
 use crate::func::{FnTable, FunctionKind};
 use crate::eval::machine::budget::{ResultSet, plain};
+use rayon::prelude::*;
 use super::op::{Opcode, VmExit, CaseBranch, QuoteVarSource, QuoteVarMatch};
 use super::state::{VMState, CallFrame, CallFrameKind};
 use std::sync::Arc;
@@ -1973,6 +1974,7 @@ fn run_vm_inner(
                                         body_env,
                                         locals_to_push,
                                         cost: total_cost,
+                                        pure: !body_has_side_effect(&clause.body_code),
                                     });
                                 }
                             }
@@ -2064,6 +2066,7 @@ fn run_vm_inner(
                                     body_env,
                                     locals_to_push,
                                     cost: total_cost,
+                                    pure: !body_has_side_effect(&clause.body_code),
                                 });
                             }
                         }
@@ -2412,12 +2415,13 @@ fn dispatch_call(
                         }
 
                         pending_calls.push(super::state::PendingCall {
-                            body_code: clause.body_code.clone(),
-                            free_vars: Arc::from(clause.free_vars.clone()),
-                            body_env,
-                            locals_to_push,
-                            cost: total_cost,
-                        });
+                                    body_code: clause.body_code.clone(),
+                                    free_vars: Arc::from(clause.free_vars.clone()),
+                                    body_env,
+                                    locals_to_push,
+                                    cost: total_cost,
+                                    pure: !body_has_side_effect(&clause.body_code),
+                                });
                     }
                 }
             }
@@ -2456,6 +2460,7 @@ fn dispatch_call(
                     let mut comp = super::compiler::VMCompiler::new(patterns, None);
                     let mut code = Vec::new();
                     comp.compile(&body_renamed, &mut code, false)?;
+                    let code_arc: std::sync::Arc<[Opcode]> = std::sync::Arc::from(code);
 
                     let mut locals_to_push = Vec::with_capacity(comp.locals.len());
                     for var in &comp.locals {
@@ -2464,11 +2469,12 @@ fn dispatch_call(
                     }
 
                     pending_calls.push(super::state::PendingCall {
-                        body_code: std::sync::Arc::from(code),
+                        body_code: code_arc.clone(),
                         free_vars: Arc::from(comp.free_vars),
                         body_env,
                         locals_to_push,
                         cost: 0,
+                        pure: !body_has_side_effect(&code_arc),
                     });
                 }
             }
@@ -2816,65 +2822,144 @@ fn run_next_case_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
     }
 }
 
+/// ponytail: scan body code for side-effect opcodes — exits early on first hit.
+/// Used to decide whether pending calls can be run in parallel.
+fn body_has_side_effect(body_code: &[Opcode]) -> bool {
+    body_code.iter().any(|op| matches!(
+        op,
+        Opcode::AddAtom { .. }
+            | Opcode::RemAtom { .. }
+            | Opcode::PythonImport { .. }
+            | Opcode::ImportDynamic
+            | Opcode::Println
+            | Opcode::Readln
+            | Opcode::PyCall { .. }
+            | Opcode::PyEval { .. }
+            | Opcode::ImportFile { .. }
+            | Opcode::MapAtomLambda { .. }
+            | Opcode::FilterAtomLambda { .. }
+            | Opcode::MapAtomPatternLambda { .. }
+            | Opcode::FilterAtomPatternLambda { .. }
+    ))
+}
+
+/// ponytail: run a single PendingCall body inside a fresh VMState snapshot.
+/// Called by par_iter in the parallel drain path; each invocation is fully independent.
+/// Takes free var map and bindings directly so no full VMState needs to be cloned.
+/// Budget already validated before parallel dispatch; sub-calls don't track it recursively.
+fn run_call_body(
+    pending: &super::state::PendingCall,
+    funcs: &FnTable,
+    fv_map: &Arc<[String]>,
+    fv_bindings: &[Atom],
+) -> Result<Vec<(Atom, Env)>, String> {
+    let free_vars_bindings: Vec<Atom> = pending.free_vars
+        .iter()
+        .map(|name| {
+            if let Some(pos) = fv_map.iter().position(|x| x == name) {
+                fv_bindings[pos].clone()
+            } else if crate::eval::shared::fresh::is_generated_var_name(name) {
+                Atom::sym(name)
+            } else {
+                let id = super::state::next_fresh_id();
+                let hint = name.strip_prefix('$').unwrap_or(name);
+                let fresh_name = format!("$__fresh_{hint}_{id}");
+                Atom::sym(&fresh_name)
+            }
+        })
+        .collect();
+
+    let call_state = VMState {
+        code: pending.body_code.clone(),
+        ip: 0,
+        locals: pending.locals_to_push.clone(),
+        stack: Vec::new(),
+        free_vars_map: pending.free_vars.clone(),
+        free_vars_bindings,
+        frames: Vec::new(),
+        budget: None, // ponytail: budget already validated at parallel drain entry
+        cut_executed: false,
+        resume_data: None,
+        last_sub_result: None,
+    };
+
+    let (results, _, _) = super::run_vm(call_state, funcs, &pending.body_env)?;
+    Ok(results)
+}
+
 /// Run the next iteration of the Call opcode in flat frame-based control flow.
 fn run_next_call_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Option<Env>, String> {
-    let mut to_run = None;
-    if let Some(frame) = state.frames.last_mut() {
-        if let CallFrameKind::Call {
-            pending_calls,
-            next_idx,
-            ..
-        } = &mut frame.kind {
-            if *next_idx < pending_calls.len() {
-                let pending = &pending_calls[*next_idx];
-                *next_idx += 1;
-                
-                if let Some(b) = state.budget {
-                    if b <= pending.cost {
-                        return Err("Budget exhausted".into());
-                    }
-                    state.budget = Some(b - pending.cost);
-                }
-                
-                to_run = Some((pending.body_code.clone(), pending.free_vars.clone(), pending.body_env.clone(), pending.locals_to_push.clone()));
+    // ponytail: peek at the full pending queue.
+    // When all calls are pure and there's enough work to amortize thread overhead,
+    // drain the ENTIRE queue in one parallel pass instead of one call per invocation.
+    let (all_pure, pending_len) = {
+        let frame = match state.frames.last_mut() {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let kind = &frame.kind;
+        if let CallFrameKind::Call { pending_calls, next_idx, .. } = kind {
+            let remaining = pending_calls.len().saturating_sub(*next_idx);
+            (remaining > 0 && pending_calls[*next_idx..].iter().all(|p| p.pure), remaining)
+        } else {
+            return Ok(None);
+        }
+    };
+
+    let n_workers = rayon::current_num_threads();
+    let should_parallel = all_pure && pending_len >= n_workers * 4;
+
+    if should_parallel {
+        // --- Parallel drain: run ALL remaining pure calls at once ---
+        // Extract pending info BEFORE any borrow conflict; frame is only borrowed here.
+        let frame = match state.frames.last_mut() {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let CallFrameKind::Call { pending_calls, next_idx, .. } = &mut frame.kind else {
+            return Ok(None);
+        };
+        let remaining: Vec<_> = pending_calls[*next_idx..].to_vec();
+        let total_cost: i64 = remaining.iter().map(|p| p.cost).sum();
+        *next_idx = pending_calls.len(); // consume all
+
+        // Capture only what run_call_body needs from parent state.
+        let fv_map = state.free_vars_map.clone();
+        let fv_bindings = state.free_vars_bindings.clone();
+
+        // Extract budget value BEFORE taking &mut state.budget in parallel loop.
+        // Cannot double-borrow state.budget: once for check, once for &mut Option<i64>.
+        let initial_budget = state.budget;
+        if let Some(b) = initial_budget {
+            if b <= total_cost {
+                return Err("Budget exhausted".into());
             }
         }
-    }
-    
-    if let Some((body_code, free_vars_map, body_env, locals_to_push)) = to_run {
-        // Save parent's locals before entering function body, replace with callee's params.
-        // This prevents absolute-index corruption (Load(0) seeing parent's param, not callee's).
-        if let Some(frame) = state.frames.last_mut() {
-            let parent_locals = std::mem::take(&mut state.locals);
-            frame.saved_locals = parent_locals;
-        }
-        state.locals = locals_to_push;
-        state.code = body_code;
-        state.ip = 0;
-        
-        let free_vars_bindings = free_vars_map
-            .iter()
-            .map(|name| {
-                if let Some(pos) = state.free_vars_map.iter().position(|x| x == name) {
-                    state.free_vars_bindings[pos].clone()
-                } else if crate::eval::shared::fresh::is_generated_var_name(name) {
-                    Atom::sym(name)
-                } else {
-                    let id = super::state::next_fresh_id();
-                    let hint = name.strip_prefix('$').unwrap_or(name);
-                    let fresh_name = format!("$__fresh_{hint}_{id}");
-                    Atom::sym(&fresh_name)
+        let budget_for_calls = initial_budget.map(|b| b - total_cost);
+
+        let mut budget_ref = budget_for_calls;
+        let results: Vec<(Atom, Env)> = {
+            // Collect parallel results; errors collected but not yet propagated.
+            let raw: Vec<Result<Vec<(Atom, Env)>, String>> = remaining
+                .into_par_iter()
+                .map(|pending| run_call_body(&pending, funcs, &fv_map, &fv_bindings))
+                .collect();
+            // Propagate first error, or flatten all results on success.
+            let mut out = Vec::new();
+            for r in raw {
+                match r {
+                    Ok(rs) => out.extend(rs),
+                    Err(e) => return Err(e),
                 }
-            })
-            .collect();
-        state.free_vars_map = free_vars_map;
-        state.free_vars_bindings = free_vars_bindings;
-        Ok(Some(body_env))
-    } else {
+            }
+            out
+        };
+        state.budget = budget_ref;
+
+        // Push results and fall through to the normal "frame done" path
         let frame = state.frames.pop().unwrap();
-        if let CallFrameKind::Call { results, memo_key, .. } = frame.kind {
+        if let CallFrameKind::Call { memo_key, .. } = frame.kind {
             if let Some(key) = memo_key {
-                // substitute environments on memoization results
                 let atoms_only: Vec<Atom> = results.iter().map(|(a, env)| crate::eval::shared::subst::subst_atom(a, env)).collect();
                 funcs.memo_set(key, atoms_only);
             }
@@ -2887,6 +2972,81 @@ fn run_next_call_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
             Ok(None)
         } else {
             unreachable!()
+        }
+    } else {
+        // --- Serial path: one call per invocation (original logic) ---
+        let mut to_run = None;
+        if let Some(frame) = state.frames.last_mut() {
+            if let CallFrameKind::Call {
+                pending_calls,
+                next_idx,
+                ..
+            } = &mut frame.kind {
+                if *next_idx < pending_calls.len() {
+                    let pending = &pending_calls[*next_idx];
+                    *next_idx += 1;
+
+                    if let Some(b) = state.budget {
+                        if b <= pending.cost {
+                            return Err("Budget exhausted".into());
+                        }
+                        state.budget = Some(b - pending.cost);
+                    }
+
+                    to_run = Some((
+                        pending.body_code.clone(),
+                        pending.free_vars.clone(),
+                        pending.body_env.clone(),
+                        pending.locals_to_push.clone(),
+                    ));
+                }
+            }
+        }
+
+        if let Some((body_code, free_vars_map, body_env, locals_to_push)) = to_run {
+            if let Some(frame) = state.frames.last_mut() {
+                let parent_locals = std::mem::take(&mut state.locals);
+                frame.saved_locals = parent_locals;
+            }
+            state.locals = locals_to_push;
+            state.code = body_code;
+            state.ip = 0;
+
+            let free_vars_bindings = free_vars_map
+                .iter()
+                .map(|name| {
+                    if let Some(pos) = state.free_vars_map.iter().position(|x| x == name) {
+                        state.free_vars_bindings[pos].clone()
+                    } else if crate::eval::shared::fresh::is_generated_var_name(name) {
+                        Atom::sym(name)
+                    } else {
+                        let id = super::state::next_fresh_id();
+                        let hint = name.strip_prefix('$').unwrap_or(name);
+                        let fresh_name = format!("$__fresh_{hint}_{id}");
+                        Atom::sym(&fresh_name)
+                    }
+                })
+                .collect();
+            state.free_vars_map = free_vars_map;
+            state.free_vars_bindings = free_vars_bindings;
+            Ok(Some(body_env))
+        } else {
+            let frame = state.frames.pop().unwrap();
+            if let CallFrameKind::Call { results, memo_key, .. } = frame.kind {
+                if let Some(key) = memo_key {
+                    let atoms_only: Vec<Atom> = results.iter().map(|(a, env)| crate::eval::shared::subst::subst_atom(a, env)).collect();
+                    funcs.memo_set(key, atoms_only);
+                }
+                state.code = frame.return_code;
+                state.ip = frame.return_ip + 1;
+                state.locals = frame.saved_locals;
+                state.free_vars_map = frame.saved_free_vars_map;
+                state.free_vars_bindings = frame.saved_free_vars_bindings;
+                state.stack.push(results);
+                Ok(None)
+            } else {
+                unreachable!()
+            }
         }
     }
 }

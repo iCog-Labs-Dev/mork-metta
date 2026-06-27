@@ -16,6 +16,9 @@ pub struct PendingCall {
     pub body_env: Env,
     pub locals_to_push: Vec<(Atom, Env)>,
     pub cost: i64,
+    /// True if this call body has no space mutations, I/O, or other side effects.
+    /// Enables parallel execution of pending calls in run_next_call_iteration.
+    pub pure: bool,
 }
 
 ///  Loop and execution state for frame-based control flow.
