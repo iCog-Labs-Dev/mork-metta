@@ -95,12 +95,14 @@ pub struct MorkSpace {
     /// RwLock: ArenaCompactTree is now Sync (Cell moved to zipper), so concurrent
     /// reads are safe. Only add_atom/remove_atom take the write lock.
     inner: std::sync::RwLock<mork::space::Space<mork::weightedsweep::UnitHeader>>,
+    symbol_index: std::sync::RwLock<rustc_hash::FxHashMap<crate::symbol::Symbol, indexmap::IndexSet<Atom>>>,
 }
 
 impl MorkSpace {
     pub fn new() -> Self {
         MorkSpace {
             inner: std::sync::RwLock::new(mork::space::Space::new()),
+            symbol_index: std::sync::RwLock::new(rustc_hash::FxHashMap::default()),
         }
     }
 
@@ -130,6 +132,40 @@ impl MorkSpace {
                 }
             }
             return rx;
+        }
+
+        let mut pat_syms = rustc_hash::FxHashSet::default();
+        crate::space::core::extract_symbols_from_pattern(pattern, &mut pat_syms);
+        
+        if !pat_syms.is_empty() {
+            let index = self.symbol_index.read().unwrap();
+            let mut best_sym = None;
+            let mut min_size = usize::MAX;
+            for sym in pat_syms {
+                if let Some(set) = index.get(&sym) {
+                    if set.len() < min_size {
+                        min_size = set.len();
+                        best_sym = Some(sym);
+                    }
+                } else {
+                    return rx;
+                }
+            }
+            
+            if let Some(sym) = best_sym {
+                let candidates = index.get(&sym).unwrap().clone();
+                drop(index); // release lock
+                let pattern = pattern.clone();
+                std::thread::spawn(move || {
+                    let results: Vec<MatchResult> = candidates.into_iter().filter_map(|stored| {
+                        match_one(&pattern, &stored)
+                    }).collect();
+                    for r in results {
+                        if tx.send(r).is_err() { return; }
+                    }
+                });
+                return rx;
+            }
         }
 
         let prefix_bytes: Vec<u8> = MORK_SPACE_ENCODE_BUF.with(|cell| {
@@ -343,7 +379,12 @@ fn encode_pattern_inner(
 
 impl Space for MorkSpace {
     fn add_atom(&self, atom: &Atom) -> Result<(), String> {
-        //  write directly to the trie bytes instead of formatting to an sexpr string first
+        let mut index = self.symbol_index.write().unwrap();
+        let mut syms = rustc_hash::FxHashSet::default();
+        crate::space::core::extract_all_symbols(atom, &mut syms);
+        for sym in syms {
+            index.entry(sym).or_default().insert(atom.clone());
+        }
         MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             let mut inner = self.inner.write().unwrap();
@@ -354,7 +395,14 @@ impl Space for MorkSpace {
     }
 
     fn remove_atom(&self, atom: &Atom) -> Result<bool, String> {
-        //  write directly to the trie bytes instead of formatting to an sexpr string first
+        let mut index = self.symbol_index.write().unwrap();
+        let mut syms = rustc_hash::FxHashSet::default();
+        crate::space::core::extract_all_symbols(atom, &mut syms);
+        for sym in syms {
+            if let Some(set) = index.get_mut(&sym) {
+                set.remove(atom);
+            }
+        }
         MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             let mut inner = self.inner.write().unwrap();
@@ -382,6 +430,33 @@ impl Space for MorkSpace {
             } else {
                 vec![]
             };
+        }
+
+        let mut pat_syms = rustc_hash::FxHashSet::default();
+        crate::space::core::extract_symbols_from_pattern(pattern, &mut pat_syms);
+        
+        if !pat_syms.is_empty() {
+            let index = self.symbol_index.read().unwrap();
+            let mut best_sym = None;
+            let mut min_size = usize::MAX;
+            for sym in pat_syms {
+                if let Some(set) = index.get(&sym) {
+                    if set.len() < min_size {
+                        min_size = set.len();
+                        best_sym = Some(sym);
+                    }
+                } else {
+                    return vec![];
+                }
+            }
+            
+            if let Some(sym) = best_sym {
+                let candidates = index.get(&sym).unwrap().clone();
+                drop(index); // release lock
+                return candidates.into_par_iter().filter_map(|stored| {
+                    match_one(pattern, &stored)
+                }).collect();
+            }
         }
 
         // Phase 1: encode prefix (read lock — concurrent with other readers).
@@ -729,5 +804,34 @@ fn parse_value(chars: &[char], pos: &mut usize) -> Result<Atom, String> {
 fn skip_whitespace(chars: &[char], pos: &mut usize) {
     while *pos < chars.len() && chars[*pos].is_whitespace() {
         *pos += 1;
+    }
+}
+
+pub fn extract_all_symbols(atom: &Atom, syms: &mut rustc_hash::FxHashSet<crate::symbol::Symbol>) {
+    match atom {
+        Atom::Sym(s) => { syms.insert(*s); }
+        Atom::Expr(items) => {
+            for item in items.iter() {
+                extract_all_symbols(item, syms);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn extract_symbols_from_pattern(pattern: &Pattern, syms: &mut rustc_hash::FxHashSet<crate::symbol::Symbol>) {
+    match pattern {
+        Pattern::Exact(Atom::Sym(s)) => { syms.insert(*s); }
+        Pattern::Exact(Atom::Expr(items)) => {
+            for item in items.iter() {
+                extract_all_symbols(item, syms);
+            }
+        }
+        Pattern::Expr(items) => {
+            for item in items.iter() {
+                extract_symbols_from_pattern(item, syms);
+            }
+        }
+        _ => {}
     }
 }
