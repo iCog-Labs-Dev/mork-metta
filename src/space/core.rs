@@ -438,7 +438,7 @@ fn decode_one(b: &[u8], pos: &mut usize, var_count: &mut u8) -> Option<Atom> {
             if *pos + s > b.len() {
                 return None;
             }
-            let sym = std::str::from_utf8(&b[*pos..*pos + s]).ok()?;
+            let sym = unsafe { std::str::from_utf8_unchecked(&b[*pos..*pos + s]) };
             *pos += s;
             Some(symbol_to_atom(sym))
         }
