@@ -7,7 +7,8 @@
 /// no conversion cost for complex objects.
 use crate::atom::{Atom, Grounded};
 use crate::Env;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 /// Evaluate `(py-call expr)` — single-expression Python call.
 pub(crate) fn eval_py_call(
@@ -81,13 +82,89 @@ pub(crate) fn eval_py_eval(
     }
 }
 
+/// Initialize venv site-packages in sys.path. Runs once per process.
+#[cfg(feature = "python-bridge")]
+fn init_venv_path(py: pyo3::Python<'_>) -> Result<(), String> {
+    use pyo3::types::PyAnyMethods;
+
+    let venv_root = std::env::var("VIRTUAL_ENV")
+        .ok()
+        .or_else(find_venv_dir);
+    let Some(root) = venv_root else { return Ok(()) };
+    let root_path = Path::new(&root);
+
+    // Read pyvenv.cfg to determine the Python version directory
+    let ver = read_pyvenv_version(root_path)?;
+    let site_pkg = root_path.join("lib").join(format!("python{ver}/site-packages"));
+    if !site_pkg.is_dir() {
+        return Ok(());
+    }
+
+    let dir_str = site_pkg.to_string_lossy().to_string();
+    let sys = py
+        .import("sys")
+        .map_err(|e| format!("py-venv: cannot import sys: {e}"))?;
+    let sys_path = sys
+        .getattr("path")
+        .map_err(|e| format!("py-venv: cannot get sys.path: {e}"))?;
+    sys_path
+        .call_method1("insert", (0, dir_str))
+        .map_err(|e| format!("py-venv: failed to add venv path: {e}"))?;
+    Ok(())
+}
+
+/// Walk up from cwd looking for `.venv/pyvenv.cfg`, max 5 levels deep.
+#[cfg(feature = "python-bridge")]
+fn find_venv_dir() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    for ancestor in cwd.ancestors().take(5) {
+        let candidate = ancestor.join(".venv");
+        if candidate.is_dir() && candidate.join("pyvenv.cfg").exists() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+/// Parse `pyvenv.cfg` for the `version` or `version_info` key, returning `major.minor`.
+#[cfg(feature = "python-bridge")]
+fn read_pyvenv_version(root: &Path) -> Result<String, String> {
+    let cfg = root.join("pyvenv.cfg");
+    let text = std::fs::read_to_string(&cfg)
+        .map_err(|e| format!("py-venv: cannot read {}: {e}", cfg.display()))?;
+    // Keys: `version = 3.12.12` or `version_info = 3.12.12`
+    let ver_line = text
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("version_info = ")
+                .or_else(|| trimmed.strip_prefix("version = "))
+                .or_else(|| trimmed.strip_prefix("version_info="))
+                .or_else(|| trimmed.strip_prefix("version="))
+        })
+        .ok_or_else(|| format!("py-venv: no version key in {}", cfg.display()))?;
+    let parts: Vec<&str> = ver_line.splitn(3, '.').collect();
+    if parts.len() < 2 {
+        return Err(format!(
+            "py-venv: malformed version '{}' in {}",
+            ver_line,
+            cfg.display()
+        ));
+    }
+    Ok(format!("{}.{}", parts[0], parts[1]))
+}
+
 /// Import a Python file as a module (from `(library ...)` import).
 pub(crate) fn eval_py_import_library(file_path: &std::path::Path) -> Result<(), String> {
     #[cfg(feature = "python-bridge")]
     {
         use pyo3::prelude::*;
         use pyo3::types::PyAnyMethods;
+        // ponytail: single-process `OnceLock` so we only scan for venv once.
+        static VENV_INIT: OnceLock<Result<(), String>> = OnceLock::new();
         Python::with_gil(|py| -> Result<(), String> {
+            VENV_INIT.get_or_init(|| init_venv_path(py)).clone()?;
             let dir = file_path
                 .parent()
                 .unwrap_or(std::path::Path::new("."))
