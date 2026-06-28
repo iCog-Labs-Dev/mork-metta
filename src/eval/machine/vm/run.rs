@@ -25,15 +25,7 @@ thread_local! {
     static VM_DEPTH: Cell<u32> = Cell::new(0);
 }
 
-fn intern_name(name: &str) -> &'static str {
-    static INTERNER: std::sync::OnceLock<std::sync::Mutex<HashMap<String, &'static str>>> =
-        std::sync::OnceLock::new();
-    let map = INTERNER.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut map = map.lock().unwrap();
-    *map.entry(name.to_string()).or_insert_with(|| {
-        Box::leak(name.to_string().into_boxed_str())
-    })
-}
+
 
 fn replace_at_path(atom: &mut Atom, path: &[usize], val: Atom) {
     if path.is_empty() {
@@ -707,7 +699,7 @@ fn run_vm_inner(
                     saved_free_vars_bindings: state.free_vars_bindings.clone(),
                     kind: CallFrameKind::Call {
                         name: match full_combos.first().and_then(|c| c.0.first()) {
-                            Some(Atom::Sym(s)) => intern_name(s),
+                            Some(Atom::Sym(s)) => s.as_str(),
                             _ => "",
                         },
                         arity: *arity,
@@ -1712,12 +1704,14 @@ fn run_vm_inner(
 
                 // substitute env
                 let path = match path_rs.first().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
-                    Some(Atom::Sym(s)) | Some(Atom::Str(s)) => s.clone(),
+                    Some(Atom::Sym(s)) => std::sync::Arc::from(s.as_str()),
+                    Some(Atom::Str(s)) => s.clone(),
                     Some(Atom::Expr(expr)) if expr.len() == 2 => {
                         if let (Some(Atom::Sym(head)), Some(py_atom)) = (expr.get(0), expr.get(1)) {
                             if head.as_ref() == "library" {
                                 match py_atom {
-                                    Atom::Sym(py) | Atom::Str(py) => py.clone(),
+                                    Atom::Sym(py) => std::sync::Arc::from(py.as_str()),
+                                    Atom::Str(py) => py.clone(),
                                     _ => return Err("import!: invalid path expression".into()),
                                 }
                             } else {

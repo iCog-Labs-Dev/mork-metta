@@ -157,8 +157,9 @@ pub fn expr_data<T: Into<Vec<Atom>>>(items: T) -> Arc<ExprData> {
 #[derive(Clone, Debug)]
 pub enum Atom {
     /// A symbolic name: function names, variable names (with $ prefix), data symbols.
-    /// Stored as Arc<str> so cloning is O(1) — hot paths clone symbols frequently.
-    Sym(Arc<str>),
+    /// Stored as a highly-optimized interned symbol (8 bytes) so cloning is zero-cost
+    /// and comparisons are instant. Avoids allocating Arcs for identical symbols.
+    Sym(crate::symbol::Symbol),
     /// A string literal value, distinct from symbols.
     /// `"hello"` in source → `Str("hello")`, NOT equal to symbol `hello`.
     Str(Arc<str>),
@@ -242,7 +243,7 @@ impl Atom {
             "False" => "false",
             other => other,
         };
-        Atom::Sym(Arc::from(canonical))
+        Atom::Sym(crate::symbol::Symbol::intern(canonical))
     }
 
     /// Convenience: create a string atom.

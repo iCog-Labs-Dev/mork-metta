@@ -1,4 +1,5 @@
 /// Public API for the mork-metta evaluator.
+pub mod symbol;
 pub mod atom;
 pub mod compile;
 pub mod env;

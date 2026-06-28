@@ -119,8 +119,8 @@ pub fn expect_n_args(args: &[Atom], n: usize, name: &str) -> Result<(), String> 
 pub(crate) fn alpha_equiv(
     a: &Atom,
     b: &Atom,
-    map_ab: &mut std::collections::HashMap<std::sync::Arc<str>, std::sync::Arc<str>>,
-    map_ba: &mut std::collections::HashMap<std::sync::Arc<str>, std::sync::Arc<str>>,
+    map_ab: &mut std::collections::HashMap<crate::symbol::Symbol, crate::symbol::Symbol>,
+    map_ba: &mut std::collections::HashMap<crate::symbol::Symbol, crate::symbol::Symbol>,
 ) -> bool {
     match (a, b) {
         (Atom::Sym(sa), Atom::Sym(sb)) => {
@@ -129,9 +129,9 @@ pub(crate) fn alpha_equiv(
             match (a_var, b_var) {
                 (true, true) => {
                     let fwd = map_ab.entry(sa.clone()).or_insert_with(|| sb.clone());
-                    let fwd_ok = fwd == sb;
+                    let fwd_ok = *fwd == *sb;
                     let bwd = map_ba.entry(sb.clone()).or_insert_with(|| sa.clone());
-                    fwd_ok && bwd == sa
+                    fwd_ok && *bwd == *sa
                 }
                 (false, false) => sa == sb,
                 _ => false,

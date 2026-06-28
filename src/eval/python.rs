@@ -343,9 +343,19 @@ fn atom_to_py<'py>(
 ) -> Result<pyo3::Bound<'py, pyo3::types::PyAny>, String> {
     use pyo3::prelude::*;
     match atom {
-        Atom::Sym(s) | Atom::Str(s) => {
-            // Try numeric parse first — MeTTa arithmetic produces Sym("NaN"),
-            // Sym("inf"), and numeric-looking symbols for special float values.
+        Atom::Sym(sym) => {
+            let s = sym.as_str();
+            if let Ok(val) = s.parse::<i64>() {
+                Ok(val.into_py(py).into_bound(py))
+            } else if let Ok(val) = s.parse::<f64>() {
+                Ok(val.into_py(py).into_bound(py))
+            } else {
+                let ps: pyo3::Bound<'_, pyo3::types::PyString> =
+                    pyo3::types::PyString::new(py, s);
+                Ok(ps.into_any())
+            }
+        }
+        Atom::Str(s) => {
             if let Ok(val) = s.parse::<i64>() {
                 Ok(val.into_py(py).into_bound(py))
             } else if let Ok(val) = s.parse::<f64>() {

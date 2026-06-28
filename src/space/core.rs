@@ -108,6 +108,96 @@ impl MorkSpace {
         Box::new(Self::new())
     }
 
+    pub fn stream_match_atoms(&self, pattern: &Pattern) -> std::sync::mpsc::Receiver<MatchResult> {
+        use std::sync::mpsc::sync_channel;
+        use rayon::prelude::*;
+
+        let (tx, rx) = sync_channel(32768);
+        
+        if let Some(atom) = pattern.as_ground_atom() {
+            let encoded: Vec<u8> = MORK_SPACE_ENCODE_BUF.with(|cell| {
+                let mut buf = cell.borrow_mut();
+                let inner = self.inner.read().unwrap();
+                match Self::encode_atom_direct(&atom, &*inner, &mut buf) {
+                    Ok(len) => buf[..len].to_vec(),
+                    Err(_) => vec![],
+                }
+            });
+            if !encoded.is_empty() {
+                let inner = self.inner.read().unwrap();
+                if inner.btm.get_val_at(&encoded).is_some() {
+                    let _ = tx.send(MatchResult { atom, bindings: vec![] });
+                }
+            }
+            return rx;
+        }
+
+        let prefix_bytes: Vec<u8> = MORK_SPACE_ENCODE_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            let inner = self.inner.read().unwrap();
+            match Self::encode_pattern_direct(pattern, &*inner, &mut buf) {
+                Ok(len) => {
+                    let e = mork_expr::Expr { ptr: buf.as_mut_ptr() };
+                    match e.prefix() {
+                        Ok(p) | Err(p) => unsafe { &*p }.to_vec(),
+                    }
+                }
+                Err(_) => vec![],
+            }
+        });
+
+        let map_clone = self.inner.read().unwrap().btm.clone();
+        let pattern = pattern.clone();
+
+        std::thread::spawn(move || {
+            let mut z = map_clone.read_zipper_at_path(&prefix_bytes);
+            let mut chunk: Vec<Vec<u8>> = Vec::with_capacity(32768);
+            let mut found_any = false;
+
+            while z.to_next_val() {
+                found_any = true;
+                chunk.push(z.origin_path().to_vec());
+                if chunk.len() >= 32768 {
+                    let current_chunk = std::mem::take(&mut chunk);
+                    let results: Vec<MatchResult> = current_chunk.into_par_iter().filter_map(|path| {
+                        decode_expr_bytes(&path).and_then(|stored| match_one(&pattern, &stored))
+                    }).collect();
+                    for r in results {
+                        if tx.send(r).is_err() { return; }
+                    }
+                }
+            }
+
+            if !found_any && !prefix_bytes.is_empty() {
+                let mut z = map_clone.read_zipper();
+                while z.to_next_val() {
+                    chunk.push(z.origin_path().to_vec());
+                    if chunk.len() >= 32768 {
+                        let current_chunk = std::mem::take(&mut chunk);
+                        let results: Vec<MatchResult> = current_chunk.into_par_iter().filter_map(|path| {
+                            decode_expr_bytes(&path).and_then(|stored| match_one(&pattern, &stored))
+                        }).collect();
+                        for r in results {
+                            if tx.send(r).is_err() { return; }
+                        }
+                    }
+                }
+            }
+
+            if !chunk.is_empty() {
+                let current_chunk = std::mem::take(&mut chunk);
+                let results: Vec<MatchResult> = current_chunk.into_par_iter().filter_map(|path| {
+                    decode_expr_bytes(&path).and_then(|stored| match_one(&pattern, &stored))
+                }).collect();
+                for r in results {
+                    let _ = tx.send(r);
+                }
+            }
+        });
+
+        rx
+    }
+
     fn encode_atom_direct(
         atom: &Atom,
         inner: &mork::space::Space<mork::weightedsweep::UnitHeader>,
@@ -494,7 +584,7 @@ fn unify(
             {
                 return **bound == pat_atom;
             }
-            stored_bindings.push((s.clone(), Arc::new(pat_atom)));
+            stored_bindings.push((s.as_str().into(), Arc::new(pat_atom)));
             return true;
         }
     }
