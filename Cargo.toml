@@ -8,6 +8,7 @@ debug = true
 [features]
 default = []
 trace = []
+profile = []
 python-bridge = ["dep:pyo3"]
 plugins = ["dep:libloading"]
 [dependencies]
