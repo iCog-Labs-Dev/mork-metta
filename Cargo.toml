@@ -22,3 +22,5 @@ rayon = "1"
 dashu = "0.4"
 rand = "0.8"
 rustc-hash = "2.1.2"
+memmap2 = "0.9.9"
+lasso = { version = "0.7.3", features = ["multi-threaded"] }
