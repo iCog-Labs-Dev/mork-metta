@@ -39,6 +39,28 @@ pub fn add_atom(funcs: &FnTable, space_ref: &Atom, atom: &Atom) -> Result<(), St
     Ok(())
 }
 
+/// Bulk-add pre-parsed atoms — single write-lock, single `bump_memo_stamp`.
+/// Only data atoms (no `=` definitions) should land here; definition caching
+/// is skipped since data forms never define functions.
+// ponytail: skip per-atom bump_memo_stamp — one stamp at end
+pub fn add_atoms_bulk(funcs: &FnTable, space_ref: &Atom, atoms: &[Atom]) -> Result<(), String> {
+    if atoms.is_empty() { return Ok(()); }
+    funcs.with_resolved_space(space_ref, |space| space.add_atoms_bulk(atoms))?;
+    funcs.bump_memo_stamp();
+    if matches!(space_ref, Atom::Sym(name) if name.as_ref() == "&self") {
+        for atom in atoms {
+            maybe_cache_definition_atom(atom, funcs);
+        }
+    }
+    // Also store bare head atoms for any definitions that slip through
+    for atom in atoms {
+        if let Some((head, _)) = definition_parts(atom) {
+            let _ = funcs.with_resolved_space(space_ref, |space| space.add_atom(head));
+        }
+    }
+    Ok(())
+}
+
 /// Remove an atom from a resolved space.
 /// For the default space (&self), also removes cached user function definitions
 /// and bare head shadow atoms.

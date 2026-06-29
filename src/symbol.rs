@@ -1,64 +1,42 @@
-use mork_interning::{SharedMapping, SharedMappingHandle};
-use std::sync::OnceLock;
-use rustc_hash::FxHashMap;
+use lasso::{ThreadedRodeo, Spur};
+use std::sync::LazyLock;
 
-static INTERNER: OnceLock<SharedMappingHandle> = OnceLock::new();
+static INTERNER: LazyLock<ThreadedRodeo> = LazyLock::new(|| ThreadedRodeo::new());
 
-pub fn interner() -> &'static SharedMappingHandle {
-    INTERNER.get_or_init(|| SharedMapping::new())
+#[derive(Clone, Copy)]
+pub struct Symbol(pub [u8; 8], pub &'static str);
+
+impl PartialEq for Symbol {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
 }
+impl Eq for Symbol {}
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Symbol(pub [u8; 8]);
-
-thread_local! {
-    static STR_TO_SYM: std::cell::RefCell<FxHashMap<&'static str, Symbol>> = std::cell::RefCell::new(FxHashMap::default());
-    static SYM_TO_STR: std::cell::RefCell<FxHashMap<Symbol, &'static str>> = std::cell::RefCell::new(FxHashMap::default());
+impl std::hash::Hash for Symbol {
+    #[inline(always)]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
 }
 
 impl Symbol {
     pub fn intern(s: &str) -> Self {
-        // We do a fast thread-local check first to avoid cross-thread or pathmap overhead
-        let fast_check = STR_TO_SYM.with(|cache| {
-            cache.borrow().get(s).copied()
-        });
-
-        if let Some(sym) = fast_check {
-            return sym;
-        }
-
-        // Fallback to mork-interning
-        let handle = interner();
-        let permit = handle.try_aquire_permission().unwrap_or_else(|_| panic!("failed to acquire"));
-        let sym = Symbol(permit.get_sym_or_insert(s.as_bytes()));
+        let spur = INTERNER.get_or_intern(s);
+        let s_static: &'static str = INTERNER.resolve(&spur);
         
-        // Now get the persistent string pointer from the slab
-        let bytes = handle.get_bytes(sym.0).unwrap();
-        let s_static: &'static str = unsafe { std::mem::transmute(std::str::from_utf8_unchecked(bytes)) };
+        let mut id = [0u8; 8];
+        let spur_val = spur.into_inner().get();
+        // Pack the 32-bit spur into the 8-byte array
+        id[0..4].copy_from_slice(&spur_val.to_ne_bytes());
         
-        STR_TO_SYM.with(|c| c.borrow_mut().insert(s_static, sym));
-        SYM_TO_STR.with(|c| c.borrow_mut().insert(sym, s_static));
-        
-        sym
+        Symbol(id, s_static)
     }
     
     #[inline(always)]
     pub fn as_str(&self) -> &'static str {
-        let fast_check = SYM_TO_STR.with(|cache| {
-            cache.borrow().get(self).copied()
-        });
-
-        if let Some(s) = fast_check {
-            return s;
-        }
-
-        let bytes = interner().get_bytes(self.0).unwrap();
-        let s_static: &'static str = unsafe { std::mem::transmute(std::str::from_utf8_unchecked(bytes)) };
-        
-        STR_TO_SYM.with(|c| c.borrow_mut().insert(s_static, *self));
-        SYM_TO_STR.with(|c| c.borrow_mut().insert(*self, s_static));
-        
-        s_static
+        self.1
     }
 }
 

@@ -75,6 +75,16 @@ pub trait Space: Send + Sync {
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult>;
     fn get_atoms(&self) -> Vec<Atom>;
     fn description(&self) -> &str;
+
+    /// Bulk insert: single write-lock + single memo stamp at call-site.
+    /// Default falls back to per-atom `add_atom`; MorkSpace overrides.
+    // ponytail: default impl so other Space impls don't break
+    fn add_atoms_bulk(&self, atoms: &[Atom]) -> Result<(), String> {
+        for a in atoms {
+            self.add_atom(a)?;
+        }
+        Ok(())
+    }
 }
 
 // Per-thread encode buffer. Avoids a shared lock during the encode phase so
@@ -95,7 +105,7 @@ pub struct MorkSpace {
     /// RwLock: ArenaCompactTree is now Sync (Cell moved to zipper), so concurrent
     /// reads are safe. Only add_atom/remove_atom take the write lock.
     inner: std::sync::RwLock<mork::space::Space<mork::weightedsweep::UnitHeader>>,
-    symbol_index: std::sync::RwLock<rustc_hash::FxHashMap<crate::symbol::Symbol, indexmap::IndexSet<Atom>>>,
+    symbol_index: std::sync::RwLock<rustc_hash::FxHashMap<crate::symbol::Symbol, rustc_hash::FxHashSet<Arc<[u8]>>>>,
 }
 
 impl MorkSpace {
@@ -153,12 +163,12 @@ impl MorkSpace {
             }
             
             if let Some(sym) = best_sym {
-                let candidates = index.get(&sym).unwrap().clone();
+                let candidates: Vec<Arc<[u8]>> = index.get(&sym).unwrap().iter().map(Arc::clone).collect();
                 drop(index); // release lock
                 let pattern = pattern.clone();
                 std::thread::spawn(move || {
-                    let results: Vec<MatchResult> = candidates.into_iter().filter_map(|stored| {
-                        match_one(&pattern, &stored)
+                    let results: Vec<MatchResult> = candidates.into_par_iter().filter_map(|path| {
+                        decode_expr_bytes(&path).and_then(|stored| match_one(&pattern, &stored))
                     }).collect();
                     for r in results {
                         if tx.send(r).is_err() { return; }
@@ -379,36 +389,79 @@ fn encode_pattern_inner(
 
 impl Space for MorkSpace {
     fn add_atom(&self, atom: &Atom) -> Result<(), String> {
-        let mut index = self.symbol_index.write().unwrap();
         let mut syms = rustc_hash::FxHashSet::default();
         crate::space::core::extract_all_symbols(atom, &mut syms);
-        for sym in syms {
-            index.entry(sym).or_default().insert(atom.clone());
-        }
-        MORK_SPACE_ENCODE_BUF.with(|cell| {
+
+        // Encode and insert in trie — capture the encoded bytes
+        let encoded = MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             let mut inner = self.inner.write().unwrap();
             let len = Self::encode_atom_direct(atom, &*inner, &mut buf)?;
             inner.btm.insert(&buf[..len], Default::default());
-            Ok(())
-        })
+            Ok::<Arc<[u8]>, String>(buf[..len].to_vec().into())
+        })?;
+
+        // Store encoded bytes in symbol index (no Atom::clone, no SipHash)
+        let mut index = self.symbol_index.write().unwrap();
+        for sym in syms {
+            index.entry(sym).or_default().insert(Arc::clone(&encoded));
+        }
+
+        Ok(())
+    }
+
+    fn add_atoms_bulk(&self, atoms: &[Atom]) -> Result<(), String> {
+        // ponytail: single write-lock for entire batch — no per-atom lock thrash
+        // Phase 1: encode + insert in trie, collect encoded paths
+        let encoded_all: Vec<Arc<[u8]>> = MORK_SPACE_ENCODE_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            let mut inner = self.inner.write().unwrap();
+            let mut paths = Vec::with_capacity(atoms.len());
+            for atom in atoms {
+                let len = Self::encode_atom_direct(atom, &*inner, &mut buf)?;
+                inner.btm.insert(&buf[..len], Default::default());
+                paths.push(buf[..len].to_vec().into());
+            }
+            Ok::<_, String>(paths)
+        })?;
+
+        // Phase 2: symbol index — single write lock, no Arc overhead
+        let mut index = self.symbol_index.write().unwrap();
+        for (atom, encoded) in atoms.iter().zip(encoded_all) {
+            let mut syms = rustc_hash::FxHashSet::default();
+            crate::space::core::extract_all_symbols(atom, &mut syms);
+            for sym in syms {
+                index.entry(sym).or_default().insert(Arc::clone(&encoded));
+            }
+        }
+
+        Ok(())
     }
 
     fn remove_atom(&self, atom: &Atom) -> Result<bool, String> {
-        let mut index = self.symbol_index.write().unwrap();
         let mut syms = rustc_hash::FxHashSet::default();
         crate::space::core::extract_all_symbols(atom, &mut syms);
-        for sym in syms {
-            if let Some(set) = index.get_mut(&sym) {
-                set.remove(atom);
-            }
-        }
-        MORK_SPACE_ENCODE_BUF.with(|cell| {
+
+        // Remove from trie — capture encoded path
+        let encoded = MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             let mut inner = self.inner.write().unwrap();
             let len = Self::encode_atom_direct(atom, &*inner, &mut buf)?;
-            Ok(inner.btm.remove(&buf[..len]).is_some())
-        })
+            let removed = inner.btm.remove(&buf[..len]).is_some();
+            Ok::<(Arc<[u8]>, bool), String>((buf[..len].to_vec().into(), removed))
+        })?;
+
+        let (encoded_path, removed) = encoded;
+
+        // Remove from symbol index by encoded path
+        let mut index = self.symbol_index.write().unwrap();
+        for sym in syms {
+            if let Some(set) = index.get_mut(&sym) {
+                set.remove(encoded_path.as_ref());
+            }
+        }
+
+        Ok(removed)
     }
 
     fn match_atoms(&self, pattern: &Pattern) -> Vec<MatchResult> {
@@ -451,10 +504,10 @@ impl Space for MorkSpace {
             }
             
             if let Some(sym) = best_sym {
-                let candidates = index.get(&sym).unwrap().clone();
-                drop(index); // release lock
-                return candidates.into_par_iter().filter_map(|stored| {
-                    match_one(pattern, &stored)
+                let candidates: Vec<Arc<[u8]>> = index.get(&sym).unwrap().iter().map(Arc::clone).collect();
+                drop(index);
+                return candidates.into_par_iter().filter_map(|path| {
+                    decode_expr_bytes(&path).and_then(|stored| match_one(pattern, &stored))
                 }).collect();
             }
         }

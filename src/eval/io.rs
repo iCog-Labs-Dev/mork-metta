@@ -3,11 +3,12 @@
 /// Provides file loading (streaming form-by-form), import resolution,
 /// printing, line reading, and Import-RS plugin loading.
 ///
-/// # Streaming parser
+/// # Fast bulk loader
 ///
-/// `load_metta_file` uses a streaming form-by-form parser — only one
-/// balanced expression is held in memory at a time, so billion-line
-/// data files are safe.
+/// `load_metta_file` memory-maps the file (zero heap copy, OS pages on demand)
+/// then splits it into rayon chunks for parallel parse. Pure data forms are
+/// batch-inserted with one write-lock and one `bump_memo_stamp` at the end.
+/// Definition / runnable forms still use the sequential slow path.
 use crate::atom::Atom;
 use crate::env::Env;
 use crate::eval::machine::budget::{plain, ResultSet};
@@ -17,6 +18,7 @@ use crate::parser::{Expr, TopForm, parse_forms};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use rayon::prelude::*;
 
 /// Evaluate `(import! space path)` — load a MeTTa file into the space.
 ///
@@ -166,123 +168,154 @@ pub(crate) fn resolve_import_path(path_str: &str, import_dir: &Path) -> Option<P
     None
 }
 
-/// Load a `.metta` file: read entire file at once, scan bytes for form
-/// boundaries, slice out each form and dispatch — no per-line allocation.
+/// Load a `.metta` file using memory-mapped I/O for 50GB+ scale.
 ///
-/// Fast path: non-`=` data facts bypass `Expr` entirely — parsed directly to
-/// `Atom` via `parse_atom_bytes` and inserted with no intermediate allocation.
-/// Slow path: runnables and `(= ...)` definitions still use `process_form` →
-/// `Expr` → `compile_definition` so the fn_cache is populated correctly.
+/// # Fast path (pure data files)
+/// Uses `memmap2` — zero heap copy, the OS pages in only what's accessed.
+/// Scans byte offsets of all top-level forms, then parses them in parallel
+/// with rayon. All parsed `Atom`s are bulk-inserted with a single write-lock
+/// and a single `bump_memo_stamp` at the end.
+///
+/// # Slow path (definitions / runnables)
+/// Any form starting with `=` or prefixed `!` falls through to the sequential
+/// `process_form` path so the fn_cache is populated correctly.
 pub fn load_metta_file(path: &Path, space_ref: &Atom, env: &Env, funcs: &FnTable) -> Result<Vec<Atom>, String> {
-    let content = std::fs::read_to_string(path)
+    let file = std::fs::File::open(path)
         .map_err(|e| format!("cannot open '{}': {}", path.display(), e))?;
-    let bytes = content.as_bytes();
+
+    // ponytail: mmap — OS pages on demand, no 50GB heap copy
+    // SAFETY: the mmap lives for the duration of this function; we don't mutate it.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| format!("mmap '{}': {}", path.display(), e))?;
+    let bytes: &[u8] = &mmap;
     let n = bytes.len();
-    let mut pos = 0;
+
+    // ── Pass 1: scan form boundaries (sequential, byte-scan only) ───────────
+    // Collect (start, end, is_bang, start_line) for every top-level form.
+    struct FormSpan { start: usize, end: usize, is_bang: bool, start_line: usize }
+    let mut spans: Vec<FormSpan> = Vec::new();
+    let mut pos = 0usize;
     let mut line_no = 1usize;
-    let mut results: Vec<Atom> = Vec::new();
 
     while pos < n {
         skip_file_ws(bytes, &mut pos, &mut line_no);
-        if pos >= n {
-            break;
-        }
+        if pos >= n { break; }
 
         let saw_bang = bytes[pos] == b'!';
         if saw_bang {
             pos += 1;
             skip_file_ws(bytes, &mut pos, &mut line_no);
         }
-        if pos >= n {
-            break;
-        }
+        if pos >= n { break; }
 
         if bytes[pos] != b'(' {
             return Err(format!(
                 "expected '(' in '{}' at line {}, found '{}'",
-                path.display(),
-                line_no,
-                bytes[pos] as char
+                path.display(), line_no, bytes[pos] as char
             ));
         }
 
         let start_line = line_no;
+        let form_start = pos;
+        let mut depth: i32 = 0;
 
-        if !saw_bang && is_data_form(bytes, pos) {
-            // Fast path: parse directly to Atom, skip Expr entirely.
-            // Safe for non-'=' forms — compile_definition is a no-op for these.
-            let atom = crate::parser::parse_atom_bytes(&content, &mut pos, &mut line_no)
-                .map_err(|e| format!("{} (in '{}' near line {})", e, path.display(), start_line))?;
-            crate::space::mutate::add_atom(funcs, space_ref, &atom)
-                .map_err(|e| {
-                    format!("add_atom: {} (in '{}' near line {})", e, path.display(), start_line)
-                })?;
-        } else {
-            // Slow path: runnables and `(= ...)` definitions need Expr for eval/compile.
-            let form_start = pos;
-            let mut depth: i32 = 0;
-            while pos < n {
-                match bytes[pos] {
-                    b'\n' => {
-                        line_no += 1;
-                        pos += 1;
-                    }
-                    b';' => {
-                        while pos < n && bytes[pos] != b'\n' {
-                            pos += 1;
+        while pos < n {
+            match bytes[pos] {
+                b'\n' => { line_no += 1; pos += 1; }
+                b';'  => { while pos < n && bytes[pos] != b'\n' { pos += 1; } }
+                b'"'  => {
+                    pos += 1;
+                    while pos < n {
+                        match bytes[pos] {
+                            b'\\' => pos += 2,
+                            b'"'  => { pos += 1; break; }
+                            b'\n' => { line_no += 1; pos += 1; }
+                            _     => pos += 1,
                         }
                     }
-                    b'"' => {
-                        pos += 1;
-                        while pos < n {
-                            match bytes[pos] {
-                                b'\\' => pos += 2,
-                                b'"' => {
-                                    pos += 1;
-                                    break;
-                                }
-                                b'\n' => {
-                                    line_no += 1;
-                                    pos += 1;
-                                }
-                                _ => pos += 1,
-                            }
-                        }
-                    }
-                    b'(' => {
-                        depth += 1;
-                        pos += 1;
-                    }
-                    b')' => {
-                        depth -= 1;
-                        pos += 1;
-                        if depth == 0 {
-                            break;
-                        }
-                        if depth < 0 {
-                            return Err(format!(
-                                "unmatched ')' in '{}' at line {}",
-                                path.display(),
-                                line_no
-                            ));
-                        }
-                    }
-                    _ => pos += 1,
                 }
+                b'(' => { depth += 1; pos += 1; }
+                b')' => {
+                    depth -= 1; pos += 1;
+                    if depth == 0 { break; }
+                    if depth < 0 {
+                        return Err(format!("unmatched ')' in '{}' at line {}", path.display(), line_no));
+                    }
+                }
+                _ => pos += 1,
             }
-            if depth != 0 {
-                return Err(format!(
-                    "unclosed '(' in '{}' at line {}",
-                    path.display(),
-                    start_line
-                ));
+        }
+        if depth != 0 {
+            return Err(format!("unclosed '(' in '{}' at line {}", path.display(), start_line));
+        }
+        spans.push(FormSpan { start: form_start, end: pos, is_bang: saw_bang, start_line });
+    }
+
+    // ── Pass 2: split into data-only vs slow forms ──────────────────────────
+    // Data forms (no `=`, no `!`) are parsed in parallel; others sequential.
+    let mut slow_indices: Vec<usize> = Vec::new();
+    let mut data_indices: Vec<usize> = Vec::new();
+    for (i, s) in spans.iter().enumerate() {
+        if !s.is_bang && is_data_form(bytes, s.start) {
+            data_indices.push(i);
+        } else {
+            slow_indices.push(i);
+        }
+    }
+
+    // ── Pass 3: parallel parse of data forms ────────────────────────────────
+    // Each rayon thread gets its own slice; all produce Atoms independently.
+    // We need the bytes as a shared ref across threads — mmap is read-only.
+    // SAFETY: bytes is a shared read-only slice from the mmap; no writes occur.
+    let bytes_ptr = bytes.as_ptr() as usize; // send pointer across rayon boundary
+    let bytes_len = bytes.len();
+
+    let data_atoms: Vec<Result<Atom, (usize, String)>> = data_indices
+        .par_iter()
+        .map(|&i| {
+            let s = &spans[i];
+            // Reconstruct the slice per-thread.
+            // SAFETY: read-only, mmap lives for function scope, rayon scope is nested.
+            let bytes_slice = unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
+            let snippet = std::str::from_utf8(&bytes_slice[s.start..s.end])
+                .map_err(|e| (s.start_line, e.to_string()))?;
+            let mut local_pos = 0usize;
+            let mut local_line = s.start_line;
+            crate::parser::parse_atom_bytes(snippet, &mut local_pos, &mut local_line)
+                .map_err(|e| (s.start_line, e))
+        })
+        .collect();
+
+    // Collect results, propagate errors
+    let mut bulk_atoms: Vec<Atom> = Vec::with_capacity(data_atoms.len());
+    for r in data_atoms {
+        match r {
+            Ok(atom) => bulk_atoms.push(atom),
+            Err((line, msg)) => {
+                return Err(format!("{} (in '{}' near line {})", msg, path.display(), line));
             }
-            let form_str = &content[form_start..pos];
-            if let Some(result) = process_form(form_str, saw_bang, space_ref, env, funcs)
-                .map_err(|e| format!("{} (in '{}' near line {})", e, path.display(), start_line))?
-            {
-                results.push(result);
-            }
+        }
+    }
+
+    // ── Pass 4: bulk insert data atoms (single lock + single memo bump) ──────
+    if !bulk_atoms.is_empty() {
+        crate::space::mutate::add_atoms_bulk(funcs, space_ref, &bulk_atoms)?;
+    }
+
+    // ── Pass 5: sequential slow path for defs / runnables ───────────────────
+    let mut results: Vec<Atom> = Vec::new();
+    // Re-parse content as str for slow path (these are rare: only `=` / `!` forms).
+    // We re-borrow from mmap — still no copy.
+    let content = std::str::from_utf8(bytes)
+        .map_err(|e| format!("UTF-8 error in '{}': {}", path.display(), e))?;
+
+    for i in slow_indices {
+        let s = &spans[i];
+        let form_str = &content[s.start..s.end];
+        if let Some(result) = process_form(form_str, s.is_bang, space_ref, env, funcs)
+            .map_err(|e| format!("{} (in '{}' near line {})", e, path.display(), s.start_line))?
+        {
+            results.push(result);
         }
     }
 

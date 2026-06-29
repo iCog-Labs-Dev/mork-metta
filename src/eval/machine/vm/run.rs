@@ -1145,6 +1145,9 @@ fn run_vm_inner(
                 state.ip += 1;
             }
             Opcode::Forall => {
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("Forall"))
+                } else { None };
                 // Forall pops check-expr and generator, then verifies truthiness for all values
                 let check_rs = state.stack.pop().ok_or("VM stack underflow on Forall check")?;
                 let gen_rs = state.stack.pop().ok_or("VM stack underflow on Forall generator")?;
@@ -1160,29 +1163,29 @@ fn run_vm_inner(
                     _ => return Err("forall: check must be a function symbol or closure".to_string()),
                 };
 
-                let mut is_forall_true = true;
-                for val in gen_values {
+                let is_forall_true = gen_values.into_par_iter().all(|val| {
+                    let mut local_budget = state.budget;
                     let mut call_env = crate::eval::shared::env::bind(&base_env, "$__fv", val);
                     if let Atom::Closure(_) = &check_atom {
                         let check_env = crate::eval::shared::env::bind(&base_env, "$__check_fn", check_atom.clone());
                         call_env = crate::eval::shared::pattern::prepend_env(check_env, &call_env);
                     }
-                    let res = eval_call_vm(
+                    if let Ok(res) = eval_call_vm(
                         check_head.clone(),
                         vec![Expr::Symbol("$__fv".to_string())],
                         &call_env,
                         funcs,
-                        &mut state.budget,
+                        &mut local_budget,
                         &state.free_vars_map,
                         &state.free_vars_bindings,
-                    )?;
-                    // substitute env
-                    let results: Vec<Atom> = res.into_iter().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)).collect();
-                    if results.is_empty() || !results.iter().all(|a| crate::eval::forms::control::is_truthy(a)) {
-                        is_forall_true = false;
-                        break;
+                    ) {
+                        let results: Vec<Atom> = res.into_iter().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)).collect();
+                        !results.is_empty() && results.iter().all(|a| crate::eval::forms::control::is_truthy(a))
+                    } else {
+                        false
                     }
-                }
+                });
+                
                 let final_atom = if is_forall_true { Atom::sym("true") } else { Atom::sym("false") };
                 state.stack.push(plain(vec![final_atom]));
                 state.ip += 1;
@@ -1299,50 +1302,32 @@ fn run_vm_inner(
                 body_code,
                 free_vars_map,
             } => {
-                // MapAtomLambda: resumable loop, one yield per element.
-                struct MapAtomLambdaResume {
-                    items: Vec<Atom>,
-                    next_item_idx: usize,
-                    mapped_results: Vec<Atom>,
-                }
-                let mut resume = match state.resume_data.take().and_then(|r| r.downcast::<MapAtomLambdaResume>().ok()) {
-                    Some(r) => {
-                        let mut r = *r;
-                        if let Some((sub_res, sub_exit)) = state.last_sub_result.take() {
-                            if let Some((val, env)) = sub_res.into_iter().next() {
-                                r.mapped_results.push(crate::eval::shared::subst::subst_atom(&val, &env));
-                            }
-                            match sub_exit {
-                                VmExit::Cut => { state.cut_executed = true; }
-                                VmExit::TailCall(locs) => return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(r.mapped_results))]), state.budget, VmExit::TailCall(locs))),
-                                VmExit::Normal => {}
-                                VmExit::YieldCall { .. } => unreachable!(),
-                            }
-                        }
-                        r
-                    }
-                    None => {
-                        let list_rs = state.stack.pop().ok_or("VM stack underflow on MapAtomLambda")?;
-                        let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
-                            Some(Atom::Expr(v)) => v.to_vec(),
-                            Some(other) => vec![other],
-                            None => return Err("map-atom: list arg produced no result".to_string()),
-                        };
-                        let cap = items.len();
-                        MapAtomLambdaResume { items, next_item_idx: 0, mapped_results: Vec::with_capacity(cap) }
-                    }
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("MapAtomLambda"))
+                } else { None };
+                
+                let list_rs = state.stack.pop().ok_or("VM stack underflow on MapAtomLambda")?;
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
+                    Some(Atom::Expr(v)) => v.to_vec(),
+                    Some(other) => vec![other],
+                    None => return Err("map-atom: list arg produced no result".to_string()),
                 };
-                while resume.next_item_idx < resume.items.len() && !state.cut_executed {
-                    let elem = resume.items[resume.next_item_idx].clone();
-                    resume.next_item_idx += 1;
+                
+                let mapped: Result<Vec<Atom>, String> = items.into_par_iter().map(|elem| {
                     let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
                     sub_state.locals = state.locals.clone();
                     sub_state.locals.push((elem.clone(), Env::new()));
                     let sub_env = base_env.extend(&var_name, elem);
-                    state.resume_data = Some(Box::new(resume));
-                    yield_vm!(state, sub_state, sub_env);
-                }
-                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(resume.mapped_results))]));
+                    let (res, _, _) = super::run_vm(sub_state, funcs, &sub_env)?;
+                    let first = res.into_iter().next();
+                    if let Some((val, e)) = first {
+                        Ok(crate::eval::shared::subst::subst_atom(&val, &e))
+                    } else {
+                        Ok(Atom::sym("()"))
+                    }
+                }).collect();
+                
+                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(mapped?))]));
                 state.ip += 1;
             }
             Opcode::FilterAtomLambda {
@@ -1350,52 +1335,33 @@ fn run_vm_inner(
                 body_code,
                 free_vars_map,
             } => {
-                // FilterAtomLambda: resumable loop.
-                struct FilterAtomLambdaResume {
-                    items: Vec<Atom>,
-                    next_item_idx: usize,
-                    filtered_results: Vec<Atom>,
-                }
-                let mut resume = match state.resume_data.take().and_then(|r| r.downcast::<FilterAtomLambdaResume>().ok()) {
-                    Some(r) => {
-                        let mut r = *r;
-                        if let Some((sub_res, sub_exit)) = state.last_sub_result.take() {
-                            let is_true = sub_res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env).is_truthy()).unwrap_or(false);
-                            if is_true {
-                                // item at previous index passed the filter
-                                r.filtered_results.push(r.items[r.next_item_idx - 1].clone());
-                            }
-                            match sub_exit {
-                                VmExit::Cut => { state.cut_executed = true; }
-                                VmExit::TailCall(locs) => return Ok((plain(vec![Atom::Expr(crate::atom::expr_data(r.filtered_results))]), state.budget, VmExit::TailCall(locs))),
-                                VmExit::Normal => {}
-                                VmExit::YieldCall { .. } => unreachable!(),
-                            }
-                        }
-                        r
-                    }
-                    None => {
-                        let list_rs = state.stack.pop().ok_or("VM stack underflow on FilterAtomLambda")?;
-                        let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
-                            Some(Atom::Expr(v)) => v.to_vec(),
-                            Some(other) => vec![other],
-                            None => return Err("filter-atom: list arg produced no result".to_string()),
-                        };
-                        let cap = items.len();
-                        FilterAtomLambdaResume { items, next_item_idx: 0, filtered_results: Vec::with_capacity(cap) }
-                    }
+                let _profile = if cfg!(feature = "profile") {
+                    Some(crate::profile::ProfileGuard::new_owned("FilterAtomLambda"))
+                } else { None };
+                
+                let list_rs = state.stack.pop().ok_or("VM stack underflow on FilterAtomLambda")?;
+                let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
+                    Some(Atom::Expr(v)) => v.to_vec(),
+                    Some(other) => vec![other],
+                    None => return Err("filter-atom: list arg produced no result".to_string()),
                 };
-                while resume.next_item_idx < resume.items.len() && !state.cut_executed {
-                    let elem = resume.items[resume.next_item_idx].clone();
-                    resume.next_item_idx += 1;
+                
+                let mapped: Result<Vec<Option<Atom>>, String> = items.into_par_iter().map(|elem| {
                     let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
                     sub_state.locals = state.locals.clone();
                     sub_state.locals.push((elem.clone(), Env::new()));
-                    let sub_env = base_env.extend(&var_name, elem);
-                    state.resume_data = Some(Box::new(resume));
-                    yield_vm!(state, sub_state, sub_env);
-                }
-                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(resume.filtered_results))]));
+                    let sub_env = base_env.extend(&var_name, elem.clone());
+                    let (res, _, _) = super::run_vm(sub_state, funcs, &sub_env)?;
+                    let is_true = res.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env).is_truthy()).unwrap_or(false);
+                    if is_true {
+                        Ok(Some(elem))
+                    } else {
+                        Ok(None)
+                    }
+                }).collect();
+                
+                let filtered: Vec<Atom> = mapped?.into_iter().flatten().collect();
+                state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(filtered))]));
                 state.ip += 1;
             }
             Opcode::Once { body_code, free_vars_map } => {
@@ -2931,8 +2897,7 @@ fn run_next_call_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
         }
     };
 
-    let n_workers = rayon::current_num_threads();
-    let should_parallel = all_pure && pending_len >= n_workers * 4;
+    let should_parallel = all_pure && pending_len > 1;
 
     if should_parallel {
         // --- Parallel drain: run ALL remaining pure calls at once ---
@@ -2980,6 +2945,14 @@ fn run_next_call_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
             out
         };
         state.budget = budget_ref;
+
+        // Save parent's locals before popping the frame — mirrors what the serial
+        // path does at line 2999 (frame.saved_locals = parent_locals). Without this,
+        // frame.saved_locals stays Vec::new() and restoring it wipes the parent locals.
+        if let Some(frame) = state.frames.last_mut() {
+            let parent_locals = std::mem::take(&mut state.locals);
+            frame.saved_locals = parent_locals;
+        }
 
         // Push results and fall through to the normal "frame done" path
         let frame = state.frames.pop().unwrap();
