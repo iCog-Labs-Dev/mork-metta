@@ -27,6 +27,9 @@ pub fn prepend_chain(prefix: Env, base: &Env) -> Env {
     } else if base.is_empty_env() {
         prefix
     } else {
-        Env(Arc::new(EnvNode::Link { prefix, base: base.clone() }))
+        Env(Arc::new(EnvNode::Link {
+            prefix,
+            base: base.clone(),
+        }))
     }
 }

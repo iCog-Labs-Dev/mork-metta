@@ -1,10 +1,11 @@
 //! Builtins for structural and declaration-backed type inspection.
 
-use crate::atom::Atom;
+use crate::atom::{Atom, expr_data};
+use crate::builtins::arithmetic::expect_n_args;
 use crate::func::{FnTable, NDet};
 
 fn expect(args: &[Atom], n: usize, name: &str) -> Result<(), String> {
-    crate::builtins::arithmetic::expect_n_args(args, n, name)
+    expect_n_args(args, n, name)
 }
 
 fn bool_atom(value: bool) -> Atom {
@@ -28,7 +29,11 @@ fn direct_type_decl(subject: &Atom, table: &FnTable) -> Result<Option<Atom>, Str
     Ok(None)
 }
 
-fn function_type_decl(head: &Atom, arity: usize, table: &FnTable) -> Result<Vec<Vec<Atom>>, String> {
+fn function_type_decl(
+    head: &Atom,
+    arity: usize,
+    table: &FnTable,
+) -> Result<Vec<Vec<Atom>>, String> {
     let self_ref = Atom::sym("&self");
     let atoms = table.with_resolved_space(&self_ref, |space| Ok(space.get_atoms()))?;
     let mut out = Vec::new();
@@ -53,7 +58,9 @@ fn function_type_decl(head: &Atom, arity: usize, table: &FnTable) -> Result<Vec<
 fn infer_type(atom: &Atom, table: &FnTable) -> Result<Atom, String> {
     match atom {
         Atom::Num(_) => return Ok(Atom::sym("Number")),
-        Atom::Sym(s) if s.as_ref() == "true" || s.as_ref() == "false" => return Ok(Atom::sym("Bool")),
+        Atom::Sym(s) if s.as_ref() == "true" || s.as_ref() == "false" => {
+            return Ok(Atom::sym("Bool"));
+        }
         Atom::Expr(items) if !items.is_empty() => {
             if let Some(decl) = direct_type_decl(atom, table)? {
                 return Ok(decl);
@@ -73,19 +80,13 @@ fn infer_type(atom: &Atom, table: &FnTable) -> Result<Atom, String> {
                     return Ok(result_ty[0].clone());
                 }
             }
-            Ok(Atom::Expr(crate::atom::expr_data([
-                Atom::sym("get-type"),
-                atom.clone(),
-            ])))
+            Ok(Atom::Expr(expr_data([Atom::sym("get-type"), atom.clone()])))
         }
         _ => {
             if let Some(decl) = direct_type_decl(atom, table)? {
                 Ok(decl)
             } else {
-                Ok(Atom::Expr(crate::atom::expr_data([
-                    Atom::sym("get-type"),
-                    atom.clone(),
-                ])))
+                Ok(Atom::Expr(expr_data([Atom::sym("get-type"), atom.clone()])))
             }
         }
     }

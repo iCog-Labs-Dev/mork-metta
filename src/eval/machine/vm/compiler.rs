@@ -1,25 +1,23 @@
-use crate::atom::Atom;
-use crate::parser::Expr;
-use super::op::{Opcode, CaseBranch, QuoteVarSource, QuoteVarMatch};
+use super::op::{CaseBranch, Opcode, QuoteVarMatch, QuoteVarSource};
+use crate::atom::{Atom, expr_data};
+use crate::eval::forms::query::lookup_user_clauses;
+use crate::parser::{Expr, expr_to_atom};
 
-use std::cell::Cell;
-use std::cell::RefCell;
-
+use crate::func::FnTable;
+use std::cell::{Cell, RefCell};
 thread_local! {
-    pub static CURRENT_FN_TABLE: RefCell<Option<*const crate::func::FnTable>> = const { RefCell::new(None) };
+    pub static CURRENT_FN_TABLE: RefCell<Option<*const FnTable>> = const { RefCell::new(None) };
     pub static IN_USER_ARG: Cell<bool> = const { Cell::new(false) };
 }
 
-pub fn set_current_funcs(funcs: &crate::func::FnTable) {
+pub fn set_current_funcs(funcs: &FnTable) {
     CURRENT_FN_TABLE.with(|cell| {
-        *cell.borrow_mut() = Some(funcs as *const crate::func::FnTable);
+        *cell.borrow_mut() = Some(funcs as *const FnTable);
     });
 }
 
-pub fn current_funcs() -> Option<&'static crate::func::FnTable> {
-    CURRENT_FN_TABLE.with(|cell| {
-        cell.borrow().map(|ptr| unsafe { &*ptr })
-    })
+pub fn current_funcs() -> Option<&'static FnTable> {
+    CURRENT_FN_TABLE.with(|cell| cell.borrow().map(|ptr| unsafe { &*ptr }))
 }
 
 pub struct VMCompiler {
@@ -44,7 +42,12 @@ impl VMCompiler {
         }
     }
 
-    pub fn compile(&mut self, expr: &Expr, code: &mut Vec<Opcode>, is_tail: bool) -> Result<(), String> {
+    pub fn compile(
+        &mut self,
+        expr: &Expr,
+        code: &mut Vec<Opcode>,
+        is_tail: bool,
+    ) -> Result<(), String> {
         match expr {
             Expr::Symbol(s) => {
                 if s.starts_with('$') {
@@ -71,7 +74,7 @@ impl VMCompiler {
             }
             Expr::List(items) => {
                 if items.is_empty() {
-                    code.push(Opcode::Const(Atom::Expr(crate::atom::expr_data([]))));
+                    code.push(Opcode::Const(Atom::Expr(expr_data([]))));
                     return Ok(());
                 }
 
@@ -82,24 +85,36 @@ impl VMCompiler {
                             if in_user_arg {
                                 let mut vars = Vec::new();
                                 let mut path = vec![1];
-                                collect_quote_vars(&items[1], &mut path, &self.locals, &mut self.free_vars, &mut vars);
+                                collect_quote_vars(
+                                    &items[1],
+                                    &mut path,
+                                    &self.locals,
+                                    &mut self.free_vars,
+                                    &mut vars,
+                                );
                                 if vars.is_empty() {
-                                    let atom = crate::parser::expr_to_atom(expr);
+                                    let atom = expr_to_atom(expr);
                                     code.push(Opcode::Const(atom));
                                 } else {
-                                    let template = crate::parser::expr_to_atom(expr);
+                                    let template = expr_to_atom(expr);
                                     code.push(Opcode::ConstQuote { template, vars });
                                 }
                             } else {
                                 // strip the outer quote wrapper during compilation in normal contexts so it evaluates to the inner expression as a constant/ConstQuote
                                 let mut vars = Vec::new();
                                 let mut path = Vec::new();
-                                collect_quote_vars(&items[1], &mut path, &self.locals, &mut self.free_vars, &mut vars);
+                                collect_quote_vars(
+                                    &items[1],
+                                    &mut path,
+                                    &self.locals,
+                                    &mut self.free_vars,
+                                    &mut vars,
+                                );
                                 if vars.is_empty() {
-                                    let atom = crate::parser::expr_to_atom(&items[1]);
+                                    let atom = expr_to_atom(&items[1]);
                                     code.push(Opcode::Const(atom));
                                 } else {
-                                    let template = crate::parser::expr_to_atom(&items[1]);
+                                    let template = expr_to_atom(&items[1]);
                                     code.push(Opcode::ConstQuote { template, vars });
                                 }
                             }
@@ -134,7 +149,7 @@ impl VMCompiler {
                         }
                         "if" if items.len() == 3 || items.len() == 4 => {
                             self.compile(&items[1], code, false)?; // Compile condition
-                            
+
                             let mut then_comp = VMCompiler {
                                 locals: self.locals.clone(),
                                 free_vars: self.free_vars.clone(),
@@ -143,7 +158,7 @@ impl VMCompiler {
                             };
                             let mut then_code = Vec::new();
                             then_comp.compile(&items[2], &mut then_code, is_tail)?;
-                            
+
                             let mut else_comp = VMCompiler {
                                 locals: self.locals.clone(),
                                 free_vars: self.free_vars.clone(),
@@ -154,17 +169,21 @@ impl VMCompiler {
                             if items.len() == 4 {
                                 else_comp.compile(&items[3], &mut else_code, is_tail)?;
                             }
-                            
+
                             // Combine free vars
                             let mut union_free_vars = self.free_vars.clone();
                             for v in &then_comp.free_vars {
-                                if !union_free_vars.contains(v) { union_free_vars.push(v.clone()); }
+                                if !union_free_vars.contains(v) {
+                                    union_free_vars.push(v.clone());
+                                }
                             }
                             for v in &else_comp.free_vars {
-                                if !union_free_vars.contains(v) { union_free_vars.push(v.clone()); }
+                                if !union_free_vars.contains(v) {
+                                    union_free_vars.push(v.clone());
+                                }
                             }
                             self.free_vars = union_free_vars.clone();
-                            
+
                             code.push(Opcode::If {
                                 then_code: std::sync::Arc::from(then_code),
                                 else_code: std::sync::Arc::from(else_code),
@@ -173,7 +192,11 @@ impl VMCompiler {
                             return Ok(());
                         }
                         // desugar and/or to if only when both arguments are expressions (lists) to allow logic variable unification on simple symbols
-                        "and" if items.len() == 3 && matches!(&items[1], Expr::List(_)) && matches!(&items[2], Expr::List(_)) => {
+                        "and"
+                            if items.len() == 3
+                                && matches!(&items[1], Expr::List(_))
+                                && matches!(&items[2], Expr::List(_)) =>
+                        {
                             let desugared = Expr::List(std::sync::Arc::from([
                                 Expr::Symbol("if".to_string()),
                                 items[1].clone(),
@@ -183,7 +206,10 @@ impl VMCompiler {
                             self.compile(&desugared, code, is_tail)?;
                             return Ok(());
                         }
-                        "or" if items.len() == 3 && matches!(&items[1], Expr::List(_)) && matches!(&items[2], Expr::List(_)) => {
+                        "or" if items.len() == 3
+                            && matches!(&items[1], Expr::List(_))
+                            && matches!(&items[2], Expr::List(_)) =>
+                        {
                             let desugared = Expr::List(std::sync::Arc::from([
                                 Expr::Symbol("if".to_string()),
                                 items[1].clone(),
@@ -198,35 +224,37 @@ impl VMCompiler {
                                 return Err("case clauses must be a list".into());
                             };
                             self.compile(&items[1], code, false)?;
-                            
+
                             let mut compiled_branches = Vec::new();
                             let mut union_free_vars = self.free_vars.clone();
                             for clause in clauses.iter() {
                                 let (pattern, body) = match clause {
-                                    Expr::List(clause_items) if clause_items.len() == 2 => (&clause_items[0], &clause_items[1]),
+                                    Expr::List(clause_items) if clause_items.len() == 2 => {
+                                        (&clause_items[0], &clause_items[1])
+                                    }
                                     _ => return Err("case clause must be a list of 2 items".into()),
                                 };
-                                
+
                                 let mut body_comp = VMCompiler {
                                     locals: self.locals.clone(),
                                     free_vars: union_free_vars.clone(),
                                     fn_name: self.fn_name.clone(),
                                     arity: self.arity,
                                 };
-                                
+
                                 let mut pattern_vars = Vec::new();
                                 collect_pattern_vars(pattern, &mut pattern_vars);
                                 body_comp.locals.extend(pattern_vars.clone());
-                                
+
                                 let mut branch_code = Vec::new();
                                 body_comp.compile(body, &mut branch_code, is_tail)?;
-                                
+
                                 for v in &body_comp.free_vars {
                                     if !union_free_vars.contains(v) {
                                         union_free_vars.push(v.clone());
                                     }
                                 }
-                                
+
                                 compiled_branches.push(CaseBranch {
                                     pattern: pattern.clone(),
                                     body_code: std::sync::Arc::from(branch_code),
@@ -235,7 +263,7 @@ impl VMCompiler {
                                 });
                             }
                             self.free_vars = union_free_vars;
-                            
+
                             code.push(Opcode::Case {
                                 branches: compiled_branches,
                                 local_names: self.locals.clone(),
@@ -244,7 +272,7 @@ impl VMCompiler {
                         }
                         "match" if items.len() == 4 => {
                             self.compile(&items[1], code, false)?;
-                            
+
                             let mut body_comp = VMCompiler {
                                 locals: self.locals.clone(),
                                 free_vars: self.free_vars.clone(),
@@ -254,10 +282,10 @@ impl VMCompiler {
                             let mut pattern_vars = Vec::new();
                             collect_pattern_vars(&items[2], &mut pattern_vars);
                             body_comp.locals.extend(pattern_vars.clone());
-                            
+
                             let mut body_code = Vec::new();
                             body_comp.compile(&items[3], &mut body_code, is_tail)?;
-                            
+
                             code.push(Opcode::Match {
                                 pattern: items[2].clone(),
                                 body_code: std::sync::Arc::from(body_code),
@@ -457,11 +485,23 @@ impl VMCompiler {
                         // For any other special keyword/construct (e.g. once, etc.), fallback to EvalCEK
                         "once" if items.len() == 2 => {
                             // run body, keep first result only
-                            let mut body_comp = VMCompiler { locals: self.locals.clone(), free_vars: self.free_vars.clone(), fn_name: self.fn_name.clone(), arity: self.arity };
+                            let mut body_comp = VMCompiler {
+                                locals: self.locals.clone(),
+                                free_vars: self.free_vars.clone(),
+                                fn_name: self.fn_name.clone(),
+                                arity: self.arity,
+                            };
                             let mut body_code = Vec::new();
                             body_comp.compile(&items[1], &mut body_code, false)?;
-                            for v in &body_comp.free_vars { if !self.free_vars.contains(v) { self.free_vars.push(v.clone()); } }
-                            code.push(Opcode::Once { body_code: std::sync::Arc::from(body_code), free_vars_map: std::sync::Arc::from(body_comp.free_vars) });
+                            for v in &body_comp.free_vars {
+                                if !self.free_vars.contains(v) {
+                                    self.free_vars.push(v.clone());
+                                }
+                            }
+                            code.push(Opcode::Once {
+                                body_code: std::sync::Arc::from(body_code),
+                                free_vars_map: std::sync::Arc::from(body_comp.free_vars),
+                            });
                             return Ok(());
                         }
                         "progn" if items.len() >= 2 => {
@@ -471,14 +511,30 @@ impl VMCompiler {
                             let len = items.len() - 1;
                             for (idx, item) in items[1..].iter().enumerate() {
                                 let last_item = idx + 1 == len;
-                                let mut bc = VMCompiler { locals: self.locals.clone(), free_vars: fvs.clone(), fn_name: self.fn_name.clone(), arity: self.arity };
+                                let mut bc = VMCompiler {
+                                    locals: self.locals.clone(),
+                                    free_vars: fvs.clone(),
+                                    fn_name: self.fn_name.clone(),
+                                    arity: self.arity,
+                                };
                                 let mut bcode = Vec::new();
-                                bc.compile(item, &mut bcode, if last_item { is_tail } else { false })?;
-                                for v in &bc.free_vars { if !fvs.contains(v) { fvs.push(v.clone()); } }
+                                bc.compile(
+                                    item,
+                                    &mut bcode,
+                                    if last_item { is_tail } else { false },
+                                )?;
+                                for v in &bc.free_vars {
+                                    if !fvs.contains(v) {
+                                        fvs.push(v.clone());
+                                    }
+                                }
                                 bodies.push(bcode);
                             }
                             self.free_vars = fvs.clone();
-                            code.push(Opcode::Progn { bodies: bodies.into_iter().map(std::sync::Arc::from).collect(), free_vars_map: std::sync::Arc::from(fvs) });
+                            code.push(Opcode::Progn {
+                                bodies: bodies.into_iter().map(std::sync::Arc::from).collect(),
+                                free_vars_map: std::sync::Arc::from(fvs),
+                            });
                             return Ok(());
                         }
                         "prog1" if items.len() >= 2 => {
@@ -486,14 +542,26 @@ impl VMCompiler {
                             let mut bodies = Vec::new();
                             let mut fvs = self.free_vars.clone();
                             for item in &items[1..] {
-                                let mut bc = VMCompiler { locals: self.locals.clone(), free_vars: fvs.clone(), fn_name: self.fn_name.clone(), arity: self.arity };
+                                let mut bc = VMCompiler {
+                                    locals: self.locals.clone(),
+                                    free_vars: fvs.clone(),
+                                    fn_name: self.fn_name.clone(),
+                                    arity: self.arity,
+                                };
                                 let mut bcode = Vec::new();
                                 bc.compile(item, &mut bcode, false)?;
-                                for v in &bc.free_vars { if !fvs.contains(v) { fvs.push(v.clone()); } }
+                                for v in &bc.free_vars {
+                                    if !fvs.contains(v) {
+                                        fvs.push(v.clone());
+                                    }
+                                }
                                 bodies.push(bcode);
                             }
                             self.free_vars = fvs.clone();
-                            code.push(Opcode::Prog1 { bodies: bodies.into_iter().map(std::sync::Arc::from).collect(), free_vars_map: std::sync::Arc::from(fvs) });
+                            code.push(Opcode::Prog1 {
+                                bodies: bodies.into_iter().map(std::sync::Arc::from).collect(),
+                                free_vars_map: std::sync::Arc::from(fvs),
+                            });
                             return Ok(());
                         }
                         "chain" if items.len() >= 4 && items.len() % 2 == 0 => {
@@ -506,21 +574,47 @@ impl VMCompiler {
                                 let var_item = &items[2 + i * 2];
                                 let var_name = match var_item {
                                     Expr::Symbol(s) if s.starts_with('$') => s.clone(),
-                                    _ => return Err(format!("chain: arg {} must be a $variable", 2 + i * 2)),
+                                    _ => {
+                                        return Err(format!(
+                                            "chain: arg {} must be a $variable",
+                                            2 + i * 2
+                                        ));
+                                    }
                                 };
-                                let mut bc = VMCompiler { locals: self.locals.clone(), free_vars: fvs.clone(), fn_name: self.fn_name.clone(), arity: self.arity };
+                                let mut bc = VMCompiler {
+                                    locals: self.locals.clone(),
+                                    free_vars: fvs.clone(),
+                                    fn_name: self.fn_name.clone(),
+                                    arity: self.arity,
+                                };
                                 let mut bcode = Vec::new();
                                 bc.compile(expr_item, &mut bcode, false)?;
-                                for v in &bc.free_vars { if !fvs.contains(v) { fvs.push(v.clone()); } }
+                                for v in &bc.free_vars {
+                                    if !fvs.contains(v) {
+                                        fvs.push(v.clone());
+                                    }
+                                }
                                 steps.push((bcode, var_name));
                             }
-                            let mut fc = VMCompiler { locals: self.locals.clone(), free_vars: fvs.clone(), fn_name: self.fn_name.clone(), arity: self.arity };
+                            let mut fc = VMCompiler {
+                                locals: self.locals.clone(),
+                                free_vars: fvs.clone(),
+                                fn_name: self.fn_name.clone(),
+                                arity: self.arity,
+                            };
                             let mut final_code = Vec::new();
                             fc.compile(items.last().unwrap(), &mut final_code, is_tail)?;
-                            for v in &fc.free_vars { if !fvs.contains(v) { fvs.push(v.clone()); } }
+                            for v in &fc.free_vars {
+                                if !fvs.contains(v) {
+                                    fvs.push(v.clone());
+                                }
+                            }
                             self.free_vars = fvs.clone();
                             code.push(Opcode::Chain {
-                                steps: steps.into_iter().map(|(bc, v)| (std::sync::Arc::from(bc), v)).collect(),
+                                steps: steps
+                                    .into_iter()
+                                    .map(|(bc, v)| (std::sync::Arc::from(bc), v))
+                                    .collect(),
                                 final_code: std::sync::Arc::from(final_code),
                                 free_vars_map: std::sync::Arc::from(fvs),
                             });
@@ -537,7 +631,9 @@ impl VMCompiler {
                             let mut body_code = Vec::new();
                             body_comp.compile(&items[1], &mut body_code, false)?;
                             for v in &body_comp.free_vars {
-                                if !self.free_vars.contains(v) { self.free_vars.push(v.clone()); }
+                                if !self.free_vars.contains(v) {
+                                    self.free_vars.push(v.clone());
+                                }
                             }
                             code.push(Opcode::Within {
                                 body_code: std::sync::Arc::from(body_code),
@@ -557,7 +653,9 @@ impl VMCompiler {
                             let mut body_code = Vec::new();
                             body_comp.compile(&items[2], &mut body_code, is_tail)?;
                             for v in &body_comp.free_vars {
-                                if !self.free_vars.contains(v) { self.free_vars.push(v.clone()); }
+                                if !self.free_vars.contains(v) {
+                                    self.free_vars.push(v.clone());
+                                }
                             }
                             code.push(Opcode::WithMutex {
                                 body_code: std::sync::Arc::from(body_code),
@@ -576,7 +674,9 @@ impl VMCompiler {
                             let mut body_code = Vec::new();
                             body_comp.compile(&items[1], &mut body_code, is_tail)?;
                             for v in &body_comp.free_vars {
-                                if !self.free_vars.contains(v) { self.free_vars.push(v.clone()); }
+                                if !self.free_vars.contains(v) {
+                                    self.free_vars.push(v.clone());
+                                }
                             }
                             code.push(Opcode::Transaction {
                                 body_code: std::sync::Arc::from(body_code),
@@ -590,11 +690,17 @@ impl VMCompiler {
                             let path_opcode = match &items[2] {
                                 // (library path.py) — Python import, space-ref is still evaluated but unused
                                 Expr::List(lib) if lib.len() == 2 => {
-                                    if let (Expr::Symbol(head), Expr::Symbol(py) | Expr::Str(py)) = (&lib[0], &lib[1]) {
+                                    if let (Expr::Symbol(head), Expr::Symbol(py) | Expr::Str(py)) =
+                                        (&lib[0], &lib[1])
+                                    {
                                         if head == "library" {
                                             Some(Opcode::PythonImport { path: py.clone() })
-                                        } else { None }
-                                    } else { None }
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
                                 }
                                 Expr::Symbol(p) | Expr::Str(p) => {
                                     if p.ends_with(".py") {
@@ -675,10 +781,14 @@ impl VMCompiler {
 
                             let mut union_free_vars = self.free_vars.clone();
                             for v in &then_comp.free_vars {
-                                if !union_free_vars.contains(v) { union_free_vars.push(v.clone()); }
+                                if !union_free_vars.contains(v) {
+                                    union_free_vars.push(v.clone());
+                                }
                             }
                             for v in &else_comp.free_vars {
-                                if !union_free_vars.contains(v) { union_free_vars.push(v.clone()); }
+                                if !union_free_vars.contains(v) {
+                                    union_free_vars.push(v.clone());
+                                }
                             }
                             self.free_vars = union_free_vars.clone();
 
@@ -697,11 +807,15 @@ impl VMCompiler {
                             // Compile py-call expression directly — avoids CEK round-trip.
                             // The Python expression tree is not evaluated as MeTTa args;
                             // `expr_to_py` resolves $var references at runtime from the env.
-                            code.push(Opcode::PyCall { expr: items[1].clone() });
+                            code.push(Opcode::PyCall {
+                                expr: items[1].clone(),
+                            });
                             return Ok(());
                         }
                         "py-eval" if items.len() == 2 => {
-                            code.push(Opcode::PyEval { expr: items[1].clone() });
+                            code.push(Opcode::PyEval {
+                                expr: items[1].clone(),
+                            });
                             return Ok(());
                         }
                         "test" if items.len() == 3 => {
@@ -714,7 +828,6 @@ impl VMCompiler {
                         }
                         _ => {}
                     }
-
                 }
                 // General application
                 let arity = items.len() - 1;
@@ -726,7 +839,7 @@ impl VMCompiler {
 
                 let is_user_fn = if let Some(ref fname) = fname_opt {
                     if let Some(funcs) = current_funcs() {
-                        crate::eval::forms::query::lookup_user_clauses(fname, arity as u8, funcs).is_some()
+                        lookup_user_clauses(fname, arity as u8, funcs).is_some()
                     } else {
                         false
                     }
@@ -892,4 +1005,3 @@ fn collect_quote_vars(
         _ => {}
     }
 }
-

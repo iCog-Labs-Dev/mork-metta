@@ -1,6 +1,7 @@
 use crate::atom::Atom;
+use crate::eval::shared::{closure::lazy_user_arg_mask, fresh::contains_fresh_vars};
 use crate::parser::Expr;
-use crate::space::Space;
+use crate::space::{MorkSpace, Space};
 use rustc_hash::FxHashMap as HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -143,7 +144,7 @@ impl FnTable {
     pub fn new() -> Self {
         FnTable {
             map: RwLock::new(HashMap::default()),
-            space: RwLock::new(Box::new(crate::space::MorkSpace::new())),
+            space: RwLock::new(Box::new(MorkSpace::new())),
             named_spaces: RwLock::new(HashMap::default()),
             fn_cache: RwLock::new(HashMap::default()),
             fn_effect: RwLock::new(HashMap::default()),
@@ -214,17 +215,30 @@ impl FnTable {
 
     pub fn has_greater_arity(&self, name: &str, arity: u8) -> bool {
         // ponytail: check if function is registered with any arity greater than current arity
-        if self.map.read().unwrap().get(name).map_or(false, |inner| inner.keys().any(|&k| k > arity)) {
+        if self
+            .map
+            .read()
+            .unwrap()
+            .get(name)
+            .map_or(false, |inner| inner.keys().any(|&k| k > arity))
+        {
             return true;
         }
-        if self.fn_cache.read().unwrap().get(name).map_or(false, |inner| inner.keys().any(|&k| k > arity)) {
+        if self
+            .fn_cache
+            .read()
+            .unwrap()
+            .get(name)
+            .map_or(false, |inner| inner.keys().any(|&k| k > arity))
+        {
             return true;
         }
         false
     }
 
     pub fn is_registered(&self, name: &str) -> bool {
-        self.map.read().unwrap().contains_key(name) || self.fn_cache.read().unwrap().contains_key(name)
+        self.map.read().unwrap().contains_key(name)
+            || self.fn_cache.read().unwrap().contains_key(name)
     }
 
     pub fn get(&self, name: &str, arity: u8) -> Option<Arc<Function>> {
@@ -250,7 +264,8 @@ impl FnTable {
             return res;
         }
 
-        let res = self.map
+        let res = self
+            .map
             .read()
             .unwrap()
             .get(name)
@@ -288,9 +303,9 @@ impl FnTable {
                 }
                 // Slow path: lazily create the space — write lock.
                 let mut spaces = self.named_spaces.write().unwrap();
-                let space = spaces.entry(name.to_string()).or_insert_with(|| {
-                    Box::new(crate::space::MorkSpace::new()) as Box<dyn Space + Send + Sync>
-                });
+                let space = spaces
+                    .entry(name.to_string())
+                    .or_insert_with(|| Box::new(MorkSpace::new()) as Box<dyn Space + Send + Sync>);
                 f(space.as_ref())
             }
             other => Err(format!(
@@ -306,28 +321,39 @@ impl FnTable {
         if let Some(mask) = self.lazy_mask_cache.read().unwrap().get(&key) {
             return mask.clone();
         }
-        let mask = if let Some(clauses) = self.fn_cache.read().unwrap()
-            .get(name).and_then(|m| m.get(&arity))
+        let mask = if let Some(clauses) = self
+            .fn_cache
+            .read()
+            .unwrap()
+            .get(name)
+            .and_then(|m| m.get(&arity))
         {
-            let slice: Vec<(&[crate::parser::Expr], &crate::parser::Expr)> =
-                clauses.iter().map(|c| (c.patterns.as_slice(), &c.body)).collect();
-            crate::eval::shared::closure::lazy_user_arg_mask(&slice)
+            let slice: Vec<(&[Expr], &Expr)> = clauses
+                .iter()
+                .map(|c| (c.patterns.as_slice(), &c.body))
+                .collect();
+            lazy_user_arg_mask(&slice)
         } else {
             vec![]
         };
-        self.lazy_mask_cache.write().unwrap().insert(key, mask.clone());
+        self.lazy_mask_cache
+            .write()
+            .unwrap()
+            .insert(key, mask.clone());
         mask
     }
 
     pub fn cache_fn(&self, name: &str, arity: u8, clause: Clause) {
         // Invalidate lazy mask when clauses change.
-        self.lazy_mask_cache.write().unwrap().remove(&(name.to_string(), arity));
+        self.lazy_mask_cache
+            .write()
+            .unwrap()
+            .remove(&(name.to_string(), arity));
         // Compute space-free purity BEFORE taking the cache write lock: the
         // analysis reads fn_cache/fn_effect, so locking first would deadlock.
         // Self-recursion is optimistically pure, so directly recursive pure
         // functions (e.g. fib) stay parallelizable.
-        let clause_effect =
-            is_pure_expr_assuming(&clause.body, self, name);
+        let clause_effect = is_pure_expr_assuming(&clause.body, self, name);
 
         {
             let mut cache = self.fn_cache.write().unwrap();
@@ -402,14 +428,14 @@ impl FnTable {
 
     /// Store a memoized result tagged with the current mutation stamp.
     pub fn memo_set(&self, key: (String, Vec<Atom>), result: Vec<Atom>) {
-        if result
-            .iter()
-            .any(crate::eval::shared::fresh::contains_fresh_vars)
-        {
+        if result.iter().any(contains_fresh_vars) {
             return;
         }
         let stamp = self.memo_stamp.load(Ordering::Relaxed);
-        self.memo_cache.write().unwrap().insert(key, (stamp, result));
+        self.memo_cache
+            .write()
+            .unwrap()
+            .insert(key, (stamp, result));
     }
 
     /// True if the named function at the given arity is marked pure.
@@ -471,13 +497,13 @@ impl FnTable {
     }
 
     /// True if the expression can be evaluated in parallel (no space mutation).
-    pub fn is_parallelizable_expr(&self, expr: &crate::parser::Expr) -> bool {
+    pub fn is_parallelizable_expr(&self, expr: &Expr) -> bool {
         is_pure_expr_inner(expr, self, None) != Effect::SpaceMutate
     }
 
     /// Estimate the computational weight of an expression.
-    pub fn expr_weight(&self, expr: &crate::parser::Expr) -> usize {
-        use crate::parser::Expr;
+    pub fn expr_weight(&self, expr: &Expr) -> usize {
+        use Expr;
         match expr {
             Expr::Number(_) | Expr::Symbol(_) | Expr::Str(_) => 0,
             Expr::List(items) => {
@@ -491,7 +517,8 @@ impl FnTable {
                 if let Expr::Symbol(head) = &items[0] {
                     match head.as_str() {
                         "quote" | "|->" | "empty" => {}
-                        "if" | "progn" | "prog1" | "let" | "let*" | "chain" | "collapse" | "once" | "superpose" => {
+                        "if" | "progn" | "prog1" | "let" | "let*" | "chain" | "collapse"
+                        | "once" | "superpose" => {
                             weight += 10;
                         }
                         _ => {
@@ -507,24 +534,22 @@ impl FnTable {
     }
 }
 
-fn is_pure_expr_assuming(expr: &crate::parser::Expr, funcs: &FnTable, self_name: &str) -> Effect {
+fn is_pure_expr_assuming(expr: &Expr, funcs: &FnTable, self_name: &str) -> Effect {
     is_pure_expr_inner(expr, funcs, Some(self_name))
 }
 
-fn is_pure_expr_inner(
-    expr: &crate::parser::Expr,
-    funcs: &FnTable,
-    assume_pure: Option<&str>,
-) -> Effect {
-    use crate::parser::Expr;
+fn is_pure_expr_inner(expr: &Expr, funcs: &FnTable, assume_pure: Option<&str>) -> Effect {
+    use Expr;
     match expr {
         Expr::Number(_) | Expr::Symbol(_) | Expr::Str(_) => Effect::Pure,
         Expr::List(items) if items.is_empty() => Effect::Pure,
         Expr::List(items) => {
-            let args_effect =
-                || items[1..].iter()
+            let args_effect = || {
+                items[1..]
+                    .iter()
                     .map(|e| is_pure_expr_inner(e, funcs, assume_pure))
-                    .fold(Effect::Pure, Effect::max);
+                    .fold(Effect::Pure, Effect::max)
+            };
             if let Expr::Symbol(s) = &items[0] {
                 // Dispatch-level special forms not in the fn table.
                 match s.as_str() {
@@ -538,17 +563,17 @@ fn is_pure_expr_inner(
                     // add-atom/remove-atom classified as SpaceRead because MorkSpace RwLock makes concurrent mutations thread-safe.
                     "match" | "case" | "add-atom" | "remove-atom" => Effect::SpaceRead,
                     // SpaceMutate: forced re-eval or IO.
-                    "eval" | "call" | "reduce" | "assert" | "transform-check"
-                    | "with_mutex" | "transaction" | "import!"
-                    | "foldall" | "map-atom" | "forall" | "within" | "py-call" | "py-eval"
-                    | "import-rs!" => Effect::SpaceMutate,
+                    "eval" | "call" | "reduce" | "assert" | "transform-check" | "with_mutex"
+                    | "transaction" | "import!" | "foldall" | "map-atom" | "forall" | "within"
+                    | "py-call" | "py-eval" | "import-rs!" => Effect::SpaceMutate,
                     _ => {
                         // Registered natives: look up their declared Effect.
                         // Self-recursion: optimistically Pure to avoid infinite loop.
                         let callee_effect = if assume_pure == Some(s.as_str()) {
                             Effect::Pure
                         } else {
-                            funcs.effect_of(s, (items.len() - 1) as u8)
+                            funcs
+                                .effect_of(s, (items.len() - 1) as u8)
                                 .unwrap_or(Effect::SpaceMutate) // unknown = conservative
                         };
                         callee_effect.max(args_effect())

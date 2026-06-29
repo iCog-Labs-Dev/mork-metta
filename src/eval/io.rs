@@ -9,16 +9,22 @@
 /// then splits it into rayon chunks for parallel parse. Pure data forms are
 /// batch-inserted with one write-lock and one `bump_memo_stamp` at the end.
 /// Definition / runnable forms still use the sequential slow path.
-use crate::atom::Atom;
+use crate::atom::{Atom, expr_data};
 use crate::env::Env;
-use crate::eval::machine::budget::{plain, ResultSet};
 use crate::eval::runtime::eval_scope;
+use crate::eval::{
+    machine::budget::{ResultSet, plain},
+    runtime::eval_with_state,
+};
 use crate::func::{FnTable, NDet};
-use crate::parser::{Expr, TopForm, parse_forms};
+use crate::parser::{Expr, TopForm, atom_to_expr, expr_to_atom, parse_atom_bytes, parse_forms};
+#[cfg(feature = "plugins")]
+use crate::plugin::Plugin;
+use crate::space::mutate::{add_atom, add_atoms_bulk};
+use rayon::prelude::*;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use rayon::prelude::*;
 
 /// Evaluate `(import! space path)` — load a MeTTa file into the space.
 ///
@@ -103,7 +109,7 @@ pub(crate) fn eval_import_rs(args: &[Expr], env: &Env, funcs: &FnTable) -> Resul
     let plugin_path = find_plugin_path(&name, &import_dir)?;
 
     // Load and compile the plugin
-    let plugin = crate::plugin::Plugin::new(&plugin_path)
+    let plugin = Plugin::new(&plugin_path)
         .map_err(|e| format!("import-rs!: failed to load plugin '{}': {}", name, e))?;
     plugin.register(funcs);
     Ok(NDet::single(Atom::sym("ok")))
@@ -179,7 +185,12 @@ pub(crate) fn resolve_import_path(path_str: &str, import_dir: &Path) -> Option<P
 /// # Slow path (definitions / runnables)
 /// Any form starting with `=` or prefixed `!` falls through to the sequential
 /// `process_form` path so the fn_cache is populated correctly.
-pub fn load_metta_file(path: &Path, space_ref: &Atom, env: &Env, funcs: &FnTable) -> Result<Vec<Atom>, String> {
+pub fn load_metta_file(
+    path: &Path,
+    space_ref: &Atom,
+    env: &Env,
+    funcs: &FnTable,
+) -> Result<Vec<Atom>, String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("cannot open '{}': {}", path.display(), e))?;
 
@@ -192,26 +203,37 @@ pub fn load_metta_file(path: &Path, space_ref: &Atom, env: &Env, funcs: &FnTable
 
     // ── Pass 1: scan form boundaries (sequential, byte-scan only) ───────────
     // Collect (start, end, is_bang, start_line) for every top-level form.
-    struct FormSpan { start: usize, end: usize, is_bang: bool, start_line: usize }
+    struct FormSpan {
+        start: usize,
+        end: usize,
+        is_bang: bool,
+        start_line: usize,
+    }
     let mut spans: Vec<FormSpan> = Vec::new();
     let mut pos = 0usize;
     let mut line_no = 1usize;
 
     while pos < n {
         skip_file_ws(bytes, &mut pos, &mut line_no);
-        if pos >= n { break; }
+        if pos >= n {
+            break;
+        }
 
         let saw_bang = bytes[pos] == b'!';
         if saw_bang {
             pos += 1;
             skip_file_ws(bytes, &mut pos, &mut line_no);
         }
-        if pos >= n { break; }
+        if pos >= n {
+            break;
+        }
 
         if bytes[pos] != b'(' {
             return Err(format!(
                 "expected '(' in '{}' at line {}, found '{}'",
-                path.display(), line_no, bytes[pos] as char
+                path.display(),
+                line_no,
+                bytes[pos] as char
             ));
         }
 
@@ -221,34 +243,66 @@ pub fn load_metta_file(path: &Path, space_ref: &Atom, env: &Env, funcs: &FnTable
 
         while pos < n {
             match bytes[pos] {
-                b'\n' => { line_no += 1; pos += 1; }
-                b';'  => { while pos < n && bytes[pos] != b'\n' { pos += 1; } }
-                b'"'  => {
+                b'\n' => {
+                    line_no += 1;
+                    pos += 1;
+                }
+                b';' => {
+                    while pos < n && bytes[pos] != b'\n' {
+                        pos += 1;
+                    }
+                }
+                b'"' => {
                     pos += 1;
                     while pos < n {
                         match bytes[pos] {
                             b'\\' => pos += 2,
-                            b'"'  => { pos += 1; break; }
-                            b'\n' => { line_no += 1; pos += 1; }
-                            _     => pos += 1,
+                            b'"' => {
+                                pos += 1;
+                                break;
+                            }
+                            b'\n' => {
+                                line_no += 1;
+                                pos += 1;
+                            }
+                            _ => pos += 1,
                         }
                     }
                 }
-                b'(' => { depth += 1; pos += 1; }
+                b'(' => {
+                    depth += 1;
+                    pos += 1;
+                }
                 b')' => {
-                    depth -= 1; pos += 1;
-                    if depth == 0 { break; }
+                    depth -= 1;
+                    pos += 1;
+                    if depth == 0 {
+                        break;
+                    }
                     if depth < 0 {
-                        return Err(format!("unmatched ')' in '{}' at line {}", path.display(), line_no));
+                        return Err(format!(
+                            "unmatched ')' in '{}' at line {}",
+                            path.display(),
+                            line_no
+                        ));
                     }
                 }
                 _ => pos += 1,
             }
         }
         if depth != 0 {
-            return Err(format!("unclosed '(' in '{}' at line {}", path.display(), start_line));
+            return Err(format!(
+                "unclosed '(' in '{}' at line {}",
+                path.display(),
+                start_line
+            ));
         }
-        spans.push(FormSpan { start: form_start, end: pos, is_bang: saw_bang, start_line });
+        spans.push(FormSpan {
+            start: form_start,
+            end: pos,
+            is_bang: saw_bang,
+            start_line,
+        });
     }
 
     // ── Pass 2: split into data-only vs slow forms ──────────────────────────
@@ -276,12 +330,13 @@ pub fn load_metta_file(path: &Path, space_ref: &Atom, env: &Env, funcs: &FnTable
             let s = &spans[i];
             // Reconstruct the slice per-thread.
             // SAFETY: read-only, mmap lives for function scope, rayon scope is nested.
-            let bytes_slice = unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
+            let bytes_slice =
+                unsafe { std::slice::from_raw_parts(bytes_ptr as *const u8, bytes_len) };
             let snippet = std::str::from_utf8(&bytes_slice[s.start..s.end])
                 .map_err(|e| (s.start_line, e.to_string()))?;
             let mut local_pos = 0usize;
             let mut local_line = s.start_line;
-            crate::parser::parse_atom_bytes(snippet, &mut local_pos, &mut local_line)
+            parse_atom_bytes(snippet, &mut local_pos, &mut local_line)
                 .map_err(|e| (s.start_line, e))
         })
         .collect();
@@ -292,14 +347,19 @@ pub fn load_metta_file(path: &Path, space_ref: &Atom, env: &Env, funcs: &FnTable
         match r {
             Ok(atom) => bulk_atoms.push(atom),
             Err((line, msg)) => {
-                return Err(format!("{} (in '{}' near line {})", msg, path.display(), line));
+                return Err(format!(
+                    "{} (in '{}' near line {})",
+                    msg,
+                    path.display(),
+                    line
+                ));
             }
         }
     }
 
     // ── Pass 4: bulk insert data atoms (single lock + single memo bump) ──────
     if !bulk_atoms.is_empty() {
-        crate::space::mutate::add_atoms_bulk(funcs, space_ref, &bulk_atoms)?;
+        add_atoms_bulk(funcs, space_ref, &bulk_atoms)?;
     }
 
     // ── Pass 5: sequential slow path for defs / runnables ───────────────────
@@ -379,7 +439,7 @@ fn process_form(
         form
     };
     let mut last = None;
-    for top_form in crate::parser::parse_forms(src)? {
+    for top_form in parse_forms(src)? {
         last = process_top_form(top_form, space_ref, env, funcs)?;
     }
     Ok(last)
@@ -394,16 +454,15 @@ pub(crate) fn process_top_form(
 ) -> Result<Option<Atom>, String> {
     match form {
         TopForm::Definition(expr) => {
-            let atom = crate::parser::expr_to_atom(&expr);
-            crate::space::mutate::add_atom(funcs, space_ref, &atom)?;
+            let atom = expr_to_atom(&expr);
+            add_atom(funcs, space_ref, &atom)?;
             Ok(None)
         }
         TopForm::Runnable(expr) => {
             // Drive the spec's 4-register machine (cost ledger + insensitive gate
             // live; unbounded budget → results identical to bare eval). This is
             // the file/CLI run path.
-            let (mut results, _budget) =
-                crate::eval::runtime::eval_with_state(&expr, env, funcs, None)?;
+            let (mut results, _budget) = eval_with_state(&expr, env, funcs, None)?;
             Ok(results.next())
         }
     }
@@ -418,20 +477,18 @@ pub(crate) fn eval_readln(_args: &[Expr], _env: &Env, _funcs: &FnTable) -> Resul
         .read_line(&mut input)
         .map_err(|e| e.to_string())?;
     let wrapped = format!("({})", input);
-    match crate::parser::parse_forms(&wrapped) {
+    match parse_forms(&wrapped) {
         Ok(forms) => {
-            if let Some(crate::parser::TopForm::Definition(crate::parser::Expr::List(items))) =
-                forms.into_iter().next()
-            {
+            if let Some(TopForm::Definition(Expr::List(items))) = forms.into_iter().next() {
                 if items.len() == 1 {
-                    Ok(NDet::single(crate::parser::expr_to_atom(&items[0])))
+                    Ok(NDet::single(expr_to_atom(&items[0])))
                 } else if items.is_empty() {
-                    Ok(NDet::single(crate::atom::Atom::Expr(crate::atom::expr_data([]))))
+                    Ok(NDet::single(Atom::Expr(expr_data([]))))
                 } else {
-                    Ok(NDet::single(crate::atom::Atom::expr(
+                    Ok(NDet::single(Atom::expr(
                         items
                             .into_iter()
-                            .map(|e| crate::parser::expr_to_atom(&e))
+                            .map(|e| expr_to_atom(&e))
                             .collect::<Vec<_>>(),
                     )))
                 }

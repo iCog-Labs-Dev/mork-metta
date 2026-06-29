@@ -131,7 +131,9 @@ fn freshen_list(
                 let mut new_bindings = None;
                 for (i, binding) in bindings.iter().enumerate() {
                     let Expr::List(pair) = binding else {
-                        if let Some(new_b) = freshen_expr_inner_opt(binding, bound_vars, &cur_locals, free) {
+                        if let Some(new_b) =
+                            freshen_expr_inner_opt(binding, bound_vars, &cur_locals, free)
+                        {
                             if new_bindings.is_none() {
                                 new_bindings = Some(bindings[..i].to_vec());
                             }
@@ -142,7 +144,9 @@ fn freshen_list(
                         continue;
                     };
                     if pair.len() != 2 {
-                        if let Some(new_b) = freshen_expr_inner_opt(binding, bound_vars, &cur_locals, free) {
+                        if let Some(new_b) =
+                            freshen_expr_inner_opt(binding, bound_vars, &cur_locals, free)
+                        {
                             if new_bindings.is_none() {
                                 new_bindings = Some(bindings[..i].to_vec());
                             }
@@ -160,7 +164,10 @@ fn freshen_list(
                         }
                         let pattern = pattern_opt.unwrap_or_else(|| pair[0].clone());
                         let value = value_opt.unwrap_or_else(|| pair[1].clone());
-                        new_bindings.as_mut().unwrap().push(Expr::List(vec![pattern, value].into()));
+                        new_bindings
+                            .as_mut()
+                            .unwrap()
+                            .push(Expr::List(vec![pattern, value].into()));
                     } else if let Some(ref mut vec) = new_bindings {
                         vec.push(binding.clone());
                     }

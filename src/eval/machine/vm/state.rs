@@ -1,11 +1,11 @@
+use super::op::{CaseBranch, Opcode, VmExit};
 use crate::atom::Atom;
 use crate::env::Env;
-use crate::eval::shared::fresh;
 use crate::eval::machine::budget::{ResultSet, plain};
-use super::op::{Opcode, VmExit, CaseBranch};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use crate::eval::shared::fresh;
 use std::any::Any;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::parser::Expr;
 
@@ -72,7 +72,7 @@ pub struct CallFrame {
     pub return_code: Arc<[Opcode]>,
     pub locals_to_pop: usize,
     pub saved_base_env: Env,
-    pub saved_locals: Vec<(Atom, Env)>,  // parent's locals for Call frames
+    pub saved_locals: Vec<(Atom, Env)>, // parent's locals for Call frames
     pub saved_free_vars_map: Arc<[String]>,
     pub saved_free_vars_bindings: Vec<Atom>,
     pub kind: CallFrameKind,
@@ -83,8 +83,8 @@ pub struct VMState {
     pub ip: usize,
     pub stack: Vec<ResultSet>,
     pub locals: Vec<(Atom, Env)>,
-    pub free_vars_map: Arc<[String]>,     // Index to original free var name
-    pub free_vars_bindings: Vec<Atom>,  // Index to instantiated fresh Atom
+    pub free_vars_map: Arc<[String]>, // Index to original free var name
+    pub free_vars_bindings: Vec<Atom>, // Index to instantiated fresh Atom
     pub frames: Vec<CallFrame>,
     pub budget: Option<i64>,
     pub cut_executed: bool,

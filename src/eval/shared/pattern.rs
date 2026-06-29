@@ -6,8 +6,8 @@
 use crate::atom::Atom;
 use crate::env::Env;
 use crate::func::{Clause, FnTable};
-use std::sync::Arc;
 use crate::parser::Expr;
+use std::sync::Arc;
 
 /// Match a clause's argument patterns against evaluated argument atoms.
 ///
@@ -55,15 +55,17 @@ pub(crate) fn try_match_one(
     funcs: &FnTable,
 ) -> Result<Option<Env>, String> {
     match pattern {
-    Expr::Symbol(symbol) if symbol.starts_with('$') => match crate::eval::shared::env::lookup(env, symbol) {
-            Some(bound) if bound == *atom => Ok(Some(env.clone())),
-            Some(_) => Ok(None),
-            None => Ok(Some(crate::eval::shared::env::bind(
-                env,
-                symbol,
-                atom.clone(),
-            ))),
-        },
+        Expr::Symbol(symbol) if symbol.starts_with('$') => {
+            match crate::eval::shared::env::lookup(env, symbol) {
+                Some(bound) if bound == *atom => Ok(Some(env.clone())),
+                Some(_) => Ok(None),
+                None => Ok(Some(crate::eval::shared::env::bind(
+                    env,
+                    symbol,
+                    atom.clone(),
+                ))),
+            }
+        }
         Expr::Str(s) => match atom {
             Atom::Str(value) if s.as_str() == value.as_ref() => Ok(Some(env.clone())),
             _ => Ok(None),
@@ -87,9 +89,7 @@ pub(crate) fn try_match_one(
         },
         Expr::Symbol(symbol) => match atom {
             // Exact canonicalized match
-            Atom::Sym(value)
-                if Atom::sym(symbol.as_str()) == Atom::Sym(value.clone()) =>
-            {
+            Atom::Sym(value) if Atom::sym(symbol.as_str()) == Atom::Sym(value.clone()) => {
                 Ok(Some(env.clone()))
             }
             // Atom is an unbound call-site variable ($x) against a ground pattern
@@ -109,9 +109,7 @@ pub(crate) fn try_match_one(
             _ => Ok(None),
         },
         Expr::List(items) => {
-            if items.len() == 3
-                && matches!(&items[0], Expr::Symbol(head) if head == "cons")
-            {
+            if items.len() == 3 && matches!(&items[0], Expr::Symbol(head) if head == "cons") {
                 return match atom {
                     Atom::Expr(elements) if !elements.is_empty() => {
                         let Some(head_env) = try_match_one(&items[1], &elements[0], env, funcs)?
@@ -137,14 +135,12 @@ pub(crate) fn try_match_one(
                     Ok(Some(current))
                 }
                 Atom::Sym(symbol) if symbol.starts_with('$') => {
-                let expr = Expr::List(items.clone());
-                match crate::eval::machine::step::run(&expr, env, funcs) {
-                    Ok(results) => match results.into_iter().next() {
-                        Some(value) => Ok(Some(crate::eval::shared::env::bind(
-                            env,
-                            symbol,
-                            value,
-                        ))),
+                    let expr = Expr::List(items.clone());
+                    match crate::eval::machine::step::run(&expr, env, funcs) {
+                        Ok(results) => match results.into_iter().next() {
+                            Some(value) => {
+                                Ok(Some(crate::eval::shared::env::bind(env, symbol, value)))
+                            }
                             None => Ok(None),
                         },
                         Err(_) => Ok(None),

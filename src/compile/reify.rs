@@ -35,8 +35,6 @@ pub fn atom_to_expr(atom: &Atom) -> Result<Expr, String> {
             ];
             Ok(Expr::List(items.into()))
         }
-        Atom::Gnd(g) => {
-            Ok(Expr::Symbol(g.display_metta()))
-        }
+        Atom::Gnd(g) => Ok(Expr::Symbol(g.display_metta())),
     }
 }

@@ -5,10 +5,15 @@
 //! query-related cost behavior.
 
 use crate::atom::Atom;
-use crate::env::Env;
+use crate::env::{Env, EnvNode};
+use crate::eval::{
+    machine::budget::calculate_cost,
+    shared::pattern::{prepend_env, try_match_one},
+};
 use crate::func::Clause;
 use crate::func::FnTable;
-use crate::parser::Expr;
+use crate::parser::{Expr, atom_to_expr, expr_to_atom};
+use crate::space::Pattern;
 
 pub(crate) use super::super::shared::closure::{
     delayed_user_call_arg, eval_user_call_arg, eval_user_call_arg_slot, lazy_user_arg_mask,
@@ -29,14 +34,11 @@ pub(crate) fn prepare_arg_slot(
 /// Compute the total structural cost of the bindings in an environment.
 pub(crate) fn env_binding_cost(env: &Env) -> i64 {
     match env.inner() {
-        crate::env::EnvNode::Empty => 0,
-        crate::env::EnvNode::Cons { value, next, .. } => {
-            crate::eval::machine::budget::calculate_cost(value).unwrap_or(0)
-                + env_binding_cost(next)
+        EnvNode::Empty => 0,
+        EnvNode::Cons { value, next, .. } => {
+            calculate_cost(value).unwrap_or(0) + env_binding_cost(next)
         }
-        crate::env::EnvNode::Link { prefix, base } => {
-            env_binding_cost(prefix) + env_binding_cost(base)
-        }
+        EnvNode::Link { prefix, base } => env_binding_cost(prefix) + env_binding_cost(base),
     }
 }
 
@@ -64,12 +66,12 @@ pub(crate) fn match_clause(
 
     let mut unification_env = Env::new();
     for (pattern, arg) in patterns.iter().zip(args.iter()) {
-        match crate::eval::shared::pattern::try_match_one(pattern, arg, &unification_env, funcs) {
+        match try_match_one(pattern, arg, &unification_env, funcs) {
             Ok(Some(new_env)) => {
                 if debug_vars {
                     eprintln!(
                         "debug[varcalls]: matched pat={} arg={} open_arg={}",
-                        crate::parser::expr_to_atom(pattern).to_sexpr_string(),
+                        expr_to_atom(pattern).to_sexpr_string(),
                         arg.to_sexpr_string(),
                         arg.is_open()
                     );
@@ -80,7 +82,7 @@ pub(crate) fn match_clause(
                 if debug_vars {
                     eprintln!(
                         "debug[varcalls]: no-match pat={} arg={} open_arg={}",
-                        crate::parser::expr_to_atom(pattern).to_sexpr_string(),
+                        expr_to_atom(pattern).to_sexpr_string(),
                         arg.to_sexpr_string(),
                         arg.is_open()
                     );
@@ -91,7 +93,7 @@ pub(crate) fn match_clause(
                 if debug_vars {
                     eprintln!(
                         "debug[varcalls]: error pat={} arg={} err={}",
-                        crate::parser::expr_to_atom(pattern).to_sexpr_string(),
+                        expr_to_atom(pattern).to_sexpr_string(),
                         arg.to_sexpr_string(),
                         e
                     );
@@ -105,7 +107,7 @@ pub(crate) fn match_clause(
     if debug_vars {
         let pats: Vec<String> = patterns
             .iter()
-            .map(|p| crate::parser::expr_to_atom(p).to_sexpr_string())
+            .map(|p| expr_to_atom(p).to_sexpr_string())
             .collect();
         let vals: Vec<String> = args.iter().map(|a| a.to_sexpr_string()).collect();
         eprintln!(
@@ -115,10 +117,7 @@ pub(crate) fn match_clause(
             subst_cost
         );
     }
-    Some((
-        crate::eval::shared::pattern::prepend_env(unification_env, base_env),
-        subst_cost,
-    ))
+    Some((prepend_env(unification_env, base_env), subst_cost))
 }
 
 /// Collect lazy-mask-ready clause references for a user-defined function body.
@@ -179,8 +178,6 @@ pub(crate) fn lookup_user_clauses_via_space(
     arity: u8,
     funcs: &FnTable,
 ) -> Option<Vec<(Vec<Expr>, Expr)>> {
-    use crate::space::Pattern;
-
     // Pattern: (= (name $ $ ... $) $body)  with `arity` argument slots.
     let mut head_pats = Vec::with_capacity(arity as usize + 1);
     head_pats.push(Pattern::Exact(Atom::sym(name)));
@@ -211,9 +208,8 @@ pub(crate) fn lookup_user_clauses_via_space(
         if !matches!(&head[0], Atom::Sym(s) if s.as_ref() == name) {
             continue;
         }
-        let patterns: Result<Vec<Expr>, _> =
-            head[1..].iter().map(crate::parser::atom_to_expr).collect();
-        let body = crate::parser::atom_to_expr(&items[2]);
+        let patterns: Result<Vec<Expr>, _> = head[1..].iter().map(atom_to_expr).collect();
+        let body = atom_to_expr(&items[2]);
         if let (Ok(patterns), Ok(body)) = (patterns, body) {
             clauses.push((patterns, body));
         }

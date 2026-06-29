@@ -30,10 +30,7 @@ pub(crate) enum EnvNode {
         next: Env,
     },
     /// A link node prepending one environment chain onto another.
-    Link {
-        prefix: Env,
-        base: Env,
-    },
+    Link { prefix: Env, base: Env },
 }
 
 impl PartialEq for EnvNode {
@@ -41,12 +38,26 @@ impl PartialEq for EnvNode {
         match (self, other) {
             (EnvNode::Empty, EnvNode::Empty) => true,
             (
-                EnvNode::Cons { name: n1, value: v1, next: nx1 },
-                EnvNode::Cons { name: n2, value: v2, next: nx2 },
+                EnvNode::Cons {
+                    name: n1,
+                    value: v1,
+                    next: nx1,
+                },
+                EnvNode::Cons {
+                    name: n2,
+                    value: v2,
+                    next: nx2,
+                },
             ) => n1 == n2 && v1 == v2 && nx1 == nx2,
             (
-                EnvNode::Link { prefix: p1, base: b1 },
-                EnvNode::Link { prefix: p2, base: b2 },
+                EnvNode::Link {
+                    prefix: p1,
+                    base: b1,
+                },
+                EnvNode::Link {
+                    prefix: p2,
+                    base: b2,
+                },
             ) => p1 == p2 && b1 == b2,
             _ => false,
         }
@@ -128,7 +139,11 @@ impl Env {
                     curr = todo.pop()?;
                     continue;
                 }
-                EnvNode::Cons { name: n, value, next } => {
+                EnvNode::Cons {
+                    name: n,
+                    value,
+                    next,
+                } => {
                     if &**n == name {
                         return Some((**value).clone());
                     }

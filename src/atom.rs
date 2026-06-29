@@ -1,11 +1,12 @@
 use crate::env::Env;
 use crate::parser::Expr;
-use dashu::Integer as IBig;
+use crate::symbol::Symbol;
 use dashu::Decimal as DBig;
+use dashu::Integer as IBig;
 
 use std::any::Any;
-use std::sync::Arc;
 use std::fmt;
+use std::sync::Arc;
 /// A growing numeric value — either an arbitrary-precision integer or decimal.
 /// Integer values up to ~2×64 bits are stored inline (no heap alloc); larger
 /// values promote to heap. Decimal values are exact (no NaN, no IEEE rounding).
@@ -128,7 +129,10 @@ pub struct ExprData {
 impl ExprData {
     fn new(items: Vec<Atom>) -> Self {
         let has_var = items.iter().any(Atom::is_open);
-        ExprData { has_var, items: items.into_boxed_slice() }
+        ExprData {
+            has_var,
+            items: items.into_boxed_slice(),
+        }
     }
     /// True if any free `$`-variable appears anywhere below this node.
     #[inline]
@@ -159,7 +163,7 @@ pub enum Atom {
     /// A symbolic name: function names, variable names (with $ prefix), data symbols.
     /// Stored as a highly-optimized interned symbol (8 bytes) so cloning is zero-cost
     /// and comparisons are instant. Avoids allocating Arcs for identical symbols.
-    Sym(crate::symbol::Symbol),
+    Sym(Symbol),
     /// A string literal value, distinct from symbols.
     /// `"hello"` in source → `Str("hello")`, NOT equal to symbol `hello`.
     Str(Arc<str>),
@@ -209,7 +213,6 @@ impl std::hash::Hash for Atom {
     }
 }
 
-
 impl Atom {
     /// Format an Atom as an S-expression string (for display and repr).
     ///
@@ -243,7 +246,7 @@ impl Atom {
             "False" => "false",
             other => other,
         };
-        Atom::Sym(crate::symbol::Symbol::intern(canonical))
+        Atom::Sym(Symbol::intern(canonical))
     }
 
     /// Convenience: create a string atom.
@@ -300,9 +303,7 @@ impl Atom {
             Atom::Num(Numeric::Int(n)) => {
                 i128::try_from(n.clone()).map_err(|_| format!("integer {} overflows i128", n))
             }
-            Atom::Num(Numeric::Dec(d)) => {
-                Err(format!("expected integer, got decimal {}", d))
-            }
+            Atom::Num(Numeric::Dec(d)) => Err(format!("expected integer, got decimal {}", d)),
             other => Err(format!("expected number, got {}", other.to_sexpr_string())),
         }
     }

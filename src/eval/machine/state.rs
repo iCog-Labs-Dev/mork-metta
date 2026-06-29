@@ -7,7 +7,6 @@
 use crate::atom::Atom;
 use std::collections::HashMap;
 
-
 /// Return `true` when binding `var` to `atom` would introduce a cycle.
 fn occurs_check(var: &str, atom: &Atom, subst: &HashMap<String, Atom>) -> bool {
     match deref(atom, subst) {

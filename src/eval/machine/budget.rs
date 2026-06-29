@@ -5,6 +5,8 @@
 
 use crate::atom::Atom;
 use crate::env::Env;
+use crate::eval::shared::{pattern::prepend_env, subst::subst_atom};
+use crate::parser::Expr;
 
 /// A result set produced by machine evaluation.
 ///
@@ -21,7 +23,7 @@ pub(crate) fn plain(atoms: Vec<Atom>) -> ResultSet {
 pub(crate) fn atoms_of(results: &ResultSet) -> Vec<Atom> {
     results
         .iter()
-        .map(|(atom, env)| crate::eval::shared::subst::subst_atom(atom, env))
+        .map(|(atom, env)| subst_atom(atom, env))
         .collect()
 }
 
@@ -36,8 +38,7 @@ pub fn calculate_cost(atom: &Atom) -> Option<i64> {
 }
 
 /// Calculate the structural cost of an Expr directly without allocating an Atom.
-pub fn calculate_expr_cost(expr: &crate::parser::Expr) -> i64 {
-    use crate::parser::Expr;
+pub fn calculate_expr_cost(expr: &Expr) -> i64 {
     match expr {
         Expr::Number(_) | Expr::Symbol(_) | Expr::Str(_) => 1,
         Expr::List(items) => {
@@ -56,7 +57,7 @@ pub(crate) fn threaded_combinations(sets: &[ResultSet]) -> Vec<(Vec<Atom>, Env)>
         for rs in sets {
             let (atom, env) = &rs[0];
             atoms.push(atom.clone());
-            acc_env = crate::eval::shared::pattern::prepend_env(env.clone(), &acc_env);
+            acc_env = prepend_env(env.clone(), &acc_env);
         }
         return vec![(atoms, acc_env)];
     }
@@ -68,7 +69,7 @@ pub(crate) fn threaded_combinations(sets: &[ResultSet]) -> Vec<(Vec<Atom>, Env)>
             for (atom, atom_env) in rs {
                 let mut atoms = prefix.clone();
                 atoms.push(atom.clone());
-                let merged = crate::eval::shared::pattern::prepend_env(atom_env.clone(), acc_env);
+                let merged = prepend_env(atom_env.clone(), acc_env);
                 next.push((atoms, merged));
             }
         }
@@ -76,4 +77,3 @@ pub(crate) fn threaded_combinations(sets: &[ResultSet]) -> Vec<(Vec<Atom>, Env)>
     }
     combos
 }
-

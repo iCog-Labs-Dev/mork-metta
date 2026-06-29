@@ -16,7 +16,8 @@
 /// - Comments begin with `;` and extend to end of line.
 /// - Integer tokens are prefixed or unprefixed ASCII digits.
 /// - Symbols can contain any non-whitespace, non-paren characters.
-use crate::atom::Atom;
+use crate::atom::{Atom, Numeric, expr_data};
+
 use std::sync::Arc;
 
 /// A top-level form in a MeTTa file.
@@ -36,7 +37,7 @@ pub enum Expr {
     /// A string literal: `"hello"`, `"foo bar"`
     Str(String),
     /// An integer literal: `30`, `-1`, `354224848179261915075`
-    Number(crate::atom::Numeric),
+    Number(Numeric),
     /// A parenthesized list: `(fib 30)`, `(+ $N 1)`
     List(Arc<[Expr]>),
 }
@@ -121,9 +122,7 @@ pub fn atom_to_expr(atom: &Atom) -> Result<Expr, String> {
             ];
             Ok(Expr::List(items.into()))
         }
-        Atom::Gnd(g) => {
-            Ok(Expr::Symbol(g.display_metta()))
-        }
+        Atom::Gnd(g) => Ok(Expr::Symbol(g.display_metta())),
     }
 }
 
@@ -177,7 +176,9 @@ pub fn parse_forms(input: &str) -> Result<Vec<TopForm>, String> {
 
 /// Parse a single S-expression from a character stream.
 /// Assumes the opening '(' has already been consumed.
-pub(crate) fn parse_sexpr_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<Expr, String> {
+pub(crate) fn parse_sexpr_body(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<Expr, String> {
     let mut items = Vec::with_capacity(4);
 
     loop {
@@ -209,13 +210,13 @@ pub(crate) fn parse_sexpr_body(chars: &mut std::iter::Peekable<std::str::Chars<'
                 };
                 if pure_int {
                     if let Ok(n) = token.parse::<dashu::Integer>() {
-                        items.push(Expr::Number(crate::atom::Numeric::Int(n)));
+                        items.push(Expr::Number(Numeric::Int(n)));
                     } else {
                         items.push(Expr::Symbol(token));
                     }
                 } else if token.contains('.') || token.contains('e') || token.contains('E') {
                     match token.parse::<dashu::Decimal>() {
-                        Ok(n) => items.push(Expr::Number(crate::atom::Numeric::Dec(n))),
+                        Ok(n) => items.push(Expr::Number(Numeric::Dec(n))),
                         Err(_) => items.push(Expr::Symbol(token)),
                     }
                 } else {
@@ -248,7 +249,10 @@ fn read_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
                         '\\' => s.push('\\'),
                         'n' => s.push('\n'),
                         't' => s.push('\t'),
-                        other => { s.push('\\'); s.push(other); }
+                        other => {
+                            s.push('\\');
+                            s.push(other);
+                        }
                     }
                 }
                 continue;
@@ -306,7 +310,11 @@ pub fn parse_atom_bytes(
     line_no: &mut usize,
 ) -> Result<Atom, String> {
     let bytes = content.as_bytes();
-    debug_assert_eq!(bytes.get(*pos), Some(&b'('), "parse_atom_bytes must start at '('");
+    debug_assert_eq!(
+        bytes.get(*pos),
+        Some(&b'('),
+        "parse_atom_bytes must start at '('"
+    );
     *pos += 1; // consume '('
     let mut items: Vec<Atom> = Vec::with_capacity(4);
 
@@ -335,7 +343,7 @@ pub fn parse_atom_bytes(
         match bytes[*pos] {
             b')' => {
                 *pos += 1;
-                return Ok(Atom::Expr(crate::atom::expr_data(items)));
+                return Ok(Atom::Expr(expr_data(items)));
             }
             b'(' => {
                 items.push(parse_atom_bytes(content, pos, line_no)?);
@@ -403,7 +411,7 @@ fn bytes_token_to_atom(token: &str) -> Atom {
             // Potential integer: check all-digit and try parsing
             if s.bytes().all(|b| b.is_ascii_digit()) {
                 if let Ok(n) = token.parse::<dashu::Integer>() {
-                    return Atom::Num(crate::atom::Numeric::Int(n));
+                    return Atom::Num(Numeric::Int(n));
                 }
             }
         } else if first != b'.' {
@@ -415,7 +423,7 @@ fn bytes_token_to_atom(token: &str) -> Atom {
     // Float or symbol
     if token.contains('.') || token.contains('e') || token.contains('E') {
         if let Ok(n) = token.parse::<dashu::Decimal>() {
-            return Atom::Num(crate::atom::Numeric::Dec(n));
+            return Atom::Num(Numeric::Dec(n));
         }
     }
     Atom::sym(token)

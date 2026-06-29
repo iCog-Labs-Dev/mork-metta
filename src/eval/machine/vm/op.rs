@@ -1,6 +1,6 @@
 use crate::atom::Atom;
-use crate::parser::Expr;
 use crate::env::Env;
+use crate::parser::Expr;
 use std::sync::Arc;
 
 pub enum VmExit {
@@ -11,9 +11,9 @@ pub enum VmExit {
     /// break the layout cycle (VMState contains VmExit via last_sub_result).
     YieldCall {
         parent_state: Box<super::state::VMState>,
-        parent_env:   Env,
-        sub_state:    Box<super::state::VMState>,
-        sub_env:      Env,
+        parent_env: Env,
+        sub_state: Box<super::state::VMState>,
+        sub_env: Env,
     },
 }
 
@@ -160,13 +160,21 @@ pub enum Opcode {
         free_vars_map: Arc<[String]>,
     },
     /// Pops space-ref from stack, loads a .metta file into it.
-    ImportFile { path: String },
+    ImportFile {
+        path: String,
+    },
     /// Pops space-ref from stack (ignored), loads a .py library file.
-    PythonImport { path: String },
+    PythonImport {
+        path: String,
+    },
     /// Evaluates a `(py-call expr)` — raw expression tree, not evaluated args.
     /// Bypasses dispatch.rs string matching and CEK machine entirely.
-    PyCall { expr: Expr },
-    PyEval { expr: Expr },
+    PyCall {
+        expr: Expr,
+    },
+    PyEval {
+        expr: Expr,
+    },
     ImportDynamic,
     /// Test special form: evaluates expression, collects ALL non-deterministic results,
     /// compares with expected value (structural equality), prints "is X, should Y. ✅/❌",
@@ -201,4 +209,3 @@ pub struct QuoteVarMatch {
     pub path: Vec<usize>,
     pub source: QuoteVarSource,
 }
-

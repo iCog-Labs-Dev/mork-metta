@@ -1,9 +1,9 @@
 #[cfg(feature = "profile")]
 mod real_impl {
+    use rustc_hash::FxHashMap;
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
-    use rustc_hash::FxHashMap;
 
     static PROFILE_MEM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
@@ -80,9 +80,9 @@ mod real_impl {
                 std::sync::OnceLock::new();
             let map = INTERNER.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
             let mut map = map.lock().unwrap();
-            let static_name = *map.entry(name.to_string()).or_insert_with(|| {
-                Box::leak(name.to_string().into_boxed_str())
-            });
+            let static_name = *map
+                .entry(name.to_string())
+                .or_insert_with(|| Box::leak(name.to_string().into_boxed_str()));
 
             let guard = ProfileGuard::new(static_name);
 
@@ -138,16 +138,15 @@ mod real_impl {
             items.reverse();
 
             println!("\n======================== PROFILE SUMMARY ========================");
-            println!("{:<30} {:<10} {:<12} {:<12} {:<18}", "Function", "Calls", "Total Time", "Self Time", "VMem Growth (Bytes)");
+            println!(
+                "{:<30} {:<10} {:<12} {:<12} {:<18}",
+                "Function", "Calls", "Total Time", "Self Time", "VMem Growth (Bytes)"
+            );
             println!("{}", "-".repeat(87));
             for (name, stats) in items {
                 println!(
                     "{:<30} {:<10} {:<12?} {:<12?} {:<18}",
-                    name,
-                    stats.calls,
-                    stats.total_time,
-                    stats.self_time,
-                    stats.allocated_bytes
+                    name, stats.calls, stats.total_time, stats.self_time, stats.allocated_bytes
                 );
             }
             let overhead = PROFILE_OVERHEAD.with(|o| *o.borrow());
@@ -182,5 +181,3 @@ impl ProfileGuard {
 pub fn print_profile_summary() {
     // ponytail: no-op when profile feature is disabled
 }
-
-

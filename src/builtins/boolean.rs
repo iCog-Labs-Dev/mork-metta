@@ -1,8 +1,10 @@
 //! Builtins for boolean values, logical operators, and equality comparisons.
 
 use crate::atom::Atom;
-use crate::func::{FnTable, NDet};
-use crate::parser::Expr;
+use crate::builtins::arithmetic::{alpha_equiv, expect_n_args};
+use crate::eval::machine::state::unify;
+use crate::func::{Clause, FnTable, NDet};
+use crate::parser::{Expr, expr_to_atom};
 
 /// Convert a Rust boolean into a MeTTa boolean atom.
 pub fn bool_atom(value: bool) -> Atom {
@@ -19,60 +21,50 @@ pub fn register_boolean_builtins(funcs: &FnTable) {
     register_truth_tables(funcs);
 
     funcs.insert_native("==", 2, |args, _| {
-        crate::builtins::arithmetic::expect_n_args(args, 2, "==")?;
+        expect_n_args(args, 2, "==")?;
         Ok(NDet::single(bool_atom(args[0] == args[1])))
     });
     funcs.mark_pure("==", 2);
 
     funcs.insert_native("!=", 2, |args, _| {
-        crate::builtins::arithmetic::expect_n_args(args, 2, "!=")?;
+        expect_n_args(args, 2, "!=")?;
         Ok(NDet::single(bool_atom(args[0] != args[1])))
     });
     funcs.mark_pure("!=", 2);
 
     funcs.insert_native("=", 2, |args, _| {
-        crate::builtins::arithmetic::expect_n_args(args, 2, "=")?;
+        expect_n_args(args, 2, "=")?;
         Ok(NDet::single(bool_atom(args[0] == args[1])))
     });
     funcs.mark_pure("=", 2);
 
     funcs.insert_native("=?", 2, |args, _| {
-        crate::builtins::arithmetic::expect_n_args(args, 2, "=?")?;
-        let unifiable = crate::eval::machine::state::unify(&args[0], &args[1]).is_some();
+        expect_n_args(args, 2, "=?")?;
+        let unifiable = unify(&args[0], &args[1]).is_some();
         Ok(NDet::single(bool_atom(unifiable)))
     });
     funcs.mark_pure("=?", 2);
 
     funcs.insert_native("same", 2, |args, _| {
-        crate::builtins::arithmetic::expect_n_args(args, 2, "same")?;
+        expect_n_args(args, 2, "same")?;
         Ok(NDet::single(bool_atom(args[0] == args[1])))
     });
     funcs.mark_pure("same", 2);
 
     funcs.insert_native("=alpha", 2, |args, _| {
-        crate::builtins::arithmetic::expect_n_args(args, 2, "=alpha")?;
+        expect_n_args(args, 2, "=alpha")?;
         let mut map_ab = std::collections::HashMap::new();
         let mut map_ba = std::collections::HashMap::new();
-        let eq = crate::builtins::arithmetic::alpha_equiv(
-            &args[0],
-            &args[1],
-            &mut map_ab,
-            &mut map_ba,
-        );
+        let eq = alpha_equiv(&args[0], &args[1], &mut map_ab, &mut map_ba);
         Ok(NDet::single(bool_atom(eq)))
     });
     funcs.mark_pure("=alpha", 2);
 
     funcs.insert_native("=@=", 2, |args, _| {
-        crate::builtins::arithmetic::expect_n_args(args, 2, "=@=")?;
+        expect_n_args(args, 2, "=@=")?;
         let mut map_ab = std::collections::HashMap::new();
         let mut map_ba = std::collections::HashMap::new();
-        let eq = crate::builtins::arithmetic::alpha_equiv(
-            &args[0],
-            &args[1],
-            &mut map_ab,
-            &mut map_ba,
-        );
+        let eq = alpha_equiv(&args[0], &args[1], &mut map_ab, &mut map_ba);
         Ok(NDet::single(bool_atom(eq)))
     });
     funcs.mark_pure("=@=", 2);
@@ -112,12 +104,15 @@ fn register_truth_tables(funcs: &FnTable) {
             head.clone(),
             body,
         ]));
-        let def_atom = crate::parser::expr_to_atom(&def_expr);
+        let def_atom = expr_to_atom(&def_expr);
         funcs.space.write().unwrap().add_atom(&def_atom).unwrap();
-        let head_atom = crate::parser::expr_to_atom(&head);
+        let head_atom = expr_to_atom(&head);
         funcs.space.write().unwrap().add_atom(&head_atom).unwrap();
-        let clause = crate::func::Clause {
-            patterns: patterns.iter().map(|p| Expr::Symbol(p.to_string())).collect(),
+        let clause = Clause {
+            patterns: patterns
+                .iter()
+                .map(|p| Expr::Symbol(p.to_string()))
+                .collect(),
             body: Expr::Symbol(body_str.to_string()),
         };
         let arity = clause.patterns.len() as u8;
@@ -125,7 +120,13 @@ fn register_truth_tables(funcs: &FnTable) {
     }
 
     // mark pure
-    for (name, arity) in [("or", 2u8), ("and", 2), ("not", 1), ("xor", 2), ("implies", 2)] {
+    for (name, arity) in [
+        ("or", 2u8),
+        ("and", 2),
+        ("not", 1),
+        ("xor", 2),
+        ("implies", 2),
+    ] {
         funcs.mark_pure(name, arity);
     }
 }

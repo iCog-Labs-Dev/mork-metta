@@ -1,4 +1,4 @@
-use lasso::{ThreadedRodeo, Spur};
+use lasso::{Spur, ThreadedRodeo};
 use std::sync::LazyLock;
 
 static INTERNER: LazyLock<ThreadedRodeo> = LazyLock::new(|| ThreadedRodeo::new());
@@ -25,15 +25,15 @@ impl Symbol {
     pub fn intern(s: &str) -> Self {
         let spur = INTERNER.get_or_intern(s);
         let s_static: &'static str = INTERNER.resolve(&spur);
-        
+
         let mut id = [0u8; 8];
         let spur_val = spur.into_inner().get();
         // Pack the 32-bit spur into the 8-byte array
         id[0..4].copy_from_slice(&spur_val.to_ne_bytes());
-        
+
         Symbol(id, s_static)
     }
-    
+
     #[inline(always)]
     pub fn as_str(&self) -> &'static str {
         self.1

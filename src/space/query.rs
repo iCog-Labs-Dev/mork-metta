@@ -1,14 +1,22 @@
 //! Atomspace query operations.
 
-use crate::atom::Atom;
+use crate::atom::{Atom, expr_data};
 use crate::env::Env;
+use crate::eval::machine::{state::unify, step::run};
+use crate::eval::shared::{
+    env::{bind_all, lookup},
+    subst::subst_expr_vars,
+};
 use crate::func::FnTable;
 use crate::parser::Expr;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::space::core::{MatchResult, Pattern};
+use crate::space::{
+    core::{MatchResult, Pattern},
+    store::get_atoms,
+};
 
 /// Build a space pattern from an expression.
 pub fn pattern_from_expr(expr: &Expr) -> Pattern {
@@ -44,7 +52,7 @@ fn merge_match_bindings(
 fn subst_pattern(pattern: &Pattern, env: &Env) -> Pattern {
     match pattern {
         Pattern::Var(name) => {
-            if let Some(atom) = crate::eval::shared::env::lookup(env, name) {
+            if let Some(atom) = lookup(env, name) {
                 match &atom {
                     Atom::Sym(s) if s.starts_with('$') => Pattern::Var(s.to_string()),
                     _ => Pattern::Exact(atom.clone()),
@@ -84,23 +92,23 @@ pub fn collect_match_results(
                 let subpatterns = &items[1..];
                 // Evaluate the first subpattern serially to get the initial binding sets.
                 let initial = collect_match_results(funcs, space_ref, &subpatterns[0], env)?;
-                let initial_bindings: Vec<Vec<(Arc<str>, Arc<Atom>)>> = initial
-                    .into_iter()
-                    .map(|m| m.bindings)
-                    .collect();
+                let initial_bindings: Vec<Vec<(Arc<str>, Arc<Atom>)>> =
+                    initial.into_iter().map(|m| m.bindings).collect();
 
                 // Each initial binding is an independent search branch for the remaining
                 // subpatterns. Spawn one rayon task per initial binding — coarse-grained
                 // tasks with significant work per task (the full remaining conjunction).
                 // RwLock on space allows concurrent readers.
                 let remaining = &subpatterns[1..];
-                let remaining_compiled: Vec<Pattern> = remaining.iter().map(pattern_from_expr).collect();
+                let remaining_compiled: Vec<Pattern> =
+                    remaining.iter().map(pattern_from_expr).collect();
 
                 // ponytail: compute parallelism decision once, before allocating the vec.
                 // Conditions: work must exceed thread-spawn overhead (~100μs), and we must
                 // not double-parallelize when remaining subpatterns are pure space lookups
                 // (those are better parallelized at the match_atoms level inside the space).
-                let all_remaining_pure = remaining_compiled.iter().all(|p| p.is_pure_space_lookup());
+                let all_remaining_pure =
+                    remaining_compiled.iter().all(|p| p.is_pure_space_lookup());
                 let n_workers = rayon::current_num_threads();
                 // Minimum ~8 results per thread to justify parallel dispatch overhead.
                 // When all remaining subpatterns are pure space lookups, skip par_iter here —
@@ -118,8 +126,7 @@ pub fn collect_match_results(
                             for subpattern in &remaining_compiled {
                                 let mut next = Vec::new();
                                 for bindings in &bindings_sets {
-                                    let bound_env =
-                                        crate::eval::shared::env::bind_all(env, bindings);
+                                    let bound_env = bind_all(env, bindings);
                                     let submatches = collect_match_results_pattern(
                                         funcs, space_ref, subpattern, &bound_env,
                                     )?;
@@ -148,9 +155,10 @@ pub fn collect_match_results(
                     for subpattern in &remaining_compiled {
                         let mut next = Vec::new();
                         for bindings in &bindings_sets {
-                            let bound_env = crate::eval::shared::env::bind_all(env, bindings);
-                            let submatches =
-                                collect_match_results_pattern(funcs, space_ref, subpattern, &bound_env)?;
+                            let bound_env = bind_all(env, bindings);
+                            let submatches = collect_match_results_pattern(
+                                funcs, space_ref, subpattern, &bound_env,
+                            )?;
                             for matched in &submatches {
                                 if let Some(merged) =
                                     merge_match_bindings(bindings, &matched.bindings)
@@ -169,7 +177,7 @@ pub fn collect_match_results(
                 return Ok(results
                     .into_iter()
                     .map(|bindings| MatchResult {
-                        atom: Atom::Expr(crate::atom::expr_data([Atom::sym(",")])),
+                        atom: Atom::Expr(expr_data([Atom::sym(",")])),
                         bindings,
                     })
                     .collect());
@@ -177,14 +185,14 @@ pub fn collect_match_results(
         }
     }
 
-    let substituted = crate::eval::shared::subst::subst_expr_vars(pattern_expr, env);
+    let substituted = subst_expr_vars(pattern_expr, env);
     let pattern = pattern_from_expr(&substituted);
     match_in_space(funcs, space_ref, &pattern)
 }
 
 /// Evaluate a space reference expression and return its first produced atom.
 pub fn eval_space_ref(expr: &Expr, env: &Env, funcs: &FnTable) -> Result<Atom, String> {
-    crate::eval::machine::step::run(expr, env, funcs)?
+    run(expr, env, funcs)?
         .into_iter()
         .next()
         .ok_or_else(|| "space expression produced no results".to_string())
@@ -202,17 +210,20 @@ pub fn transform_matches(
                 .get(symbol.as_ref())
                 .cloned()
                 .unwrap_or_else(|| atom.clone()),
-            Atom::Expr(items) => {
-                Atom::expr(items.iter().map(|item| apply_subst(item, subst)).collect::<Vec<_>>())
-            }
+            Atom::Expr(items) => Atom::expr(
+                items
+                    .iter()
+                    .map(|item| apply_subst(item, subst))
+                    .collect::<Vec<_>>(),
+            ),
             _ => atom.clone(),
         }
     }
 
-    let atoms = crate::space::store::get_atoms(funcs, &Atom::sym("&self"))?;
+    let atoms = get_atoms(funcs, &Atom::sym("&self"))?;
     let mut out = Vec::new();
     for atom in atoms {
-        if let Some(subst) = crate::eval::machine::state::unify(&atom, pattern) {
+        if let Some(subst) = unify(&atom, pattern) {
             out.push(apply_subst(replacement, &subst));
         }
     }

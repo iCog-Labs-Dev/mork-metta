@@ -1,8 +1,10 @@
 //! Atomspace mutation operations.
 
 use crate::atom::Atom;
-use crate::func::FnTable;
-use crate::space::Space;
+use crate::compile::compile_definition;
+use crate::func::{Clause, Effect, FnTable};
+use crate::parser::atom_to_expr;
+use crate::space::{MorkSpace, Space};
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -18,9 +20,9 @@ pub struct TransactionSnapshot {
     /// Values stored in the state map.
     pub state: HashMap<String, Atom>,
     /// Cached user clause lookup results.
-    pub fn_cache: HashMap<String, HashMap<u8, Vec<crate::func::Clause>>>,
+    pub fn_cache: HashMap<String, HashMap<u8, Vec<Clause>>>,
     /// Cached function purity results.
-    pub fn_effect: HashMap<String, HashMap<u8, crate::func::Effect>>,
+    pub fn_effect: HashMap<String, HashMap<u8, Effect>>,
 }
 
 /// Add an atom to a resolved space.
@@ -44,7 +46,9 @@ pub fn add_atom(funcs: &FnTable, space_ref: &Atom, atom: &Atom) -> Result<(), St
 /// is skipped since data forms never define functions.
 // ponytail: skip per-atom bump_memo_stamp — one stamp at end
 pub fn add_atoms_bulk(funcs: &FnTable, space_ref: &Atom, atoms: &[Atom]) -> Result<(), String> {
-    if atoms.is_empty() { return Ok(()); }
+    if atoms.is_empty() {
+        return Ok(());
+    }
     funcs.with_resolved_space(space_ref, |space| space.add_atoms_bulk(atoms))?;
     funcs.bump_memo_stamp();
     if matches!(space_ref, Atom::Sym(name) if name.as_ref() == "&self") {
@@ -107,8 +111,8 @@ fn maybe_cache_definition_atom(atom: &Atom, funcs: &FnTable) {
 }
 
 fn cache_definition_atom(atom: &Atom, funcs: &FnTable) -> Result<(), String> {
-    let expr = crate::parser::atom_to_expr(atom)?;
-    let (name, clause) = crate::compile::compile_definition(&expr)?;
+    let expr = atom_to_expr(atom)?;
+    let (name, clause) = compile_definition(&expr)?;
     funcs.cache_fn(&name, clause.patterns.len() as u8, clause);
     Ok(())
 }
@@ -120,8 +124,8 @@ fn maybe_uncache_definition_atom(atom: &Atom, funcs: &FnTable) {
 }
 
 fn uncache_definition_atom(atom: &Atom, funcs: &FnTable) -> Result<(), String> {
-    let expr = crate::parser::atom_to_expr(atom)?;
-    let (name, clause) = crate::compile::compile_definition(&expr)?;
+    let expr = atom_to_expr(atom)?;
+    let (name, clause) = compile_definition(&expr)?;
     funcs.uncache_fn(&name, clause.patterns.len() as u8);
     Ok(())
 }
@@ -170,10 +174,8 @@ pub fn restore_transaction_state(
     snapshot: TransactionSnapshot,
     funcs: &FnTable,
 ) -> Result<(), String> {
-    fn rebuild_space(
-        atoms: &[Atom],
-    ) -> Result<Box<dyn crate::space::Space + Send + Sync>, String> {
-        let space = crate::space::MorkSpace::new();
+    fn rebuild_space(atoms: &[Atom]) -> Result<Box<dyn Space + Send + Sync>, String> {
+        let space = MorkSpace::new();
         for atom in atoms {
             space.add_atom(atom)?;
         }

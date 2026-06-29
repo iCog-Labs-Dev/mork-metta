@@ -4,7 +4,7 @@
 //! and `crate::space::Space` / `crate::space::MorkSpace` resolve correctly
 //! after the swap.
 
-use crate::atom::Atom;
+use crate::atom::{Atom, Numeric, expr_data};
 use crate::parser::Expr;
 use mork_frontend::bytestring_parser::Parser;
 use rayon::prelude::*;
@@ -29,7 +29,7 @@ impl Pattern {
                 .iter()
                 .map(|p| p.as_ground_atom())
                 .collect::<Option<Vec<_>>>()
-                .map(|v| Atom::Expr(crate::atom::expr_data(v))),
+                .map(|v| Atom::Expr(expr_data(v))),
         }
     }
 
@@ -554,7 +554,7 @@ fn symbol_to_atom(s: &str) -> Atom {
     let digits = s.strip_prefix('-').unwrap_or(s);
     if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
         if let Ok(n) = s.parse::<dashu::Integer>() {
-            return Atom::Num(crate::atom::Numeric::Int(n));
+            return Atom::Num(Numeric::Int(n));
         }
     }
     Atom::sym(s)
@@ -608,7 +608,7 @@ fn decode_children(b: &[u8], pos: &mut usize, var_count: &mut u8, n: usize) -> O
     for _ in 0..n {
         items.push(decode_one(b, pos, var_count)?);
     }
-    Some(Atom::Expr(crate::atom::expr_data(items)))
+    Some(Atom::Expr(expr_data(items)))
 }
 
 fn match_one(pattern: &Pattern, atom: &Atom) -> Option<MatchResult> {
@@ -742,7 +742,7 @@ fn parse_value(chars: &[char], pos: &mut usize) -> Result<Atom, String> {
                 }
                 if chars[*pos] == ')' {
                     *pos += 1;
-                    return Ok(Atom::Expr(crate::atom::expr_data(items)));
+                    return Ok(Atom::Expr(expr_data(items)));
                 }
                 items.push(parse_value(chars, pos)?);
             }
@@ -772,7 +772,7 @@ fn parse_value(chars: &[char], pos: &mut usize) -> Result<Atom, String> {
             let n: dashu::Integer = num_str
                 .parse()
                 .map_err(|_| format!("invalid number: {}", num_str))?;
-            Ok(Atom::Num(crate::atom::Numeric::Int(n)))
+            Ok(Atom::Num(Numeric::Int(n)))
         }
         c if c.is_alphanumeric() || "$!?<>=+-*/_".contains(c) => {
             let start = *pos;

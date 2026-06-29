@@ -1,3 +1,4 @@
+use crate::Env;
 /// Python bridge via PyO3.
 ///
 /// Implements `(py-call ...)` and `(py-eval ...)` for calling Python
@@ -5,17 +6,15 @@
 ///
 /// Opaque Python values are stored as `Atom::Gnd(PyObjectGrounded)` —
 /// no conversion cost for complex objects.
-use crate::atom::{Atom, Grounded};
-use crate::Env;
+use crate::atom::{Atom, Grounded, Numeric};
+use crate::eval::machine::step::run_rs;
+use crate::func::{FnTable, NDet};
+use crate::parser::Expr;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 /// Evaluate `(py-call expr)` — single-expression Python call.
-pub(crate) fn eval_py_call(
-    args: &[crate::parser::Expr],
-    env: &Env,
-    _funcs: &crate::func::FnTable,
-) -> Result<crate::func::NDet, String> {
+pub(crate) fn eval_py_call(args: &[Expr], env: &Env, _funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 1 {
         return Err(format!(
             "py-call: expected 1 arg (a Python expression), got {}",
@@ -31,7 +30,7 @@ pub(crate) fn eval_py_call(
             // expr_to_py already evaluates function calls for list expressions
             // (e.g. ("round" 3.14 2) → round(3.14, 2) → returns float result).
             // For bare symbols, it resolves to the Python object directly.
-            Ok(crate::func::NDet::single(atom_from_py(&py_obj)))
+            Ok(single(atom_from_py(&py_obj)))
         })
     }
     #[cfg(not(feature = "python-bridge"))]
@@ -44,11 +43,7 @@ pub(crate) fn eval_py_call(
 }
 
 /// Evaluate `(py-eval "code")` — evaluate arbitrary Python code string.
-pub(crate) fn eval_py_eval(
-    args: &[crate::parser::Expr],
-    _env: &Env,
-    _funcs: &crate::func::FnTable,
-) -> Result<crate::func::NDet, String> {
+pub(crate) fn eval_py_eval(args: &[Expr], _env: &Env, _funcs: &FnTable) -> Result<NDet, String> {
     if args.len() != 1 {
         return Err(format!(
             "py-eval: expected 1 arg (a string of Python code), got {}",
@@ -56,10 +51,8 @@ pub(crate) fn eval_py_eval(
         ));
     }
     let code = match &args[0] {
-        crate::parser::Expr::Str(s) => s.clone(),
-        other => {
-            return Err(format!("py-eval: expected a string, got {:?}", other))
-        }
+        Expr::Str(s) => s.clone(),
+        other => return Err(format!("py-eval: expected a string, got {:?}", other)),
     };
     #[cfg(feature = "python-bridge")]
     {
@@ -70,7 +63,7 @@ pub(crate) fn eval_py_eval(
             let result = py
                 .eval(&c_code, None, None)
                 .map_err(|e| format!("py-eval: error: {}", e))?;
-            Ok(crate::func::NDet::single(atom_from_py(&result)))
+            Ok(single(atom_from_py(&result)))
         })
     }
     #[cfg(not(feature = "python-bridge"))]
@@ -87,15 +80,15 @@ pub(crate) fn eval_py_eval(
 fn init_venv_path(py: pyo3::Python<'_>) -> Result<(), String> {
     use pyo3::types::PyAnyMethods;
 
-    let venv_root = std::env::var("VIRTUAL_ENV")
-        .ok()
-        .or_else(find_venv_dir);
+    let venv_root = std::env::var("VIRTUAL_ENV").ok().or_else(find_venv_dir);
     let Some(root) = venv_root else { return Ok(()) };
     let root_path = Path::new(&root);
 
     // Read pyvenv.cfg to determine the Python version directory
     let ver = read_pyvenv_version(root_path)?;
-    let site_pkg = root_path.join("lib").join(format!("python{ver}/site-packages"));
+    let site_pkg = root_path
+        .join("lib")
+        .join(format!("python{ver}/site-packages"));
     if !site_pkg.is_dir() {
         return Ok(());
     }
@@ -218,9 +211,9 @@ pub(crate) fn eval_py_import_library(file_path: &std::path::Path) -> Result<(), 
 #[cfg(feature = "python-bridge")]
 fn atom_from_py(obj: &pyo3::Bound<'_, pyo3::types::PyAny>) -> Atom {
     use pyo3::types::PyAnyMethods;
+    use pyo3::types::PyDictMethods;
     use pyo3::types::PyListMethods;
     use pyo3::types::PyTupleMethods;
-    use pyo3::types::PyDictMethods;
 
     // None → empty list
     if obj.is_none() {
@@ -314,12 +307,7 @@ impl Grounded for PyObjectGrounded {
             if self.obj.as_ptr() == other.obj.as_ptr() {
                 return true;
             }
-            pyo3::Python::with_gil(|py| {
-                self.obj
-                    .bind(py)
-                    .eq(other.obj.bind(py))
-                    .unwrap_or(false)
-            })
+            pyo3::Python::with_gil(|py| self.obj.bind(py).eq(other.obj.bind(py)).unwrap_or(false))
         } else {
             false
         }
@@ -350,8 +338,7 @@ fn atom_to_py<'py>(
             } else if let Ok(val) = s.parse::<f64>() {
                 Ok(val.into_py(py).into_bound(py))
             } else {
-                let ps: pyo3::Bound<'_, pyo3::types::PyString> =
-                    pyo3::types::PyString::new(py, s);
+                let ps: pyo3::Bound<'_, pyo3::types::PyString> = pyo3::types::PyString::new(py, s);
                 Ok(ps.into_any())
             }
         }
@@ -361,13 +348,12 @@ fn atom_to_py<'py>(
             } else if let Ok(val) = s.parse::<f64>() {
                 Ok(val.into_py(py).into_bound(py))
             } else {
-                let ps: pyo3::Bound<'_, pyo3::types::PyString> =
-                    pyo3::types::PyString::new(py, s);
+                let ps: pyo3::Bound<'_, pyo3::types::PyString> = pyo3::types::PyString::new(py, s);
                 Ok(ps.into_any())
             }
         }
         Atom::Num(n) => match n {
-            crate::atom::Numeric::Int(i) => {
+            Int(i) => {
                 let is = i.to_string();
                 if let Ok(val) = is.parse::<i64>() {
                     Ok(val.into_py(py).into_bound(py))
@@ -375,7 +361,7 @@ fn atom_to_py<'py>(
                     Ok(is.into_py(py).into_bound(py))
                 }
             }
-            crate::atom::Numeric::Dec(d) => {
+            Dec(d) => {
                 let ds = d.to_string();
                 if let Ok(val) = ds.parse::<f64>() {
                     Ok(val.into_py(py).into_bound(py))
@@ -396,8 +382,7 @@ fn atom_to_py<'py>(
         Atom::Closure(c) => {
             let param_strs: Vec<String> = c.params.iter().map(|p| p.to_string()).collect();
             let s = format!("(|-> ({}) {})", param_strs.join(" "), c.body.to_string());
-            let ps: pyo3::Bound<'_, pyo3::types::PyString> =
-                pyo3::types::PyString::new(py, &s);
+            let ps: pyo3::Bound<'_, pyo3::types::PyString> = pyo3::types::PyString::new(py, &s);
             Ok(ps.into_any())
         }
         Atom::Gnd(g) => {
@@ -420,30 +405,29 @@ fn atom_to_py<'py>(
 /// MeTTa env. Lists become Python function calls or nested forms.
 #[cfg(feature = "python-bridge")]
 fn expr_to_py<'py>(
-    expr: &crate::parser::Expr,
+    expr: &Expr,
     env: &Env,
-    funcs: &crate::func::FnTable,
+    funcs: &FnTable,
     py: pyo3::Python<'py>,
 ) -> Result<pyo3::Bound<'py, pyo3::types::PyAny>, String> {
     use pyo3::prelude::*;
     use pyo3::types::PyAnyMethods;
     match expr {
-        crate::parser::Expr::Symbol(name) => {
+        Expr::Symbol(name) => {
             if name.starts_with('$') {
-                let val = env.get(name).ok_or_else(|| {
-                    format!("py-call: undefined variable '{}'", name)
-                })?;
+                let val = env
+                    .get(name)
+                    .ok_or_else(|| format!("py-call: undefined variable '{}'", name))?;
                 return atom_to_py(&val, py);
             }
             resolve_python_name(name, py)
         }
-        crate::parser::Expr::Str(s) => {
-            let ps: pyo3::Bound<'_, pyo3::types::PyString> =
-                pyo3::types::PyString::new(py, s);
+        Expr::Str(s) => {
+            let ps: pyo3::Bound<'_, pyo3::types::PyString> = pyo3::types::PyString::new(py, s);
             Ok(ps.into_any())
         }
-        crate::parser::Expr::Number(n) => match n {
-            crate::atom::Numeric::Int(i) => {
+        Expr::Number(n) => match n {
+            Int(i) => {
                 let is = i.to_string();
                 if let Ok(val) = is.parse::<i64>() {
                     Ok(val.into_py(py).into_bound(py))
@@ -451,7 +435,7 @@ fn expr_to_py<'py>(
                     Ok(is.into_py(py).into_bound(py))
                 }
             }
-            crate::atom::Numeric::Dec(d) => {
+            Dec(d) => {
                 let ds = d.to_string();
                 if let Ok(val) = ds.parse::<f64>() {
                     Ok(val.into_py(py).into_bound(py))
@@ -460,7 +444,7 @@ fn expr_to_py<'py>(
                 }
             }
         },
-        crate::parser::Expr::List(items) => {
+        Expr::List(items) => {
             if items.is_empty() {
                 let empty_code = std::ffi::CString::new("()")
                     .map_err(|e| format!("py-call: invalid empty tuple code: {}", e))?;
@@ -469,48 +453,48 @@ fn expr_to_py<'py>(
                     .map_err(|e| format!("py-call: cannot create empty tuple: {}", e))?)
             } else {
                 match &items[0] {
-                    crate::parser::Expr::Symbol(head) if head == "py-call" => {
+                    Expr::Symbol(head) if head == "py-call" => {
                         if items.len() < 2 {
                             return Err("py-call: nested py-call needs an argument".into());
                         }
                         if items.len() == 2 {
                             expr_to_py(&items[1], env, funcs, py)
                         } else {
-                            let inner =
-                                crate::parser::Expr::List(items[1..].to_vec().into());
+                            let inner = Expr::List(items[1..].to_vec().into());
                             expr_to_py(&inner, env, funcs, py)
                         }
                     }
-                    crate::parser::Expr::Symbol(head) if head == "py-eval" => {
+                    Expr::Symbol(head) if head == "py-eval" => {
                         if items.len() < 2 {
                             return Err("py-call: nested py-eval needs an argument".into());
                         }
                         let code = match &items[1] {
-                            crate::parser::Expr::Str(s) => s.clone(),
+                            Expr::Str(s) => s.clone(),
                             other => {
                                 return Err(format!(
                                     "py-call: nested py-eval expects a string, got {:?}",
                                     other
-                                ))
+                                ));
                             }
                         };
-                        let c_code = std::ffi::CString::new(code)
-                            .map_err(|e| format!("py-call: invalid code in nested py-eval: {}", e))?;
-                        let result = py.eval(&c_code, None, None).map_err(|e| {
-                            format!("py-call: nested py-eval failed: {}", e)
+                        let c_code = std::ffi::CString::new(code).map_err(|e| {
+                            format!("py-call: invalid code in nested py-eval: {}", e)
                         })?;
+                        let result = py
+                            .eval(&c_code, None, None)
+                            .map_err(|e| format!("py-call: nested py-eval failed: {}", e))?;
                         Ok(result)
                     }
                     _ => {
                         // Normal function call: (func arg1 arg2 ...)
-                        let func_obj = if let crate::parser::Expr::Str(name) = &items[0] {
+                        let func_obj = if let Expr::Str(name) = &items[0] {
                             resolve_python_name(name, py)?
                         } else {
                             expr_to_py(&items[0], env, funcs, py)?
                         };
                         let mut args: Vec<pyo3::Bound<'_, pyo3::types::PyAny>> = Vec::new();
                         for arg in &items[1..] {
-                            let atom = crate::eval::machine::step::run_rs(
+                            let atom = run_rs(
                                 std::sync::Arc::new(arg.clone()),
                                 env.clone(),
                                 funcs,
@@ -520,7 +504,7 @@ fn expr_to_py<'py>(
                             .into_iter()
                             .next()
                             .map(|(a, _)| a)
-                            .unwrap_or_else(|| crate::atom::Atom::sym("()"));
+                            .unwrap_or_else(|| Atom::sym("()"));
                             args.push(atom_to_py(&atom, py)?);
                         }
                         let args_tuple = pyo3::types::PyTuple::new(py, args.as_slice())
@@ -557,14 +541,12 @@ fn resolve_python_name<'py>(
         b
     } else {
         // Not a builtin — try as a top-level import
-        let mod_obj = py
-            .import(first)
-            .map_err(|e| {
-                format!(
-                    "py-call: cannot resolve '{}' (not a builtin or module): {}",
-                    first, e
-                )
-            })?;
+        let mod_obj = py.import(first).map_err(|e| {
+            format!(
+                "py-call: cannot resolve '{}' (not a builtin or module): {}",
+                first, e
+            )
+        })?;
         mod_obj.into_any()
     };
 
@@ -573,9 +555,7 @@ fn resolve_python_name<'py>(
     for part in &parts[1..] {
         current = current
             .getattr(*part)
-            .map_err(|e| {
-                format!("py-call: cannot resolve '{}': {}", parts[..].join("."), e)
-            })?;
+            .map_err(|e| format!("py-call: cannot resolve '{}': {}", parts[..].join("."), e))?;
     }
     Ok(current.into_any())
 }

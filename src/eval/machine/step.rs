@@ -3,9 +3,9 @@
 //! This module advances the evaluator by repeatedly dispatching expressions,
 //! applying continuation frames, and executing direct state transitions.
 
-use super::budget::{atoms_of, ResultSet};
+use super::budget::{ResultSet, atoms_of};
 use crate::atom::Atom;
-use crate::env::Env;
+use crate::env::{Env, clear_lookup_cache};
 use crate::func::{FnTable, NDet};
 use crate::parser::Expr;
 use std::sync::Arc;
@@ -41,18 +41,22 @@ pub(crate) fn run_rs(
     funcs: &FnTable,
     budget: &mut Option<i64>,
 ) -> Result<ResultSet, String> {
-    crate::env::clear_lookup_cache();
+    clear_lookup_cache();
     super::vm::compiler::set_current_funcs(funcs);
 
     // Compiling with bytecode VM
     let mut comp = super::vm::VMCompiler::new(&[], None);
     let mut code = Vec::new();
     comp.compile(&root, &mut code, false)?;
-    let state = super::vm::VMState::new(std::sync::Arc::from(code), std::sync::Arc::from(comp.free_vars.clone()), *budget);
+    let state = super::vm::VMState::new(
+        std::sync::Arc::from(code),
+        std::sync::Arc::from(comp.free_vars.clone()),
+        *budget,
+    );
     let mut sub_env = root_env.clone();
     for (i, name) in comp.free_vars.iter().enumerate() {
         if let Some(val) = root_env.get(name) {
-            if let crate::atom::Atom::Sym(fresh_name) = &state.free_vars_bindings[i] {
+            if let Atom::Sym(fresh_name) = &state.free_vars_bindings[i] {
                 sub_env = sub_env.extend(fresh_name, val.clone());
             }
         }

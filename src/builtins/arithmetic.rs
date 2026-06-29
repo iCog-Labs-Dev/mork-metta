@@ -1,7 +1,9 @@
 //! Builtins for numeric operations.
 
 use crate::atom::{Atom, Numeric};
+use crate::builtins::boolean::bool_atom;
 use crate::func::{FnTable, NDet};
+use crate::symbol::Symbol;
 
 /// Convert a Numeric to f64 for operations that need a floating-point value.
 fn numeric_as_f64(n: &Numeric) -> f64 {
@@ -119,8 +121,8 @@ pub fn expect_n_args(args: &[Atom], n: usize, name: &str) -> Result<(), String> 
 pub(crate) fn alpha_equiv(
     a: &Atom,
     b: &Atom,
-    map_ab: &mut std::collections::HashMap<crate::symbol::Symbol, crate::symbol::Symbol>,
-    map_ba: &mut std::collections::HashMap<crate::symbol::Symbol, crate::symbol::Symbol>,
+    map_ab: &mut std::collections::HashMap<Symbol, Symbol>,
+    map_ba: &mut std::collections::HashMap<Symbol, Symbol>,
 ) -> bool {
     match (a, b) {
         (Atom::Sym(sa), Atom::Sym(sb)) => {
@@ -190,8 +192,8 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
         expect_n_args(args, 2, "%")?;
         Ok(NDet::single(match (&args[0], &args[1]) {
             (Atom::Num(a), Atom::Num(b)) => numeric_rem(a, b)
-                    .map(Atom::Num)
-                    .unwrap_or_else(|e| Atom::sym(&e)),
+                .map(Atom::Num)
+                .unwrap_or_else(|e| Atom::sym(&e)),
             _ => f64_to_atom(atom_as_f64(&args[0], "%")? % atom_as_f64(&args[1], "%")?),
         }))
     });
@@ -199,7 +201,7 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
 
     funcs.insert_native("<", 2, |args, _| {
         expect_n_args(args, 2, "<")?;
-        Ok(NDet::single(crate::builtins::boolean::bool_atom(match (&args[0], &args[1]) {
+        Ok(NDet::single(bool_atom(match (&args[0], &args[1]) {
             (Atom::Num(a), Atom::Num(b)) => numeric_cmp(a, b) == std::cmp::Ordering::Less,
             _ => atom_as_f64(&args[0], "<")? < atom_as_f64(&args[1], "<")?,
         })))
@@ -208,7 +210,7 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
 
     funcs.insert_native(">", 2, |args, _| {
         expect_n_args(args, 2, ">")?;
-        Ok(NDet::single(crate::builtins::boolean::bool_atom(match (&args[0], &args[1]) {
+        Ok(NDet::single(bool_atom(match (&args[0], &args[1]) {
             (Atom::Num(a), Atom::Num(b)) => numeric_cmp(a, b) == std::cmp::Ordering::Greater,
             _ => atom_as_f64(&args[0], ">")? > atom_as_f64(&args[1], ">")?,
         })))
@@ -217,7 +219,7 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
 
     funcs.insert_native("<=", 2, |args, _| {
         expect_n_args(args, 2, "<=")?;
-        Ok(NDet::single(crate::builtins::boolean::bool_atom(match (&args[0], &args[1]) {
+        Ok(NDet::single(bool_atom(match (&args[0], &args[1]) {
             (Atom::Num(a), Atom::Num(b)) => numeric_cmp(a, b) != std::cmp::Ordering::Greater,
             _ => atom_as_f64(&args[0], "<=")? <= atom_as_f64(&args[1], "<=")?,
         })))
@@ -226,7 +228,7 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
 
     funcs.insert_native(">=", 2, |args, _| {
         expect_n_args(args, 2, ">=")?;
-        Ok(NDet::single(crate::builtins::boolean::bool_atom(match (&args[0], &args[1]) {
+        Ok(NDet::single(bool_atom(match (&args[0], &args[1]) {
             (Atom::Num(a), Atom::Num(b)) => numeric_cmp(a, b) != std::cmp::Ordering::Less,
             _ => atom_as_f64(&args[0], ">=")? >= atom_as_f64(&args[1], ">=")?,
         })))
@@ -240,51 +242,75 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
     });
     funcs.mark_pure("sqrt-math", 1);
     funcs.insert_native("abs-math", 1, |args, _| {
-        Ok(NDet::single(f64_to_atom(atom_as_f64(&args[0], "abs-math")?.abs())))
+        Ok(NDet::single(f64_to_atom(
+            atom_as_f64(&args[0], "abs-math")?.abs(),
+        )))
     });
     funcs.mark_pure("abs-math", 1);
     funcs.insert_native("trunc-math", 1, |args, _| {
-        Ok(NDet::single(f64_to_atom(atom_as_f64(&args[0], "trunc-math")?.trunc())))
+        Ok(NDet::single(f64_to_atom(
+            atom_as_f64(&args[0], "trunc-math")?.trunc(),
+        )))
     });
     funcs.mark_pure("trunc-math", 1);
     funcs.insert_native("ceil-math", 1, |args, _| {
-        Ok(NDet::single(f64_to_atom(atom_as_f64(&args[0], "ceil-math")?.ceil())))
+        Ok(NDet::single(f64_to_atom(
+            atom_as_f64(&args[0], "ceil-math")?.ceil(),
+        )))
     });
     funcs.mark_pure("ceil-math", 1);
     funcs.insert_native("floor-math", 1, |args, _| {
-        Ok(NDet::single(f64_to_atom(atom_as_f64(&args[0], "floor-math")?.floor())))
+        Ok(NDet::single(f64_to_atom(
+            atom_as_f64(&args[0], "floor-math")?.floor(),
+        )))
     });
     funcs.mark_pure("floor-math", 1);
     funcs.insert_native("round-math", 1, |args, _| {
-        Ok(NDet::single(f64_to_atom(atom_as_f64(&args[0], "round-math")?.round())))
+        Ok(NDet::single(f64_to_atom(
+            atom_as_f64(&args[0], "round-math")?.round(),
+        )))
     });
     funcs.mark_pure("round-math", 1);
     funcs.insert_native("sin-math", 1, |args, _| {
-        Ok(NDet::single(f64_to_float_atom(atom_as_f64(&args[0], "sin-math")?.sin())))
+        Ok(NDet::single(f64_to_float_atom(
+            atom_as_f64(&args[0], "sin-math")?.sin(),
+        )))
     });
     funcs.mark_pure("sin-math", 1);
     funcs.insert_native("asin-math", 1, |args, _| {
-        Ok(NDet::single(f64_to_float_atom(atom_as_f64(&args[0], "asin-math")?.asin())))
+        Ok(NDet::single(f64_to_float_atom(
+            atom_as_f64(&args[0], "asin-math")?.asin(),
+        )))
     });
     funcs.mark_pure("asin-math", 1);
     funcs.insert_native("cos-math", 1, |args, _| {
-        Ok(NDet::single(f64_to_float_atom(atom_as_f64(&args[0], "cos-math")?.cos())))
+        Ok(NDet::single(f64_to_float_atom(
+            atom_as_f64(&args[0], "cos-math")?.cos(),
+        )))
     });
     funcs.mark_pure("cos-math", 1);
     funcs.insert_native("acos-math", 1, |args, _| {
-        Ok(NDet::single(f64_to_float_atom(atom_as_f64(&args[0], "acos-math")?.acos())))
+        Ok(NDet::single(f64_to_float_atom(
+            atom_as_f64(&args[0], "acos-math")?.acos(),
+        )))
     });
     funcs.mark_pure("acos-math", 1);
     funcs.insert_native("tan-math", 1, |args, _| {
-        Ok(NDet::single(f64_to_float_atom(atom_as_f64(&args[0], "tan-math")?.tan())))
+        Ok(NDet::single(f64_to_float_atom(
+            atom_as_f64(&args[0], "tan-math")?.tan(),
+        )))
     });
     funcs.mark_pure("tan-math", 1);
     funcs.insert_native("atan-math", 1, |args, _| {
-        Ok(NDet::single(f64_to_float_atom(atom_as_f64(&args[0], "atan-math")?.atan())))
+        Ok(NDet::single(f64_to_float_atom(
+            atom_as_f64(&args[0], "atan-math")?.atan(),
+        )))
     });
     funcs.mark_pure("atan-math", 1);
     funcs.insert_native("exp", 1, |args, _| {
-        Ok(NDet::single(f64_to_float_atom(atom_as_f64(&args[0], "exp")?.exp())))
+        Ok(NDet::single(f64_to_float_atom(
+            atom_as_f64(&args[0], "exp")?.exp(),
+        )))
     });
     funcs.mark_pure("exp", 1);
 
@@ -316,13 +342,13 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
 
     funcs.insert_native("isnan-math", 1, |args, _| {
         let x = atom_as_f64(&args[0], "isnan-math")?;
-        Ok(NDet::single(crate::builtins::boolean::bool_atom(x.is_nan())))
+        Ok(NDet::single(bool_atom(x.is_nan())))
     });
     funcs.mark_pure("isnan-math", 1);
 
     funcs.insert_native("isinf-math", 1, |args, _| {
         let x = atom_as_f64(&args[0], "isinf-math")?;
-        Ok(NDet::single(crate::builtins::boolean::bool_atom(x.is_infinite())))
+        Ok(NDet::single(bool_atom(x.is_infinite())))
     });
     funcs.mark_pure("isinf-math", 1);
 
@@ -363,43 +389,61 @@ pub fn register_arithmetic_builtins(funcs: &FnTable) {
             pairs.push((atom_as_f64(item, "sort-math")?, item.clone()));
         }
         pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(NDet::single(Atom::expr(pairs.into_iter().map(|(_, a)| a).collect::<Vec<_>>())))
+        Ok(NDet::single(Atom::expr(
+            pairs.into_iter().map(|(_, a)| a).collect::<Vec<_>>(),
+        )))
     });
     funcs.mark_pure("sort-math", 1);
 
     // random-int Min Max → integer in [Min, Max] inclusive
     // random-int &rng Min Max → same (rng arg ignored, stateless thread_rng)
     funcs.insert_native("random-int", 2, |args, _| {
-        let (min, max) = (atom_as_f64(&args[0], "random-int")? as i64,
-                         atom_as_f64(&args[1], "random-int")? as i64);
-        if min > max { return Err(format!("random-int: min {min} > max {max}")); }
+        let (min, max) = (
+            atom_as_f64(&args[0], "random-int")? as i64,
+            atom_as_f64(&args[1], "random-int")? as i64,
+        );
+        if min > max {
+            return Err(format!("random-int: min {min} > max {max}"));
+        }
         use rand::Rng;
         let n = rand::thread_rng().gen_range(min..=max);
-        Ok(NDet::single(Atom::Num(Numeric::Int(dashu::Integer::from(n)))))
+        Ok(NDet::single(Atom::Num(Numeric::Int(dashu::Integer::from(
+            n,
+        )))))
     });
 
     funcs.insert_native("random-int", 3, |args, _| {
         // args[0] may be &rng symbol — skip it, use args[1]/args[2]
-        let (min, max) = (atom_as_f64(&args[1], "random-int")? as i64,
-                         atom_as_f64(&args[2], "random-int")? as i64);
-        if min > max { return Err(format!("random-int: min {min} > max {max}")); }
+        let (min, max) = (
+            atom_as_f64(&args[1], "random-int")? as i64,
+            atom_as_f64(&args[2], "random-int")? as i64,
+        );
+        if min > max {
+            return Err(format!("random-int: min {min} > max {max}"));
+        }
         use rand::Rng;
         let n = rand::thread_rng().gen_range(min..=max);
-        Ok(NDet::single(Atom::Num(Numeric::Int(dashu::Integer::from(n)))))
+        Ok(NDet::single(Atom::Num(Numeric::Int(dashu::Integer::from(
+            n,
+        )))))
     });
 
     // random-float Min Max → float in [Min, Max)
     // random-float &rng Min Max → same
     funcs.insert_native("random-float", 2, |args, _| {
-        let (min, max) = (atom_as_f64(&args[0], "random-float")?,
-                         atom_as_f64(&args[1], "random-float")?);
+        let (min, max) = (
+            atom_as_f64(&args[0], "random-float")?,
+            atom_as_f64(&args[1], "random-float")?,
+        );
         let r: f64 = rand::random();
         Ok(NDet::single(f64_to_atom(min + r * (max - min))))
     });
 
     funcs.insert_native("random-float", 3, |args, _| {
-        let (min, max) = (atom_as_f64(&args[1], "random-float")?,
-                         atom_as_f64(&args[2], "random-float")?);
+        let (min, max) = (
+            atom_as_f64(&args[1], "random-float")?,
+            atom_as_f64(&args[2], "random-float")?,
+        );
         let r: f64 = rand::random();
         Ok(NDet::single(f64_to_atom(min + r * (max - min))))
     });

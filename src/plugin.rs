@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 
-use crate::atom::Atom;
+use crate::atom::{Atom, expr_data};
 use crate::func::{FnTable, NDet};
 
 /// Cache directory for compiled plugin `.so` files.
@@ -260,7 +260,7 @@ fn parse_plugin_atom(input: &str) -> Result<Atom, String> {
                 items.push(parse_plugin_atom(token)?);
             }
         }
-        return Ok(Atom::Expr(crate::atom::expr_data(items)));
+        return Ok(Atom::Expr(expr_data(items)));
     }
     if let Ok(n) = input.parse::<i128>() {
         return Ok(Atom::num(n));

@@ -2,6 +2,7 @@
 
 use crate::atom::Atom;
 use crate::env::Env;
+use crate::eval::shared::env::bind;
 use crate::parser::Expr;
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ pub fn is_truthy(atom: &Atom) -> bool {
 
 /// Extend an environment with a single binding.
 pub fn bind_value(env: &Env, name: &str, value: Atom) -> Env {
-    crate::eval::shared::env::bind(env, name, value)
+    bind(env, name, value)
 }
 
 /// Return the sequential binding list for a `let*` form.

@@ -5,7 +5,7 @@
 
 use crate::atom::Atom;
 use crate::env::Env;
-use crate::parser::{atom_to_expr, Expr};
+use crate::parser::{Expr, atom_to_expr};
 
 /// Convert an expression into an atom, substituting bound variables from an
 /// environment.
@@ -18,7 +18,12 @@ pub(crate) fn subst_and_atomize(expr: &Expr, env: &Env) -> Atom {
         Expr::Symbol(symbol) if symbol.starts_with('$') => {
             crate::eval::shared::env::lookup(env, symbol).unwrap_or_else(|| Atom::sym(symbol))
         }
-        Expr::List(items) => Atom::expr(items.iter().map(|item| subst_and_atomize(item, env)).collect::<Vec<_>>()),
+        Expr::List(items) => Atom::expr(
+            items
+                .iter()
+                .map(|item| subst_and_atomize(item, env))
+                .collect::<Vec<_>>(),
+        ),
         Expr::Symbol(symbol) => Atom::sym(symbol),
     }
 }
@@ -43,7 +48,12 @@ pub(crate) fn subst_expr_vars(expr: &Expr, env: &Env) -> Expr {
                 expr.clone()
             }
         }
-        Expr::List(items) => Expr::List(items.iter().map(|item| subst_expr_vars(item, env)).collect()),
+        Expr::List(items) => Expr::List(
+            items
+                .iter()
+                .map(|item| subst_expr_vars(item, env))
+                .collect(),
+        ),
         _ => expr.clone(),
     }
 }
@@ -56,13 +66,11 @@ pub(crate) fn subst_expr_vars(expr: &Expr, env: &Env) -> Expr {
 fn subst_atom_opt(atom: &Atom, env: &Env) -> Option<Atom> {
     match atom {
         Atom::Sym(symbol) if symbol.starts_with('$') => {
-            crate::eval::shared::env::lookup(env, symbol).map(|bound| {
-                match &bound {
-                    Atom::Sym(b) if b.as_ref() != symbol.as_ref() => {
-                        subst_atom_opt(&bound, env).unwrap_or(bound)
-                    }
-                    _ => bound,
+            crate::eval::shared::env::lookup(env, symbol).map(|bound| match &bound {
+                Atom::Sym(b) if b.as_ref() != symbol.as_ref() => {
+                    subst_atom_opt(&bound, env).unwrap_or(bound)
                 }
+                _ => bound,
             })
         }
         // Closed (ground) expression — no free variable anywhere below, so
@@ -70,9 +78,10 @@ fn subst_atom_opt(atom: &Atom, env: &Env) -> Option<Atom> {
         Atom::Expr(items) if !items.has_var() => None,
         Atom::Expr(items) => {
             // Phase 1: scan for first changed child (no allocation).
-            let first_change = items.iter().enumerate().find_map(|(i, item)| {
-                subst_atom_opt(item, env).map(|new| (i, new))
-            });
+            let first_change = items
+                .iter()
+                .enumerate()
+                .find_map(|(i, item)| subst_atom_opt(item, env).map(|new| (i, new)));
             match first_change {
                 None => None, // No variables found — return unchanged.
                 Some((change_idx, first_new)) => {
@@ -92,6 +101,8 @@ fn subst_atom_opt(atom: &Atom, env: &Env) -> Option<Atom> {
 }
 
 pub(crate) fn subst_atom(atom: &Atom, env: &Env) -> Atom {
-    if env.is_empty_env() { return atom.clone(); }
+    if env.is_empty_env() {
+        return atom.clone();
+    }
     subst_atom_opt(atom, env).unwrap_or_else(|| atom.clone())
 }
