@@ -408,7 +408,7 @@ fn run_vm_inner(
             }
             Opcode::AddAtom { expr, local_names } => {
                 let space_rs = state.stack.pop().ok_or("VM stack underflow on AddAtom space")?;
-                
+
                 let mut current_env = base_env.clone();
                 for (i, name) in local_names.iter().enumerate() {
                     if let Some((val, _val_env)) = state.locals.get(i) {
@@ -418,7 +418,7 @@ fn run_vm_inner(
                         );
                     }
                 }
-                
+
                 let atom = crate::eval::shared::subst::subst_and_atomize(expr, &current_env);
                 let cost = crate::eval::machine::budget::calculate_cost(&atom).unwrap_or(0);
                 if let Some(b) = state.budget {
@@ -437,7 +437,7 @@ fn run_vm_inner(
             }
             Opcode::RemAtom { expr, local_names } => {
                 let space_rs = state.stack.pop().ok_or("VM stack underflow on RemAtom space")?;
-                
+
                 let mut current_env = base_env.clone();
                 for (i, name) in local_names.iter().enumerate() {
                     if let Some((val, _val_env)) = state.locals.get(i) {
@@ -447,7 +447,7 @@ fn run_vm_inner(
                         );
                     }
                 }
-                
+
                 let atom = crate::eval::shared::subst::subst_and_atomize(expr, &current_env);
                 let cost = crate::eval::machine::budget::calculate_cost(&atom).unwrap_or(0);
                 if let Some(b) = state.budget {
@@ -595,7 +595,7 @@ fn run_vm_inner(
                                     sub_locals.push((bound, Env::new()));
                                 }
                                 let sub_env = crate::eval::shared::env::bind_all(&resume.current_env, &m.bindings);
-                                
+
                                 let sub_state = VMState {
                                     code: then_code.clone(), ip: 0,
                                     stack: Vec::new(), locals: sub_locals,
@@ -679,20 +679,20 @@ fn run_vm_inner(
                     arg_sets.push(state.stack.pop().ok_or("VM stack underflow on Call arg")?);
                 }
                 arg_sets.reverse();
-                
+
                 let mut sets = vec![head_rs];
                 sets.extend(arg_sets);
                 let full_combos = super::super::budget::threaded_combinations(&sets);
-                
+
                 let mut pending_calls = Vec::new();
                 let mut results = Vec::new();
-                
+
                 let mut call_memo_key = None;
                 for (combo, combo_env) in &full_combos {
                     if combo.is_empty() { continue; }
                     let head_atom = &combo[0];
                     let args = &combo[1..];
-                    
+
                     let mut memo_key_out = None;
                     dispatch_call(
                         head_atom,
@@ -708,7 +708,7 @@ fn run_vm_inner(
                         call_memo_key = memo_key_out;
                     }
                 }
-                
+
                 // skip frame when no pending calls (native functions / partial applications fully resolved).
                 // Pushing an empty frame and immediately popping it would restore an empty
                 // saved_locals, clearing the function's actual state.locals.
@@ -719,7 +719,7 @@ fn run_vm_inner(
                     state.stack.push(results);
                     continue;
                 }
-                
+
                 let frame = CallFrame {
                     return_ip: state.ip,
                     return_code: state.code.clone(),
@@ -985,7 +985,7 @@ fn run_vm_inner(
                     };
                     target_rs.push((target_expr, target_env));
                 }
-                
+
                 let frame = CallFrame {
                     return_ip: state.ip,
                     return_code: state.code.clone(),
@@ -1185,7 +1185,7 @@ fn run_vm_inner(
                         false
                     }
                 });
-                
+
                 let final_atom = if is_forall_true { Atom::sym("true") } else { Atom::sym("false") };
                 state.stack.push(plain(vec![final_atom]));
                 state.ip += 1;
@@ -1305,14 +1305,14 @@ fn run_vm_inner(
                 let _profile = if cfg!(feature = "profile") {
                     Some(crate::profile::ProfileGuard::new_owned("MapAtomLambda"))
                 } else { None };
-                
+
                 let list_rs = state.stack.pop().ok_or("VM stack underflow on MapAtomLambda")?;
                 let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
                     Some(Atom::Expr(v)) => v.to_vec(),
                     Some(other) => vec![other],
                     None => return Err("map-atom: list arg produced no result".to_string()),
                 };
-                
+
                 let mapped: Result<Vec<Atom>, String> = items.into_par_iter().map(|elem| {
                     let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
                     sub_state.locals = state.locals.clone();
@@ -1326,7 +1326,7 @@ fn run_vm_inner(
                         Ok(Atom::sym("()"))
                     }
                 }).collect();
-                
+
                 state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(mapped?))]));
                 state.ip += 1;
             }
@@ -1338,14 +1338,14 @@ fn run_vm_inner(
                 let _profile = if cfg!(feature = "profile") {
                     Some(crate::profile::ProfileGuard::new_owned("FilterAtomLambda"))
                 } else { None };
-                
+
                 let list_rs = state.stack.pop().ok_or("VM stack underflow on FilterAtomLambda")?;
                 let items: Vec<Atom> = match list_rs.into_iter().next().map(|(a, env)| crate::eval::shared::subst::subst_atom(&a, &env)) {
                     Some(Atom::Expr(v)) => v.to_vec(),
                     Some(other) => vec![other],
                     None => return Err("filter-atom: list arg produced no result".to_string()),
                 };
-                
+
                 let mapped: Result<Vec<Option<Atom>>, String> = items.into_par_iter().map(|elem| {
                     let mut sub_state = VMState::new_with_parent(body_code.clone(), free_vars_map.clone(), state.budget, &state.free_vars_map, &state.free_vars_bindings);
                     sub_state.locals = state.locals.clone();
@@ -1359,7 +1359,7 @@ fn run_vm_inner(
                         Ok(None)
                     }
                 }).collect();
-                
+
                 let filtered: Vec<Atom> = mapped?.into_iter().flatten().collect();
                 state.stack.push(plain(vec![Atom::Expr(crate::atom::expr_data(filtered))]));
                 state.ip += 1;
@@ -1946,19 +1946,19 @@ fn run_vm_inner(
                             let cached = FN_BYTECODE_CACHE.with(|cache_ref| {
                                 Ok::<_, String>(cache_ref.borrow().get(&cache_key).unwrap().clone())
                             })?;
-                            
+
                             for (i, (patterns, body)) in clauses.iter().enumerate() {
                                 if let Some((body_env, subst_cost)) = crate::eval::forms::query::match_clause(patterns, &new_args, &base_env, funcs) {
                                     let clause = &cached[i];
                                     let body_cost = crate::eval::machine::budget::calculate_expr_cost(body);
                                     let total_cost = subst_cost + body_cost;
-                                    
+
                                     let mut locals_to_push = Vec::with_capacity(clause.locals.len());
                                     for var in &clause.locals {
                                         let val = body_env.get(var).unwrap_or(Atom::sym("()"));
                                         locals_to_push.push((val, Env::new()));
                                     }
-                                    
+
                                     pending_calls.push(super::state::PendingCall {
                                         body_code: clause.body_code.clone(),
                                         free_vars: Arc::from(clause.free_vars.clone()),
@@ -1970,7 +1970,7 @@ fn run_vm_inner(
                                 }
                             }
                         }
-                        
+
                         let frame = CallFrame {
                             return_ip: state.ip,
                             return_code: state.code.clone(),
@@ -2004,53 +2004,53 @@ fn run_vm_inner(
                     }
                     state.frames.pop();
                 }
-                
+
                 if found_call {
                     // State at this point:
                     // - Compiler emitted Store(0..arity-1) with new args BEFORE TailCallSelf
                     // - So state.locals[0..arity-1] contain the new args
                     // - Let* bindings occupy higher indices (state.locals[arity..])
                     // - The CallFrame has saved_locals = parent's locals
-                    
+
                     // Get arity from the CallFrame
                     let arity = if let Some(frame) = state.frames.last() {
                         if let CallFrameKind::Call { arity, .. } = &frame.kind {
                             *arity
                         } else { unreachable!() }
                     } else { unreachable!() };
-                    
+
                     // Save the new args before restoring parent's locals
                     let new_args: Vec<Atom> = state.locals.iter().take(arity as usize).map(|(atom, _)| atom.clone()).collect();
-                    
+
                     // Pop the CallFrame to get saved_locals (parent's locals)
                     let mut frame = state.frames.pop().unwrap();
-                    
+
                     // Restore parent's locals
                     state.locals = std::mem::take(&mut frame.saved_locals);
-                    
+
                     let name = if let CallFrameKind::Call { name, .. } = &frame.kind {
                         *name
                     } else { unreachable!() };
-                    
+
                     let mut pending_calls = Vec::new();
                     if let Some(clauses) = crate::eval::forms::query::lookup_user_clauses(name, arity, funcs) {
                         let cache_key = (name.to_string(), arity);
                         let cached = FN_BYTECODE_CACHE.with(|cache_ref| {
                             Ok::<_, String>(cache_ref.borrow().get(&cache_key).unwrap().clone())
                         })?;
-                        
+
                         for (i, (patterns, body)) in clauses.iter().enumerate() {
                             if let Some((body_env, subst_cost)) = crate::eval::forms::query::match_clause(patterns, &new_args, &base_env, funcs) {
                                 let clause = &cached[i];
                                 let body_cost = crate::eval::machine::budget::calculate_expr_cost(body);
                                 let total_cost = subst_cost + body_cost;
-                                
+
                                 let mut locals_to_push = Vec::with_capacity(clause.locals.len());
                                 for var in &clause.locals {
                                     let val = body_env.get(var).unwrap_or(Atom::sym("()"));
                                     locals_to_push.push((val, Env::new()));
                                 }
-                                
+
                                 pending_calls.push(super::state::PendingCall {
                                     body_code: clause.body_code.clone(),
                                     free_vars: Arc::from(clause.free_vars.clone()),
@@ -2062,14 +2062,14 @@ fn run_vm_inner(
                             }
                         }
                     }
-                    
+
                     // Replace frame's state: new pending calls, cleared results, empty saved_locals
                     if let CallFrameKind::Call { pending_calls: old_pending, next_idx, .. } = &mut frame.kind {
                         *old_pending = pending_calls;
                         *next_idx = 0;
                     }
                     frame.locals_to_pop = 0;
-                    
+
                     state.frames.push(frame);
                     if let Some(next_env) = run_next_call_iteration(&mut state, funcs)? {
                         base_env = next_env;
@@ -2081,11 +2081,11 @@ fn run_vm_inner(
             }
         }
     }
-        
+
     if state.ip >= state.code.len() || state.cut_executed {
             if let Some(frame) = state.frames.last_mut() {
                 let sub_results = state.stack.pop().unwrap_or_else(|| Vec::new());
-                
+
                 // For Call and Eval frames, restore parent's locals from saved_locals (replaces extend).
                 // For other frames, truncate by locals_to_pop as before.
                 // restore parent's locals for Eval frames too
@@ -2096,7 +2096,7 @@ fn run_vm_inner(
                     state.locals.truncate(new_len);
                     frame.locals_to_pop = 0;
                 }
-                
+
                 match &mut frame.kind {
                     CallFrameKind::Let { results, .. } => { results.extend(sub_results); }
                     CallFrameKind::If { results, .. } => { results.extend(sub_results); }
@@ -2114,17 +2114,17 @@ fn run_vm_inner(
                     CallFrameKind::Eval { results, .. } => { results.extend(sub_results); }
                     CallFrameKind::Normal => { state.stack.push(sub_results); }
                 }
-                
+
                 let force_finish = state.cut_executed;
                 let restored_env = frame.saved_base_env.clone();
-                
+
                 if force_finish {
                     let popped = state.frames.pop().unwrap();
                     state.code = popped.return_code;
                     state.ip = popped.return_ip + 1;
                     state.free_vars_map = popped.saved_free_vars_map;
                     state.free_vars_bindings = popped.saved_free_vars_bindings;
-                    
+
                     match popped.kind {
                         CallFrameKind::Let { results, .. } => { state.stack.push(results); }
                         CallFrameKind::If { results, .. } => {
@@ -2565,7 +2565,7 @@ fn run_next_let_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Option
             }
         }
     }
-    
+
     if let Some((body_code, free_vars_map, body_env, locals_to_push)) = to_run {
         // propagate let value bindings to existing local variables
         for (val, env) in &mut state.locals {
@@ -2576,7 +2576,7 @@ fn run_next_let_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Option
         state.locals.extend(locals_to_push);
         state.code = body_code;
         state.ip = 0;
-        
+
         let free_vars_bindings = free_vars_map
             .iter()
             .map(|name| {
@@ -2629,12 +2629,12 @@ fn run_next_if_iteration(state: &mut VMState) -> Result<Option<Env>, String> {
             while *next_idx < condition_rs.len() {
                 let (cond, cond_env) = &condition_rs[*next_idx];
                 *next_idx += 1;
-                
+
                 let is_true = match cond {
                     Atom::Sym(s) => s.as_ref().eq_ignore_ascii_case("true"),
                     _ => false,
                 };
-                
+
                 if is_true {
                     let branch_env = crate::eval::shared::pattern::prepend_env(cond_env.clone(), &frame.saved_base_env);
                     to_run = Some((then_code.clone(), free_vars_map.clone(), branch_env, Some(cond_env.clone())));
@@ -2646,7 +2646,7 @@ fn run_next_if_iteration(state: &mut VMState) -> Result<Option<Env>, String> {
             }
         }
     }
-    
+
     if let Some((code_to_run, free_vars_map, branch_env, cond_env_opt)) = to_run {
         // propagate condition bindings to existing local variables
         if let Some(ref cond_env) = cond_env_opt {
@@ -2658,7 +2658,7 @@ fn run_next_if_iteration(state: &mut VMState) -> Result<Option<Env>, String> {
         }
         state.code = code_to_run;
         state.ip = 0;
-        
+
         let free_vars_bindings = free_vars_map
             .iter()
             .map(|name| {
@@ -2694,7 +2694,7 @@ fn run_next_if_iteration(state: &mut VMState) -> Result<Option<Env>, String> {
             state.ip = frame.return_ip + 1;
             state.free_vars_map = frame.saved_free_vars_map;
             state.free_vars_bindings = frame.saved_free_vars_bindings;
-            
+
             state.stack.push(results);
             Ok(None)
         } else {
@@ -2727,7 +2727,7 @@ fn run_next_case_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
                 while *next_idx < scrutinee_rs.len() {
                     let (value, value_env) = &scrutinee_rs[*next_idx];
                     *next_idx += 1;
-                    
+
                     let mut selected = None;
                     for branch in branches {
                         if matches!(&branch.pattern, Expr::Symbol(s) if s == "Empty") {
@@ -2748,7 +2748,7 @@ fn run_next_case_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
                             break;
                         }
                     }
-                    
+
                     if let Some((branch, body_env)) = selected {
                         let mut locals_to_push = Vec::new();
                         for var in &branch.pattern_vars {
@@ -2768,7 +2768,7 @@ fn run_next_case_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
             }
         }
     }
-    
+
     if let Some((body_code, free_vars_map, body_env, locals_to_push)) = to_run {
         // propagate case scrutinee/match bindings to existing local variables
         for (val, env) in &mut state.locals {
@@ -2779,7 +2779,7 @@ fn run_next_case_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
         state.locals.extend(locals_to_push);
         state.code = body_code;
         state.ip = 0;
-        
+
         let free_vars_bindings = free_vars_map
             .iter()
             .map(|name| {
@@ -3061,7 +3061,7 @@ fn run_next_eval_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
             while *next_idx < target_rs.len() {
                 let (target_expr, target_env) = &target_rs[*next_idx];
                 *next_idx += 1;
-                
+
                 let mut comp = super::compiler::VMCompiler::new(&[], None);
                 let mut code = Vec::new();
                 if comp.compile(target_expr, &mut code, false).is_ok() {
@@ -3076,7 +3076,7 @@ fn run_next_eval_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
             }
         }
     }
-    
+
     if let Some((body_code, free_vars_map, body_env)) = to_run {
         // Save parent's locals before entering dynamic eval body, clear state.locals.
         // prevent Load(0) index contamination by isolating eval locals.
@@ -3087,7 +3087,7 @@ fn run_next_eval_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Optio
         state.locals = Vec::new();
         state.code = body_code;
         state.ip = 0;
-        
+
         let free_vars_bindings = free_vars_map
             .iter()
             .map(|name| {

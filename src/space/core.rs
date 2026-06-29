@@ -6,9 +6,9 @@
 
 use crate::atom::Atom;
 use crate::parser::Expr;
+use mork_frontend::bytestring_parser::Parser;
 use rayon::prelude::*;
 use std::sync::Arc;
-use mork_frontend::bytestring_parser::Parser;
 
 use pathmap::zipper::{ZipperAbsolutePath, ZipperIteration, ZipperMoving};
 
@@ -105,14 +105,12 @@ pub struct MorkSpace {
     /// RwLock: ArenaCompactTree is now Sync (Cell moved to zipper), so concurrent
     /// reads are safe. Only add_atom/remove_atom take the write lock.
     inner: std::sync::RwLock<mork::space::Space<mork::weightedsweep::UnitHeader>>,
-    symbol_index: std::sync::RwLock<rustc_hash::FxHashMap<crate::symbol::Symbol, rustc_hash::FxHashSet<Arc<[u8]>>>>,
 }
 
 impl MorkSpace {
     pub fn new() -> Self {
         MorkSpace {
             inner: std::sync::RwLock::new(mork::space::Space::new()),
-            symbol_index: std::sync::RwLock::new(rustc_hash::FxHashMap::default()),
         }
     }
 
@@ -121,11 +119,11 @@ impl MorkSpace {
     }
 
     pub fn stream_match_atoms(&self, pattern: &Pattern) -> std::sync::mpsc::Receiver<MatchResult> {
-        use std::sync::mpsc::sync_channel;
         use rayon::prelude::*;
+        use std::sync::mpsc::sync_channel;
 
         let (tx, rx) = sync_channel(32768);
-        
+
         if let Some(atom) = pattern.as_ground_atom() {
             let encoded: Vec<u8> = MORK_SPACE_ENCODE_BUF.with(|cell| {
                 let mut buf = cell.borrow_mut();
@@ -138,44 +136,13 @@ impl MorkSpace {
             if !encoded.is_empty() {
                 let inner = self.inner.read().unwrap();
                 if inner.btm.get_val_at(&encoded).is_some() {
-                    let _ = tx.send(MatchResult { atom, bindings: vec![] });
+                    let _ = tx.send(MatchResult {
+                        atom,
+                        bindings: vec![],
+                    });
                 }
             }
             return rx;
-        }
-
-        let mut pat_syms = rustc_hash::FxHashSet::default();
-        crate::space::core::extract_symbols_from_pattern(pattern, &mut pat_syms);
-        
-        if !pat_syms.is_empty() {
-            let index = self.symbol_index.read().unwrap();
-            let mut best_sym = None;
-            let mut min_size = usize::MAX;
-            for sym in pat_syms {
-                if let Some(set) = index.get(&sym) {
-                    if set.len() < min_size {
-                        min_size = set.len();
-                        best_sym = Some(sym);
-                    }
-                } else {
-                    return rx;
-                }
-            }
-            
-            if let Some(sym) = best_sym {
-                let candidates: Vec<Arc<[u8]>> = index.get(&sym).unwrap().iter().map(Arc::clone).collect();
-                drop(index); // release lock
-                let pattern = pattern.clone();
-                std::thread::spawn(move || {
-                    let results: Vec<MatchResult> = candidates.into_par_iter().filter_map(|path| {
-                        decode_expr_bytes(&path).and_then(|stored| match_one(&pattern, &stored))
-                    }).collect();
-                    for r in results {
-                        if tx.send(r).is_err() { return; }
-                    }
-                });
-                return rx;
-            }
         }
 
         let prefix_bytes: Vec<u8> = MORK_SPACE_ENCODE_BUF.with(|cell| {
@@ -183,7 +150,9 @@ impl MorkSpace {
             let inner = self.inner.read().unwrap();
             match Self::encode_pattern_direct(pattern, &*inner, &mut buf) {
                 Ok(len) => {
-                    let e = mork_expr::Expr { ptr: buf.as_mut_ptr() };
+                    let e = mork_expr::Expr {
+                        ptr: buf.as_mut_ptr(),
+                    };
                     match e.prefix() {
                         Ok(p) | Err(p) => unsafe { &*p }.to_vec(),
                     }
@@ -205,11 +174,16 @@ impl MorkSpace {
                 chunk.push(z.origin_path().to_vec());
                 if chunk.len() >= 32768 {
                     let current_chunk = std::mem::take(&mut chunk);
-                    let results: Vec<MatchResult> = current_chunk.into_par_iter().filter_map(|path| {
-                        decode_expr_bytes(&path).and_then(|stored| match_one(&pattern, &stored))
-                    }).collect();
+                    let results: Vec<MatchResult> = current_chunk
+                        .into_par_iter()
+                        .filter_map(|path| {
+                            decode_expr_bytes(&path).and_then(|stored| match_one(&pattern, &stored))
+                        })
+                        .collect();
                     for r in results {
-                        if tx.send(r).is_err() { return; }
+                        if tx.send(r).is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -220,11 +194,17 @@ impl MorkSpace {
                     chunk.push(z.origin_path().to_vec());
                     if chunk.len() >= 32768 {
                         let current_chunk = std::mem::take(&mut chunk);
-                        let results: Vec<MatchResult> = current_chunk.into_par_iter().filter_map(|path| {
-                            decode_expr_bytes(&path).and_then(|stored| match_one(&pattern, &stored))
-                        }).collect();
+                        let results: Vec<MatchResult> = current_chunk
+                            .into_par_iter()
+                            .filter_map(|path| {
+                                decode_expr_bytes(&path)
+                                    .and_then(|stored| match_one(&pattern, &stored))
+                            })
+                            .collect();
                         for r in results {
-                            if tx.send(r).is_err() { return; }
+                            if tx.send(r).is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -232,9 +212,12 @@ impl MorkSpace {
 
             if !chunk.is_empty() {
                 let current_chunk = std::mem::take(&mut chunk);
-                let results: Vec<MatchResult> = current_chunk.into_par_iter().filter_map(|path| {
-                    decode_expr_bytes(&path).and_then(|stored| match_one(&pattern, &stored))
-                }).collect();
+                let results: Vec<MatchResult> = current_chunk
+                    .into_par_iter()
+                    .filter_map(|path| {
+                        decode_expr_bytes(&path).and_then(|stored| match_one(&pattern, &stored))
+                    })
+                    .collect();
                 for r in results {
                     let _ = tx.send(r);
                 }
@@ -255,7 +238,9 @@ impl MorkSpace {
         }
         let sym_table = inner.sym_table();
         let mut pdp = mork::space::ParDataParser::new(&sym_table);
-        let mut ez = mork_expr::ExprZipper::new(mork_expr::Expr { ptr: buf.as_mut_ptr() });
+        let mut ez = mork_expr::ExprZipper::new(mork_expr::Expr {
+            ptr: buf.as_mut_ptr(),
+        });
         let mut vars = Vec::new();
         encode_atom_inner(atom, &mut pdp, &mut ez, &mut vars)?;
         Ok(ez.loc)
@@ -272,7 +257,9 @@ impl MorkSpace {
         }
         let sym_table = inner.sym_table();
         let mut pdp = mork::space::ParDataParser::new(&sym_table);
-        let mut ez = mork_expr::ExprZipper::new(mork_expr::Expr { ptr: buf.as_mut_ptr() });
+        let mut ez = mork_expr::ExprZipper::new(mork_expr::Expr {
+            ptr: buf.as_mut_ptr(),
+        });
         let mut vars = Vec::new();
         encode_pattern_inner(pattern, &mut pdp, &mut ez, &mut vars)?;
         Ok(ez.loc)
@@ -389,9 +376,6 @@ fn encode_pattern_inner(
 
 impl Space for MorkSpace {
     fn add_atom(&self, atom: &Atom) -> Result<(), String> {
-        let mut syms = rustc_hash::FxHashSet::default();
-        crate::space::core::extract_all_symbols(atom, &mut syms);
-
         // Encode and insert in trie — capture the encoded bytes
         let encoded = MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
@@ -400,12 +384,6 @@ impl Space for MorkSpace {
             inner.btm.insert(&buf[..len], Default::default());
             Ok::<Arc<[u8]>, String>(buf[..len].to_vec().into())
         })?;
-
-        // Store encoded bytes in symbol index (no Atom::clone, no SipHash)
-        let mut index = self.symbol_index.write().unwrap();
-        for sym in syms {
-            index.entry(sym).or_default().insert(Arc::clone(&encoded));
-        }
 
         Ok(())
     }
@@ -425,41 +403,18 @@ impl Space for MorkSpace {
             Ok::<_, String>(paths)
         })?;
 
-        // Phase 2: symbol index — single write lock, no Arc overhead
-        let mut index = self.symbol_index.write().unwrap();
-        for (atom, encoded) in atoms.iter().zip(encoded_all) {
-            let mut syms = rustc_hash::FxHashSet::default();
-            crate::space::core::extract_all_symbols(atom, &mut syms);
-            for sym in syms {
-                index.entry(sym).or_default().insert(Arc::clone(&encoded));
-            }
-        }
-
         Ok(())
     }
 
     fn remove_atom(&self, atom: &Atom) -> Result<bool, String> {
-        let mut syms = rustc_hash::FxHashSet::default();
-        crate::space::core::extract_all_symbols(atom, &mut syms);
-
         // Remove from trie — capture encoded path
-        let encoded = MORK_SPACE_ENCODE_BUF.with(|cell| {
+        let removed = MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             let mut inner = self.inner.write().unwrap();
             let len = Self::encode_atom_direct(atom, &*inner, &mut buf)?;
             let removed = inner.btm.remove(&buf[..len]).is_some();
-            Ok::<(Arc<[u8]>, bool), String>((buf[..len].to_vec().into(), removed))
+            Ok::<(bool), String>((removed))
         })?;
-
-        let (encoded_path, removed) = encoded;
-
-        // Remove from symbol index by encoded path
-        let mut index = self.symbol_index.write().unwrap();
-        for sym in syms {
-            if let Some(set) = index.get_mut(&sym) {
-                set.remove(encoded_path.as_ref());
-            }
-        }
 
         Ok(removed)
     }
@@ -475,41 +430,19 @@ impl Space for MorkSpace {
                     Err(_) => vec![],
                 }
             });
-            if encoded.is_empty() { return vec![]; }
+            if encoded.is_empty() {
+                return vec![];
+            }
             // Phase 2: lookup (read lock, concurrent with other readers).
             let inner = self.inner.read().unwrap();
             return if inner.btm.get_val_at(&encoded).is_some() {
-                vec![MatchResult { atom, bindings: vec![] }]
+                vec![MatchResult {
+                    atom,
+                    bindings: vec![],
+                }]
             } else {
                 vec![]
             };
-        }
-
-        let mut pat_syms = rustc_hash::FxHashSet::default();
-        crate::space::core::extract_symbols_from_pattern(pattern, &mut pat_syms);
-        
-        if !pat_syms.is_empty() {
-            let index = self.symbol_index.read().unwrap();
-            let mut best_sym = None;
-            let mut min_size = usize::MAX;
-            for sym in pat_syms {
-                if let Some(set) = index.get(&sym) {
-                    if set.len() < min_size {
-                        min_size = set.len();
-                        best_sym = Some(sym);
-                    }
-                } else {
-                    return vec![];
-                }
-            }
-            
-            if let Some(sym) = best_sym {
-                let candidates: Vec<Arc<[u8]>> = index.get(&sym).unwrap().iter().map(Arc::clone).collect();
-                drop(index);
-                return candidates.into_par_iter().filter_map(|path| {
-                    decode_expr_bytes(&path).and_then(|stored| match_one(pattern, &stored))
-                }).collect();
-            }
         }
 
         // Phase 1: encode prefix (read lock — concurrent with other readers).
@@ -518,7 +451,9 @@ impl Space for MorkSpace {
             let inner = self.inner.read().unwrap();
             match Self::encode_pattern_direct(pattern, &*inner, &mut buf) {
                 Ok(len) => {
-                    let e = mork_expr::Expr { ptr: buf.as_mut_ptr() };
+                    let e = mork_expr::Expr {
+                        ptr: buf.as_mut_ptr(),
+                    };
                     match e.prefix() {
                         Ok(p) | Err(p) => unsafe { &*p }.to_vec(),
                     }
@@ -555,9 +490,7 @@ impl Space for MorkSpace {
             let verified: Vec<MatchResult> = candidate_paths
                 .into_par_iter()
                 .filter_map(|path| {
-                    decode_expr_bytes(&path).and_then(|stored| {
-                        match_one(&pattern, &stored)
-                    })
+                    decode_expr_bytes(&path).and_then(|stored| match_one(&pattern, &stored))
                 })
                 .collect();
             verified
@@ -565,9 +498,7 @@ impl Space for MorkSpace {
             candidate_paths
                 .into_iter()
                 .filter_map(|path| {
-                    decode_expr_bytes(&path).and_then(|stored| {
-                        match_one(&pattern, &stored)
-                    })
+                    decode_expr_bytes(&path).and_then(|stored| match_one(&pattern, &stored))
                 })
                 .collect()
         }
@@ -719,7 +650,10 @@ fn unify(
     match pattern {
         Pattern::Any => true,
         Pattern::Var(name) => {
-            if let Some((_, bound)) = query_bindings.iter().find(|(n, _)| n.as_ref() == name.as_str()) {
+            if let Some((_, bound)) = query_bindings
+                .iter()
+                .find(|(n, _)| n.as_ref() == name.as_str())
+            {
                 **bound == *atom
             } else {
                 query_bindings.push((Arc::from(name.as_str()), Arc::new(atom.clone())));
@@ -857,34 +791,5 @@ fn parse_value(chars: &[char], pos: &mut usize) -> Result<Atom, String> {
 fn skip_whitespace(chars: &[char], pos: &mut usize) {
     while *pos < chars.len() && chars[*pos].is_whitespace() {
         *pos += 1;
-    }
-}
-
-pub fn extract_all_symbols(atom: &Atom, syms: &mut rustc_hash::FxHashSet<crate::symbol::Symbol>) {
-    match atom {
-        Atom::Sym(s) => { syms.insert(*s); }
-        Atom::Expr(items) => {
-            for item in items.iter() {
-                extract_all_symbols(item, syms);
-            }
-        }
-        _ => {}
-    }
-}
-
-pub fn extract_symbols_from_pattern(pattern: &Pattern, syms: &mut rustc_hash::FxHashSet<crate::symbol::Symbol>) {
-    match pattern {
-        Pattern::Exact(Atom::Sym(s)) => { syms.insert(*s); }
-        Pattern::Exact(Atom::Expr(items)) => {
-            for item in items.iter() {
-                extract_all_symbols(item, syms);
-            }
-        }
-        Pattern::Expr(items) => {
-            for item in items.iter() {
-                extract_symbols_from_pattern(item, syms);
-            }
-        }
-        _ => {}
     }
 }
