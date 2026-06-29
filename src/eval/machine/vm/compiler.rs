@@ -266,7 +266,6 @@ impl VMCompiler {
 
                             code.push(Opcode::Case {
                                 branches: compiled_branches,
-                                local_names: self.locals.clone(),
                             });
                             return Ok(());
                         }

@@ -1,4 +1,4 @@
-use lasso::{Spur, ThreadedRodeo};
+use lasso::ThreadedRodeo;
 use std::sync::LazyLock;
 
 static INTERNER: LazyLock<ThreadedRodeo> = LazyLock::new(|| ThreadedRodeo::new());

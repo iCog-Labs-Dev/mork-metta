@@ -7,7 +7,6 @@ use crate::atom::Atom;
 use crate::env::Env;
 use crate::func::{Clause, FnTable};
 use crate::parser::Expr;
-use std::sync::Arc;
 
 /// Match a clause's argument patterns against evaluated argument atoms.
 ///

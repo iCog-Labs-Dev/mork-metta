@@ -5,7 +5,6 @@ use crate::builtins::arithmetic::expect_n_args;
 use crate::eval::shared::value::is_truthy;
 use crate::func::{FnTable, NDet};
 use crate::parser::{Expr, expr_to_atom, parse_sexpr_body};
-use std::sync::Arc;
 
 /// Register representation, parsing, assertion, and I/O builtins.
 pub fn register_io_builtins(funcs: &FnTable) {

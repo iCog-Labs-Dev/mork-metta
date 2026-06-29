@@ -18,10 +18,9 @@ use crate::builtins::register_builtins;
 use crate::compile::compile_definition;
 use crate::env::Env;
 use crate::eval::{io::load_metta_file, runtime::eval_with_state};
-use crate::func::Clause;
 use crate::func::FnTable;
 use crate::parser::{Expr, TopForm, expr_to_atom, parse_forms};
-use crate::space::{Pattern, Space};
+use crate::space::Space;
 
 pub struct Runtime {
     pub funcs: FnTable,

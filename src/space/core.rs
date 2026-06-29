@@ -149,7 +149,7 @@ impl MorkSpace {
             let mut buf = cell.borrow_mut();
             let inner = self.inner.read().unwrap();
             match Self::encode_pattern_direct(pattern, &*inner, &mut buf) {
-                Ok(len) => {
+                Ok(_) => {
                     let e = mork_expr::Expr {
                         ptr: buf.as_mut_ptr(),
                     };
@@ -377,7 +377,7 @@ fn encode_pattern_inner(
 impl Space for MorkSpace {
     fn add_atom(&self, atom: &Atom) -> Result<(), String> {
         // Encode and insert in trie — capture the encoded bytes
-        let encoded = MORK_SPACE_ENCODE_BUF.with(|cell| {
+        let _ = MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             let mut inner = self.inner.write().unwrap();
             let len = Self::encode_atom_direct(atom, &*inner, &mut buf)?;
@@ -389,9 +389,7 @@ impl Space for MorkSpace {
     }
 
     fn add_atoms_bulk(&self, atoms: &[Atom]) -> Result<(), String> {
-        // ponytail: single write-lock for entire batch — no per-atom lock thrash
-        // Phase 1: encode + insert in trie, collect encoded paths
-        let encoded_all: Vec<Arc<[u8]>> = MORK_SPACE_ENCODE_BUF.with(|cell| {
+        let _: Vec<Arc<[u8]>> = MORK_SPACE_ENCODE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             let mut inner = self.inner.write().unwrap();
             let mut paths = Vec::with_capacity(atoms.len());
@@ -450,7 +448,7 @@ impl Space for MorkSpace {
             let mut buf = cell.borrow_mut();
             let inner = self.inner.read().unwrap();
             match Self::encode_pattern_direct(pattern, &*inner, &mut buf) {
-                Ok(len) => {
+                Ok(_) => {
                     let e = mork_expr::Expr {
                         ptr: buf.as_mut_ptr(),
                     };

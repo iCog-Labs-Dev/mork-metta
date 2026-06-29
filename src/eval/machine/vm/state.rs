@@ -1,7 +1,7 @@
 use super::op::{CaseBranch, Opcode, VmExit};
 use crate::atom::Atom;
 use crate::env::Env;
-use crate::eval::machine::budget::{ResultSet, plain};
+use crate::eval::machine::budget::ResultSet;
 use crate::eval::shared::fresh;
 use std::any::Any;
 use std::sync::Arc;

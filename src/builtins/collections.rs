@@ -11,9 +11,8 @@ use crate::eval::{
     shared::debug::logical_failure,
 };
 use crate::func::{FnTable, FunctionKind, NDet};
-use crate::parser::{Expr, atom_to_expr, expr_to_atom};
+use crate::parser::{Expr, atom_to_expr};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 fn expect(args: &[Atom], n: usize, name: &str) -> Result<(), String> {
     expect_n_args(args, n, name)

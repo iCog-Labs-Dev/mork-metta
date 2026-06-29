@@ -15,22 +15,6 @@ use crate::func::FnTable;
 use crate::parser::{Expr, atom_to_expr, expr_to_atom};
 use crate::space::Pattern;
 
-pub(crate) use super::super::shared::closure::{
-    delayed_user_call_arg, eval_user_call_arg, eval_user_call_arg_slot, lazy_user_arg_mask,
-};
-pub(crate) use super::super::shared::subst::{subst_and_atomize, subst_expr_vars};
-
-/// Prepare a single evaluated or delayed argument slot for query-style
-/// function application.
-pub(crate) fn prepare_arg_slot(
-    expr: &Expr,
-    env: &Env,
-    funcs: &FnTable,
-    lazy: bool,
-) -> Result<Vec<Atom>, String> {
-    eval_user_call_arg_slot(expr, env, funcs, lazy)
-}
-
 /// Compute the total structural cost of the bindings in an environment.
 pub(crate) fn env_binding_cost(env: &Env) -> i64 {
     match env.inner() {
@@ -118,16 +102,6 @@ pub(crate) fn match_clause(
         );
     }
     Some((prepend_env(unification_env, base_env), subst_cost))
-}
-
-/// Collect lazy-mask-ready clause references for a user-defined function body.
-pub(crate) fn collect_clause_refs<'a>(
-    clauses: &'a [(Vec<Expr>, Expr)],
-) -> Vec<(&'a [Expr], &'a Expr)> {
-    clauses
-        .iter()
-        .map(|(patterns, body)| (patterns.as_slice(), body))
-        .collect()
 }
 
 /// Look up cached user-function clauses by name and arity.

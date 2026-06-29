@@ -1,4 +1,4 @@
-use super::op::{CaseBranch, Opcode, QuoteVarMatch, QuoteVarSource, VmExit};
+use super::op::{Opcode, QuoteVarSource, VmExit};
 use super::state::{CallFrame, CallFrameKind, VMState};
 use crate::atom::{Atom, ClosureData, expr_data};
 use crate::builtins::boolean::bool_atom;
@@ -17,7 +17,7 @@ use crate::eval::{
     },
     python::{eval_py_eval, eval_py_import_library},
     shared::{
-        debug::{logical_failure, logical_failure_warnings_enabled},
+        debug::logical_failure,
         env::{bind, bind_all, lookup, prepend_chain},
         fresh::{is_generated_var_name, rename_apart_unbound_vars},
         pattern::{prepend_env, try_match_one},
@@ -30,7 +30,7 @@ use crate::profile::ProfileGuard;
 use crate::space::{
     MatchResult,
     mutate::{
-        TransactionSnapshot, add_atom, add_atoms_bulk, remove_atom, restore_transaction_state,
+        TransactionSnapshot, add_atom, remove_atom, restore_transaction_state,
         snapshot_transaction_state, with_named_mutex,
     },
     query::collect_match_results,
@@ -96,7 +96,6 @@ pub fn run_vm(
     initial_base_env: &Env,
 ) -> Result<(ResultSet, Option<i64>, VmExit), String> {
     super::compiler::set_current_funcs(funcs);
-    let _guard = VmDepthGuard::enter();
 
     // Each entry is a suspended parent frame waiting for a sub-VM result.
     // We push (parent, parent_env) when yielding, then pop when the sub finishes.
@@ -107,7 +106,7 @@ pub fn run_vm(
     loop {
         match run_vm_inner(*current_state, funcs, &current_env)? {
             (
-                res,
+                _,
                 budget,
                 VmExit::YieldCall {
                     parent_state,
@@ -709,7 +708,7 @@ fn run_vm_inner(
                             }
                             UnifyIter::Vals(iter, val_a_opt) => {
                                 let mut found = false;
-                                if let Some(val_a) = val_a_opt {
+                                if let Some(_) = val_a_opt {
                                     while let Some((val_b, env_b)) = iter.next() {
                                         let match_env = prepend_env(env_b, &resume.current_env);
                                         if let Some(matched_env) =
@@ -1235,10 +1234,7 @@ fn run_vm_inner(
                     }
                     continue;
                 }
-                Opcode::Case {
-                    branches,
-                    local_names,
-                } => {
+                Opcode::Case { branches } => {
                     let _profile = if cfg!(feature = "profile") {
                         Some(ProfileGuard::new_owned("Case"))
                     } else {
@@ -1555,7 +1551,7 @@ fn run_vm_inner(
                         );
                         sub_state.locals = state.locals.clone();
                         let vals_to_bind = [resume.current_acc.clone(), elem];
-                        for (var, val) in var_names.iter().zip(vals_to_bind.iter()) {
+                        for (_, val) in var_names.iter().zip(vals_to_bind.iter()) {
                             sub_state.locals.push((val.clone(), Env::new()));
                         }
                         if var_names.len() > vals_to_bind.len() {
@@ -1711,7 +1707,6 @@ fn run_vm_inner(
                             yield_vm!(state, sub_state, base_env.clone());
                         }
                     };
-                    state.budget = state.budget; // budget already updated by trampoline
                     match exit_status {
                         VmExit::TailCall(locs) => {
                             return Ok((Vec::new(), state.budget, VmExit::TailCall(locs)));
@@ -1870,7 +1865,6 @@ fn run_vm_inner(
                         final_code: Arc<[Opcode]>,
                         free_vars_map: Arc<[String]>,
                         next_step_idx: usize, // 0..steps.len() = steps; steps.len() = final body
-                        done: bool,
                     }
                     let mut resume = match state
                         .resume_data
@@ -1934,7 +1928,6 @@ fn run_vm_inner(
                             final_code: final_code.clone(),
                             free_vars_map: free_vars_map.clone(),
                             next_step_idx: 0,
-                            done: false,
                         },
                     };
                     if !state.cut_executed {

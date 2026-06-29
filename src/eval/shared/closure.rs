@@ -2,33 +2,7 @@
 //!
 //! This module contains support code for closure application and delayed
 //! argument handling used during evaluation.
-
-use crate::atom::{Atom, ClosureData};
-use crate::env::Env;
-use crate::func::FnTable;
 use crate::parser::Expr;
-
-use super::subst::subst_and_atomize;
-
-/// Return an unreduced atom for argument shapes that must be preserved during
-/// user-function application.
-pub(crate) fn definition_arg_atom(expr: &Expr, env: &Env) -> Option<Atom> {
-    match expr {
-        Expr::List(items) if !items.is_empty() => match &items[0] {
-            Expr::Symbol(symbol) if symbol == "=" && items.len() == 3 => {
-                Some(subst_and_atomize(expr, env))
-            }
-            // Preserve (quote ...) as data — eager evaluation would strip the
-            // quote wrapper, breaking pattern matching in user functions like
-            //   (= (unquote (quote $A)) ...)
-            Expr::Symbol(symbol) if symbol == "quote" && items.len() == 2 => {
-                Some(subst_and_atomize(expr, env))
-            }
-            _ => None,
-        },
-        _ => None,
-    }
-}
 
 /// Return `true` when every occurrence of a variable appears only under
 /// an `(eval var)` form in a function body.
@@ -112,41 +86,5 @@ fn contains_var(expr: &Expr, var: &str) -> bool {
         Expr::Symbol(s) => s == var,
         Expr::List(items) => items.iter().any(|item| contains_var(item, var)),
         _ => false,
-    }
-}
-
-/// Wrap an unevaluated user-function argument as a zero-argument closure.
-pub(crate) fn delayed_user_call_arg(expr: &Expr, env: &Env) -> Atom {
-    Atom::Closure(Box::new(ClosureData {
-        params: Vec::new(),
-        body: expr.clone(),
-        env: env.clone(),
-    }))
-}
-
-/// Evaluate a user-function argument according to ordinary eager rules.
-pub(crate) fn eval_user_call_arg(
-    expr: &Expr,
-    env: &Env,
-    funcs: &FnTable,
-) -> Result<Vec<Atom>, String> {
-    if let Some(atom) = definition_arg_atom(expr, env) {
-        Ok(vec![atom])
-    } else {
-        crate::eval::machine::step::run(expr, env, funcs)
-    }
-}
-
-/// Evaluate a user-function argument slot according to its laziness policy.
-pub(crate) fn eval_user_call_arg_slot(
-    expr: &Expr,
-    env: &Env,
-    funcs: &FnTable,
-    lazy: bool,
-) -> Result<Vec<Atom>, String> {
-    if lazy {
-        Ok(vec![delayed_user_call_arg(expr, env)])
-    } else {
-        eval_user_call_arg(expr, env, funcs)
     }
 }

@@ -95,7 +95,6 @@ pub enum Opcode {
     },
     Case {
         branches: Vec<CaseBranch>,
-        local_names: Vec<String>,
     },
     Match {
         pattern: Expr,

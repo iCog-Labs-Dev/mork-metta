@@ -17,14 +17,13 @@ use crate::eval::{
     runtime::eval_with_state,
 };
 use crate::func::{FnTable, NDet};
-use crate::parser::{Expr, TopForm, atom_to_expr, expr_to_atom, parse_atom_bytes, parse_forms};
+use crate::parser::{Expr, TopForm, expr_to_atom, parse_atom_bytes, parse_forms};
 #[cfg(feature = "plugins")]
 use crate::plugin::Plugin;
 use crate::space::mutate::{add_atom, add_atoms_bulk};
 use rayon::prelude::*;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 /// Evaluate `(import! space path)` — load a MeTTa file into the space.
 ///

@@ -14,7 +14,7 @@
 /// The prior HashMap-based implementation caused fib(30) to take >30s due to
 /// 2.7 million HashMap clones. The linked-list approach completes in ~0.3s.
 use crate::atom::Atom;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock};
 
 /// Inner node of the environment chain. Arc-wrapped by `Env` so the
 /// outer clone is always O(1).
@@ -218,47 +218,6 @@ impl Env {
         loop {
             if Arc::ptr_eq(&curr.0, &boundary.0) {
                 // This branch done, try the next from the worklist
-                if let Some(next) = worklist.pop() {
-                    curr = next;
-                    continue;
-                }
-                return;
-            }
-            match &*curr.0 {
-                EnvNode::Empty => {
-                    if let Some(next) = worklist.pop() {
-                        curr = next;
-                        continue;
-                    }
-                    return;
-                }
-                EnvNode::Cons { name, value, next } => {
-                    let skip = skip_names.iter().any(|s| s.as_str() == &**name);
-                    if !skip {
-                        bindings.push((name.clone(), value.clone()));
-                    }
-                    curr = next.clone();
-                }
-                EnvNode::Link { prefix, base } => {
-                    worklist.push(base.clone());
-                    curr = prefix.clone();
-                }
-            }
-        }
-    }
-
-    /// Collect all bindings from this environment, walking `Link` chains
-    /// iteratively via an explicit worklist instead of C-stack recursion.
-    fn collect_all_bindings(
-        &self,
-        skip_names: &[String],
-        bindings: &mut Vec<(Arc<str>, Arc<Atom>)>,
-    ) {
-        // worklist flattens Link chains iteratively.
-        let mut worklist: Vec<Env> = Vec::new();
-        let mut curr = self.clone();
-        loop {
-            if curr.is_empty_env() {
                 if let Some(next) = worklist.pop() {
                     curr = next;
                     continue;
