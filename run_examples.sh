@@ -9,8 +9,14 @@
 set -euo pipefail
 
 EXAMPLES_DIR="$(dirname "$0")/examples"
-BINARY="../target/release/mork-metta"
-
+if [ -f ./target/release/mork-metta ]; then
+	BINARY="./target/release/mork-metta"
+elif [ -f ./target/debug/mork-metta ]; then
+	BINARY="./target/debug/mork-metta"
+else
+	echo "Build the binary first: cargo build or cargo build --release"
+	exit 1
+fi
 SKIP=()
 
 # Parse args: --skip <name> [<name> ...] (repeat as needed)

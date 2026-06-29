@@ -1,26 +1,25 @@
 
 [package]
-name = "mork-metta"
-version = "0.1.0"
-edition = "2024"
+    name = "mork-metta"
+    version = "0.1.0"
+    edition = "2024"
 [profile.release]
-debug = true
+    debug = true
 [features]
-default = []
-trace = []
-profile = []
-python-bridge = ["dep:pyo3"]
-plugins = ["dep:libloading"]
+    default = []
+    profile = []
+    python-bridge = ["dep:pyo3"]
+    plugins = ["dep:libloading"]
 [dependencies]
-mork = { workspace = true }
-mork-expr = { workspace = true }
-mork-frontend = { workspace = true }
-pathmap = { workspace = true }
-pyo3 = { workspace = true, optional = true, features = ["auto-initialize"] }
-libloading = { version = "0.8", optional = true }
-rayon = "1"
-dashu = "0.4"
-rand = "0.8"
-rustc-hash = "2.1.2"
-memmap2 = "0.9.9"
-lasso = { version = "0.7.3", features = ["multi-threaded"] }
+    mork = { git = "https://github.com/iCog-Labs-Dev/MORK", branch = "chore/cleanup" }
+    mork-expr = { git = "https://github.com/iCog-Labs-Dev/MORK", branch = "chore/cleanup" }
+    mork-frontend = { git = "https://github.com/iCog-Labs-Dev/MORK", branch = "chore/cleanup" }
+    pathmap = { git = "https://github.com/DagmawiKK/PathMap" }
+    pyo3 = { version = "0.23", optional = true, features = ["auto-initialize"] }
+    libloading = { version = "0.8", optional = true }
+    rayon = "1"
+    dashu = "0.4"
+    rand = "0.8"
+    rustc-hash = "2.1.2"
+    memmap2 = "0.9.9"
+    lasso = { version = "0.7.3", features = ["multi-threaded"] }
