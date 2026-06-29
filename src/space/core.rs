@@ -104,7 +104,7 @@ thread_local! {
 pub struct MorkSpace {
     /// RwLock: ArenaCompactTree is now Sync (Cell moved to zipper), so concurrent
     /// reads are safe. Only add_atom/remove_atom take the write lock.
-    inner: std::sync::RwLock<mork::space::Space<mork::weightedsweep::UnitHeader>>,
+    inner: std::sync::RwLock<mork::space::Space>,
 }
 
 impl MorkSpace {
@@ -229,7 +229,7 @@ impl MorkSpace {
 
     fn encode_atom_direct(
         atom: &Atom,
-        inner: &mork::space::Space<mork::weightedsweep::UnitHeader>,
+        inner: &mork::space::Space,
         buf: &mut Vec<u8>,
     ) -> Result<usize, String> {
         let cap = approx_size(atom) + 64;
@@ -248,7 +248,7 @@ impl MorkSpace {
 
     fn encode_pattern_direct(
         pattern: &Pattern,
-        inner: &mork::space::Space<mork::weightedsweep::UnitHeader>,
+        inner: &mork::space::Space,
         buf: &mut Vec<u8>,
     ) -> Result<usize, String> {
         let cap = approx_pattern_size(pattern) + 64;
