@@ -8,6 +8,7 @@ use crate::Env;
 /// no conversion cost for complex objects.
 use crate::atom::{Atom, Grounded, Numeric};
 use crate::eval::machine::step::run_rs;
+use crate::eval::python::Numeric::{Dec, Int};
 use crate::func::{FnTable, NDet};
 use crate::parser::Expr;
 use std::path::Path;
@@ -30,7 +31,7 @@ pub(crate) fn eval_py_call(args: &[Expr], env: &Env, _funcs: &FnTable) -> Result
             // expr_to_py already evaluates function calls for list expressions
             // (e.g. ("round" 3.14 2) → round(3.14, 2) → returns float result).
             // For bare symbols, it resolves to the Python object directly.
-            Ok(single(atom_from_py(&py_obj)))
+            Ok(NDet::single(atom_from_py(&py_obj)))
         })
     }
     #[cfg(not(feature = "python-bridge"))]
@@ -63,7 +64,7 @@ pub(crate) fn eval_py_eval(args: &[Expr], _env: &Env, _funcs: &FnTable) -> Resul
             let result = py
                 .eval(&c_code, None, None)
                 .map_err(|e| format!("py-eval: error: {}", e))?;
-            Ok(single(atom_from_py(&result)))
+            Ok(NDet::single(atom_from_py(&result)))
         })
     }
     #[cfg(not(feature = "python-bridge"))]
