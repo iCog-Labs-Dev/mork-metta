@@ -3,6 +3,7 @@ use crate::eval::shared::{closure::lazy_user_arg_mask, fresh::contains_fresh_var
 use crate::parser::Expr;
 use crate::space::{MorkSpace, Space};
 use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 /// Function dispatch table.
@@ -19,6 +20,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// - `FunctionKind::Native` requires `Send + Sync` on the function pointer so that
 ///   native closures registered at startup are safe to call from worker threads.
 use std::sync::{Arc, Mutex, RwLock};
+#[cfg(feature = "prolog-bridge")]
+use crate::eval::prolog::builtins::try_resolve_imported_prolog_function;
 
 /// An iterator over nondeterministic results from evaluation.
 ///
@@ -32,6 +35,9 @@ pub enum NDet {
 impl NDet {
     pub fn single(atom: Atom) -> Self {
         NDet::Single(Some(atom))
+    }
+    pub fn empty() -> Self {
+        NDet::Single(None)
     }
     pub fn stream(iter: impl Iterator<Item = Atom> + Send + 'static) -> Self {
         NDet::Stream(Box::new(iter))
@@ -138,6 +144,10 @@ pub struct FnTable {
     /// Lazy-arg mask cache: (name, arity) → Vec<bool>. Populated on first call,
     /// invalidated on cache_fn (add-atom / redefinition).
     pub lazy_mask_cache: RwLock<HashMap<(String, u8), Vec<bool>>>,
+    /// Track function names imported from Prolog for dynamic arity resolution.
+    pub imported_prolog_funcs: RwLock<HashSet<String>>,
+    /// Track function names registered as translator rules (syntactic macros).
+    pub translator_rules: RwLock<HashSet<String>>,
 }
 
 impl FnTable {
@@ -153,6 +163,8 @@ impl FnTable {
             memo_stamp: AtomicU64::new(0),
             memo_cache: RwLock::new(HashMap::default()),
             lazy_mask_cache: RwLock::new(HashMap::default()),
+            imported_prolog_funcs: RwLock::new(HashSet::default()),
+            translator_rules: RwLock::new(HashSet::default()),
         }
     }
 
@@ -168,9 +180,17 @@ impl FnTable {
             memo_stamp: AtomicU64::new(0),
             memo_cache: RwLock::new(HashMap::default()),
             lazy_mask_cache: RwLock::new(HashMap::default()),
+            imported_prolog_funcs: RwLock::new(HashSet::default()),
+            translator_rules: RwLock::new(HashSet::default()),
         }
     }
 
+    /// Invalidate memo cache and lazy-arg mask cache, bumping memo stamp.
+    pub fn invalidate_caches(&self) {
+        self.bump_memo_stamp();
+        self.memo_cache.write().unwrap().clear();
+        self.lazy_mask_cache.write().unwrap().clear();
+    }
     pub fn insert_native<F>(&self, name: &str, arity: u8, func: F)
     where
         F: Fn(&[Atom], &FnTable) -> Result<NDet, String> + Send + Sync + 'static,
@@ -239,6 +259,7 @@ impl FnTable {
     pub fn is_registered(&self, name: &str) -> bool {
         self.map.read().unwrap().contains_key(name)
             || self.fn_cache.read().unwrap().contains_key(name)
+            || self.imported_prolog_funcs.read().unwrap().contains(name)
     }
 
     pub fn get(&self, name: &str, arity: u8) -> Option<Arc<Function>> {
@@ -272,6 +293,11 @@ impl FnTable {
             .and_then(|inner| inner.get(&arity))
             .cloned();
 
+        #[cfg(feature = "prolog-bridge")]
+        let res = res.or_else(|| {
+            if !try_resolve_imported_prolog_function(self, name, arity) { return None; }
+            self.map.read().unwrap().get(name).and_then(|inner| inner.get(&arity)).cloned()
+        });
         CACHE.with(|c| {
             let mut cache = c.borrow_mut();
             if cache.len() >= 4 {

@@ -86,6 +86,7 @@ pub enum Opcode {
         pattern: Expr,
         body_code: Arc<[Opcode]>,
         pattern_vars: Vec<String>,
+        seed_vars: Vec<String>,
         free_vars_map: Arc<[String]>,
     },
     If {
@@ -165,6 +166,18 @@ pub enum Opcode {
     /// Pops space-ref from stack (ignored), loads a .py library file.
     PythonImport {
         path: String,
+    },
+    /// Pops space-ref from stack (ignored), consults a .pl library file via SWI-Prolog.
+    PrologImport {
+        path: String,
+    },
+    /// Executes a Prolog goal via translatePredicate, marshaling variables in/out of the environment.
+    /// The goal head is a literal Prolog predicate name; its `nargs` arguments are evaluated
+    /// MeTTa expressions and have already been pushed onto the stack, in order.
+    TranslatePredicate {
+        head: Expr,
+        nargs: u8,
+        free_vars_map: Arc<[String]>,
     },
     /// Evaluates a `(py-call expr)` — raw expression tree, not evaluated args.
     /// Bypasses dispatch.rs string matching and CEK machine entirely.

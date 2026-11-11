@@ -159,6 +159,10 @@ pub(crate) fn resolve_import_path(path_str: &str, import_dir: &Path) -> Option<P
         .and_then(|d| d.parent().map(|p| p.to_path_buf()));
     let bases = std::iter::once(std::path::PathBuf::from("."))
         .chain(std::iter::once(import_dir.to_path_buf()))
+        .chain(std::iter::once(std::path::PathBuf::from("lib")))
+        .chain(std::iter::once(import_dir.join("../lib")))
+        .chain(std::iter::once(import_dir.join("lib")))
+        .chain(parent_cwd.as_ref().map(|p| p.join("lib")))
         .chain(parent_cwd);
     for base in bases {
         for candidate in [

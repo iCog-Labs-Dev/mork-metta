@@ -1,10 +1,11 @@
 use super::op::{CaseBranch, Opcode, QuoteVarMatch, QuoteVarSource};
 use crate::atom::{Atom, expr_data};
 use crate::eval::forms::query::lookup_user_clauses;
-use crate::parser::{Expr, expr_to_atom};
-
 use crate::func::FnTable;
+use crate::parser::{Expr, expr_to_atom};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::sync::Arc;
 thread_local! {
     pub static CURRENT_FN_TABLE: RefCell<Option<*const FnTable>> = const { RefCell::new(None) };
     pub static IN_USER_ARG: Cell<bool> = const { Cell::new(false) };
@@ -322,6 +323,7 @@ impl VMCompiler {
                             };
                             let mut pattern_vars = Vec::new();
                             collect_pattern_vars(&items[1], &mut pattern_vars);
+                            let seed_vars: Vec<String> = pattern_vars.iter().filter(|v| self.locals.contains(v)).cloned().collect();
                             body_comp.locals.extend(pattern_vars.clone());
 
                             let mut body_code = Vec::new();
@@ -334,9 +336,10 @@ impl VMCompiler {
                             }
                             code.push(Opcode::Let {
                                 pattern: items[1].clone(),
-                                body_code: std::sync::Arc::from(body_code),
+                                body_code: Arc::from(body_code),
                                 pattern_vars,
-                                free_vars_map: std::sync::Arc::from(body_comp.free_vars),
+                                seed_vars,
+                                free_vars_map: Arc::from(body_comp.free_vars),
                             });
                             return Ok(());
                         }
@@ -686,31 +689,7 @@ impl VMCompiler {
                         "import!" if items.len() == 3 => {
                             // path is always a compile-time literal; compile space-ref arg only
                             // Performance: avoids a full CEK round-trip just to eval &self
-                            let path_opcode = match &items[2] {
-                                // (library path.py) — Python import, space-ref is still evaluated but unused
-                                Expr::List(lib) if lib.len() == 2 => {
-                                    if let (Expr::Symbol(head), Expr::Symbol(py) | Expr::Str(py)) =
-                                        (&lib[0], &lib[1])
-                                    {
-                                        if head == "library" {
-                                            Some(Opcode::PythonImport { path: py.clone() })
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                }
-                                Expr::Symbol(p) | Expr::Str(p) => {
-                                    if p.ends_with(".py") {
-                                        Some(Opcode::PythonImport { path: p.clone() })
-                                    } else {
-                                        Some(Opcode::ImportFile { path: p.clone() })
-                                    }
-                                }
-                                _ => None,
-                            };
-                            if let Some(opcode) = path_opcode {
+                            if let Some(opcode) = resolve_import_opcode(&items[2], current_funcs()) {
                                 self.compile(&items[1], code, false)?; // evaluate space-ref
                                 code.push(opcode);
                                 return Ok(());
@@ -825,7 +804,28 @@ impl VMCompiler {
                             code.push(Opcode::Test);
                             return Ok(());
                         }
+                        "translatePredicate" if items.len() == 2 => {
+                            let mut goal_vars = Vec::new();
+                            collect_pattern_vars(&items[1], &mut goal_vars);
+                            for v in &goal_vars {
+                                if !self.locals.contains(v) && !self.free_vars.contains(v) { self.free_vars.push(v.clone()); }
+                            }
+                            let (head, nargs) = match &items[1] {
+                                Expr::List(g) if !g.is_empty() => {
+                                    for arg in &g[1..] { self.compile(arg, code, false)?; }
+                                    (g[0].clone(), (g.len() - 1) as u8)
+                                }
+                                other => (other.clone(), 0),
+                            };
+                            code.push(Opcode::TranslatePredicate { head, nargs, free_vars_map: Arc::from(self.free_vars.clone()) });
+                            return Ok(());
+                        }
                         _ => {}
+                    }
+                }
+                if let (Expr::Symbol(head), Some(funcs)) = (&items[0], current_funcs()) {
+                    if let Some(expanded) = try_expand_translator_rule(head, &items[1..], funcs) {
+                        return self.compile(&expanded, code, is_tail);
                     }
                 }
                 // General application
@@ -933,6 +933,7 @@ impl VMCompiler {
         };
         let mut pattern_vars = Vec::new();
         collect_pattern_vars(pattern, &mut pattern_vars);
+        let seed_vars: Vec<String> = pattern_vars.iter().filter(|v| self.locals.contains(v)).cloned().collect();
         body_comp.locals.extend(pattern_vars.clone());
 
         let mut body_code = Vec::new();
@@ -945,9 +946,10 @@ impl VMCompiler {
         }
         code.push(Opcode::Let {
             pattern: pattern.clone(),
-            body_code: std::sync::Arc::from(body_code),
+            body_code: Arc::from(body_code),
             pattern_vars,
-            free_vars_map: std::sync::Arc::from(body_comp.free_vars),
+            seed_vars,
+            free_vars_map: Arc::from(body_comp.free_vars),
         });
         Ok(())
     }
@@ -1002,5 +1004,86 @@ fn collect_quote_vars(
             }
         }
         _ => {}
+    }
+}
+fn match_expr_pattern(
+    pattern: &Expr,
+    arg: &Expr,
+    subst: &mut HashMap<String, Expr>,
+) -> bool {
+    match (pattern, arg) {
+        (Expr::Symbol(s), _) if s.starts_with('$') => {
+            if let Some(existing) = subst.get(s) { existing == arg } else { subst.insert(s.clone(), arg.clone()); true }
+        }
+        (Expr::Symbol(s1), Expr::Symbol(s2)) => s1 == s2,
+        (Expr::Str(s1), Expr::Str(s2)) => s1 == s2,
+        (Expr::Number(n1), Expr::Number(n2)) => n1 == n2,
+        (Expr::List(p_items), Expr::List(a_items)) => {
+            p_items.len() == a_items.len() && p_items.iter().zip(a_items.iter()).all(|(p, a)| match_expr_pattern(p, a, subst))
+        }
+        _ => false,
+    }
+}
+fn subst_expr_template(
+    template: &Expr,
+    subst: &HashMap<String, Expr>,
+) -> Expr {
+    match template {
+        Expr::Symbol(s) if s.starts_with('$') => subst.get(s).cloned().unwrap_or_else(|| template.clone()),
+        Expr::List(items) => {
+            Expr::List(items.iter().map(|item| subst_expr_template(item, subst)).collect())
+        }
+        _ => template.clone(),
+    }
+}
+
+fn unquote_template(body: &Expr) -> &Expr {
+    match body {
+        Expr::List(q) if q.len() == 2 && matches!(&q[0], Expr::Symbol(s) if s == "quote") => &q[1],
+        _ => body,
+    }
+}
+
+fn try_expand_translator_rule(head: &str, args: &[Expr], funcs: &FnTable) -> Option<Expr> {
+    if !funcs.translator_rules.read().ok()?.contains(head) {
+        return None;
+    }
+    let arity = u8::try_from(args.len()).ok()?;
+    let clauses = lookup_user_clauses(head, arity, funcs)?;
+
+    clauses.iter().find_map(|(patterns, body)| {
+        let mut subst = HashMap::new();
+        let matched = patterns.iter().zip(args).all(|(p, a)| match_expr_pattern(p, a, &mut subst));
+        if matched {
+            Some(subst_expr_template(unquote_template(body), &subst))
+        } else {
+            None
+        }
+    })
+}
+
+fn resolve_path_opcode(path: &str, is_library: bool, funcs: Option<&FnTable>) -> Opcode {
+    if path.ends_with(".py") {
+        Opcode::PythonImport { path: path.to_string() }
+    } else if path.ends_with(".pl") {
+        Opcode::PrologImport { path: path.to_string() }
+    } else if is_library {
+        let import_dir = funcs.map(|f| f.import_dir.lock().unwrap().clone()).unwrap_or_default();
+        super::run::probe_library_import(path, &import_dir)
+    } else {
+        Opcode::ImportFile { path: path.to_string() }
+    }
+}
+
+fn resolve_import_opcode(spec: &Expr, funcs: Option<&FnTable>) -> Option<Opcode> {
+    match spec {
+        Expr::List(lib) if lib.len() == 2 => match (&lib[0], &lib[1]) {
+            (Expr::Symbol(head), Expr::Symbol(p) | Expr::Str(p)) if head == "library" => {
+                Some(resolve_path_opcode(p, true, funcs))
+            }
+            _ => None,
+        },
+        Expr::Symbol(p) | Expr::Str(p) => Some(resolve_path_opcode(p, false, funcs)),
+        _ => None,
     }
 }

@@ -29,6 +29,7 @@ pub enum CallFrameKind {
         next_idx: usize,
         pattern: Expr,
         pattern_vars: Vec<String>,
+        seed_vars: Vec<String>,
         free_vars_map: Arc<[String]>,
         body_code: Arc<[Opcode]>,
         results: ResultSet,

@@ -10,7 +10,7 @@ use crate::eval::{
     },
     io::{eval_readln, finish_println, load_metta_file, resolve_import_path},
     machine::{
-        budget::{ResultSet, calculate_cost, calculate_expr_cost, plain},
+        budget::{ResultSet, calculate_cost, calculate_expr_cost, plain, threaded_combinations},
         state::unify,
         step::run_rs,
         vm::state::next_fresh_id,
@@ -25,7 +25,11 @@ use crate::eval::{
     },
 };
 use crate::func::{FnTable, FunctionKind};
-use crate::parser::{Expr, atom_to_expr};
+use crate::parser::{Expr, atom_to_expr, expr_to_atom};
+#[cfg(feature = "prolog-bridge")]
+use crate::eval::prolog::ops::{consult_file, eval_translate_predicate_atom, sync_space};
+#[cfg(feature = "prolog-bridge")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::profile::ProfileGuard;
 use crate::space::{
     MatchResult,
@@ -55,6 +59,63 @@ thread_local! {
     static VM_DEPTH: Cell<u32> = Cell::new(0);
 }
 
+fn resolve_import_file(path: &str, ext: &str, import_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let direct = std::path::Path::new(path);
+    if direct.exists() { return Some(direct.to_path_buf()); }
+    let with_ext = format!("{path}.{ext}");
+    [std::path::PathBuf::from(&with_ext), import_dir.join(path), import_dir.join(&with_ext)]
+        .into_iter().find(|p| p.exists())
+}
+pub(super) fn import_search_dirs(import_dir: &std::path::Path) -> [std::path::PathBuf; 5] {
+    [std::path::PathBuf::from("."), import_dir.to_path_buf(), std::path::PathBuf::from("lib"), import_dir.join("../lib"), import_dir.join("lib")]
+}
+fn resolve_in_bases(path: &str, ext: &str, import_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let with_ext = format!("{path}.{ext}");
+    import_search_dirs(import_dir).iter().find_map(|b| {
+        let c = b.join(path);
+        if c.exists() { return Some(c); }
+        let c = b.join(&with_ext);
+        if c.exists() { Some(c) } else { None }
+    })
+}
+pub(super) fn probe_library_import(path: &str, import_dir: &std::path::Path) -> Opcode {
+    let dirs = import_search_dirs(import_dir);
+    if dirs.iter().any(|d| d.join(format!("{path}.metta")).exists()) { return Opcode::ImportFile { path: path.to_string() }; }
+    let (pl, py) = (format!("{path}.pl"), format!("{path}.py"));
+    for d in dirs {
+        if d.join(&pl).exists() { return Opcode::PrologImport { path: pl }; }
+        if d.join(&py).exists() { return Opcode::PythonImport { path: py }; }
+    }
+    Opcode::ImportFile { path: path.to_string() }
+}
+#[cfg(feature = "prolog-bridge")]
+fn consult_prolog_import(resolved: &std::path::Path) -> Result<(), String> {
+    consult_file(&resolved.to_string_lossy()).map_err(|e| e.to_string())
+}
+#[cfg(not(feature = "prolog-bridge"))]
+fn consult_prolog_import(_resolved: &std::path::Path) -> Result<(), String> {
+    Err("prolog-bridge feature not enabled".into())
+}
+#[cfg(feature = "prolog-bridge")]
+fn atom_has_symbol(atom: &Atom, target: &str) -> bool {
+    match atom {
+        Atom::Sym(s) => s.as_str() == target,
+        Atom::Expr(items) => items.iter().any(|item| atom_has_symbol(item, target)),
+        _ => false,
+    }
+}
+#[cfg(feature = "prolog-bridge")]
+fn sync_space_if_needed(goal_atom: &Atom, funcs: &FnTable) {
+    if !atom_has_symbol(goal_atom, "&self") {
+        return;
+    }
+    static LAST_SYNCED_STAMP: AtomicU64 = AtomicU64::new(u64::MAX);
+    let stamp = funcs.memo_stamp.load(Ordering::Relaxed);
+    if LAST_SYNCED_STAMP.swap(stamp, Ordering::Relaxed) != stamp {
+        let space_atoms = funcs.space.read().unwrap().get_atoms();
+        let _ = sync_space(&space_atoms);
+    }
+}
 fn replace_at_path(atom: &mut Atom, path: &[usize], val: Atom) {
     if path.is_empty() {
         *atom = val;
@@ -239,6 +300,8 @@ fn run_vm_inner(
                             Opcode::Transaction { .. } => "Opcode::Transaction",
                             Opcode::ImportFile { .. } => "Opcode::ImportFile",
                             Opcode::PythonImport { .. } => "Opcode::PythonImport",
+                            Opcode::PrologImport { .. } => "Opcode::PrologImport",
+                            Opcode::TranslatePredicate { .. } => "Opcode::TranslatePredicate",
                             Opcode::PyCall { .. } => "Opcode::PyCall",
                             Opcode::PyEval { .. } => "Opcode::PyEval",
                             Opcode::ImportDynamic => "Opcode::ImportDynamic",
@@ -295,6 +358,8 @@ fn run_vm_inner(
                         Opcode::Transaction { .. } => "Opcode::Transaction",
                         Opcode::ImportFile { .. } => "Opcode::ImportFile",
                         Opcode::PythonImport { .. } => "Opcode::PythonImport",
+                        Opcode::PrologImport { .. } => "Opcode::PrologImport",
+                        Opcode::TranslatePredicate { .. } => "Opcode::TranslatePredicate",
                         Opcode::PyCall { .. } => "Opcode::PyCall",
                         Opcode::PyEval { .. } => "Opcode::PyEval",
                         Opcode::ImportDynamic => "Opcode::ImportDynamic",
@@ -1202,6 +1267,7 @@ fn run_vm_inner(
                     pattern,
                     body_code,
                     pattern_vars,
+                    seed_vars,
                     free_vars_map,
                 } => {
                     let _profile = if cfg!(feature = "profile") {
@@ -1223,6 +1289,7 @@ fn run_vm_inner(
                             next_idx: 0,
                             pattern: pattern.clone(),
                             pattern_vars: pattern_vars.clone(),
+                            seed_vars: seed_vars.clone(),
                             free_vars_map: free_vars_map.clone(),
                             body_code: body_code.clone(),
                             results: Vec::new(),
@@ -1731,6 +1798,7 @@ fn run_vm_inner(
                         bodies: Vec<Arc<[Opcode]>>,
                         next_body_idx: usize,
                         last: ResultSet,
+                        current_env: Env,
                         free_vars_map: Arc<[String]>,
                     }
                     let mut resume = match state
@@ -1755,7 +1823,16 @@ fn run_vm_inner(
                                         r.next_body_idx = r.bodies.len();
                                     }
                                     VmExit::Normal => {
-                                        r.last = sub_res;
+                                        if sub_res.is_empty() {
+                                            r.last = Vec::new();
+                                            r.next_body_idx = r.bodies.len();
+                                        } else {
+                                            if let Some((_, env)) = sub_res.first() {
+                                                r.current_env = env.clone();
+                                                base_env = env.clone();
+                                            }
+                                            r.last = sub_res;
+                                        }
                                     }
                                     VmExit::YieldCall { .. } => unreachable!(),
                                 }
@@ -1766,6 +1843,7 @@ fn run_vm_inner(
                             bodies: bodies.clone(),
                             next_body_idx: 0,
                             last: Vec::new(),
+                            current_env: base_env.clone(),
                             free_vars_map: free_vars_map.clone(),
                         },
                     };
@@ -1780,8 +1858,9 @@ fn run_vm_inner(
                             &state.free_vars_bindings,
                         );
                         sub_state.locals = state.locals.clone();
+                        let env_to_pass = resume.current_env.clone();
                         state.resume_data = Some(Box::new(resume));
-                        yield_vm!(state, sub_state, base_env.clone());
+                        yield_vm!(state, sub_state, env_to_pass);
                     }
                     state.stack.push(resume.last);
                     state.ip += 1;
@@ -1795,6 +1874,7 @@ fn run_vm_inner(
                         bodies: Vec<Arc<[Opcode]>>,
                         next_body_idx: usize,
                         first: ResultSet,
+                        current_env: Env,
                         free_vars_map: Arc<[String]>,
                     }
                     let mut resume = match state
@@ -1822,7 +1902,16 @@ fn run_vm_inner(
                                     }
                                     VmExit::Normal => {
                                         if r.next_body_idx == 1 {
-                                            r.first = sub_res;
+                                            r.first = sub_res.clone();
+                                        }
+                                        if sub_res.is_empty() {
+                                            r.first = Vec::new();
+                                            r.next_body_idx = r.bodies.len();
+                                        } else {
+                                            if let Some((_, env)) = sub_res.first() {
+                                                r.current_env = env.clone();
+                                                base_env = env.clone();
+                                            }
                                         }
                                     }
                                     VmExit::YieldCall { .. } => unreachable!(),
@@ -1834,6 +1923,7 @@ fn run_vm_inner(
                             bodies: bodies.clone(),
                             next_body_idx: 0,
                             first: Vec::new(),
+                            current_env: base_env.clone(),
                             free_vars_map: free_vars_map.clone(),
                         },
                     };
@@ -1848,8 +1938,9 @@ fn run_vm_inner(
                             &state.free_vars_bindings,
                         );
                         sub_state.locals = state.locals.clone();
+                        let env_to_pass = resume.current_env.clone();
                         state.resume_data = Some(Box::new(resume));
-                        yield_vm!(state, sub_state, base_env.clone());
+                        yield_vm!(state, sub_state, env_to_pass);
                     }
                     state.stack.push(resume.first);
                     state.ip += 1;
@@ -2186,28 +2277,44 @@ fn run_vm_inner(
                     // reuse existing apply.rs Frame::PythonImport logic directly
                     let _space_rs = state.stack.pop(); // space-ref consumed but unused for Python
                     let import_dir = funcs.import_dir.lock().unwrap().clone();
-                    let py_path = std::path::Path::new(&path);
-                    let resolved = if py_path.exists() {
-                        Some(py_path.to_path_buf())
-                    } else {
-                        let with_ext = format!("{}.py", path);
-                        let candidates = [
-                            std::path::PathBuf::from(&with_ext),
-                            import_dir.join(&path),
-                            import_dir.join(&with_ext),
-                        ];
-                        candidates.into_iter().find(|p| p.exists())
-                    }
-                    .ok_or_else(|| {
-                        format!(
-                            "import!: cannot find Python file '{}' (searched CWD and '{}')",
-                            path,
-                            import_dir.display()
-                        )
+                    let resolved = resolve_import_file(&path, "py", &import_dir).ok_or_else(|| {
+                        format!("import!: cannot find Python file '{}' (searched CWD and '{}')", path, import_dir.display())
                     })?;
                     eval_py_import_library(&resolved)?;
                     state.stack.push(plain(vec![Atom::sym("true")]));
                     state.ip += 1;
+                }
+                Opcode::PrologImport { path } => {
+                    let _space_rs = state.stack.pop();
+                    let import_dir = funcs.import_dir.lock().unwrap().clone();
+                    let resolved = resolve_import_file(&path, "pl", &import_dir).ok_or_else(|| {
+                        format!("import!: cannot find Prolog file '{}' (searched CWD and '{}')", path, import_dir.display())
+                    })?;
+                    consult_prolog_import(&resolved)?;
+                    state.stack.push(plain(vec![Atom::sym("true")]));
+                    state.ip += 1;
+                }
+                Opcode::TranslatePredicate { head, nargs, free_vars_map: _ } => {
+                    #[cfg(feature = "prolog-bridge")]
+                    {
+                        let head_atom = expr_to_atom(head);
+                        let mut arg_sets: Vec<ResultSet> = (0..*nargs)
+                            .map(|_| state.stack.pop().ok_or("VM stack underflow on TranslatePredicate arg"))
+                            .collect::<Result<_, _>>()?;
+                        arg_sets.reverse();
+                        let mut results: ResultSet = Vec::new();
+                        for (combo, combo_env) in threaded_combinations(&arg_sets) {
+                            let mut goal_items = vec![head_atom.clone()];
+                            for arg in &combo { goal_items.push(subst_atom(arg, &combo_env)); }
+                            let goal_atom = Atom::Expr(expr_data(goal_items));
+                            sync_space_if_needed(&goal_atom, funcs);
+                            results.extend(eval_translate_predicate_atom(&goal_atom, &base_env, &state.free_vars_map, &state.free_vars_bindings).map_err(|e| e.to_string())?);
+                        }
+                        state.stack.push(results);
+                        state.ip += 1;
+                    }
+                    #[cfg(not(feature = "prolog-bridge"))]
+                    { return Err("prolog-bridge feature not enabled".into()); }
                 }
                 Opcode::PyCall { expr } => {
                     // Direct VM opcode for py-call — bypasses dispatch.rs entirely.
@@ -2267,55 +2374,25 @@ fn run_vm_inner(
                         .unwrap_or_else(|| Atom::sym("&self"));
 
                     let is_py = path.ends_with(".py");
+                    let is_pl = path.ends_with(".pl");
                     if is_py {
                         let import_dir = funcs.import_dir.lock().unwrap().clone();
-                        let py_path = std::path::Path::new(path.as_ref());
-                        let resolved = if py_path.exists() {
-                            Some(py_path.to_path_buf())
-                        } else {
-                            let with_ext = format!("{}.py", path);
-                            let py_ext = std::path::Path::new(&with_ext);
-                            if py_ext.exists() {
-                                Some(py_ext.to_path_buf())
-                            } else {
-                                let in_dir = import_dir.join(path.as_ref());
-                                if in_dir.exists() {
-                                    Some(in_dir)
-                                } else {
-                                    let in_dir_ext = import_dir.join(&with_ext);
-                                    if in_dir_ext.exists() {
-                                        Some(in_dir_ext)
-                                    } else {
-                                        None
-                                    }
-                                }
-                            }
-                        }
-                        .ok_or_else(|| {
-                            format!(
-                                "import!: cannot find Python file '{}' (searched CWD and '{}')",
-                                path,
-                                import_dir.display()
-                            )
-                        })?;
+                        let resolved = resolve_import_file(path.as_ref(), "py", &import_dir)
+                            .ok_or_else(|| format!("import!: cannot find Python file '{}' (searched CWD and '{}')", path, import_dir.display()))?;
                         eval_py_import_library(&resolved)?;
+                        state.stack.push(plain(vec![Atom::sym("true")]));
+                    } else if is_pl {
+                        let import_dir = funcs.import_dir.lock().unwrap().clone();
+                        let resolved = resolve_in_bases(path.as_ref(), "pl", &import_dir)
+                            .ok_or_else(|| format!("import!: cannot find Prolog file '{}' (searched CWD and '{}')", path, import_dir.display()))?;
+                        consult_prolog_import(&resolved)?;
                         state.stack.push(plain(vec![Atom::sym("true")]));
                     } else {
                         let import_dir = funcs.import_dir.lock().unwrap().clone();
-                        let resolved =
-                            resolve_import_path(path.as_ref(), &import_dir).ok_or_else(|| {
-                                format!(
-                                    "import!: cannot find '{}' (searched CWD and '{}')",
-                                    path,
-                                    import_dir.display()
-                                )
-                            })?;
-                        let new_dir = resolved
-                            .parent()
-                            .unwrap_or(std::path::Path::new("."))
-                            .to_path_buf();
-                        let prev_dir =
-                            std::mem::replace(&mut *funcs.import_dir.lock().unwrap(), new_dir);
+                        let resolved = resolve_import_path(path.as_ref(), &import_dir)
+                            .ok_or_else(|| format!("import!: cannot find '{}' (searched CWD and '{}')", path, import_dir.display()))?;
+                        let new_dir = resolved.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+                        let prev_dir = std::mem::replace(&mut *funcs.import_dir.lock().unwrap(), new_dir);
                         let atoms = load_metta_file(&resolved, &space_ref, &base_env, funcs)?;
                         *funcs.import_dir.lock().unwrap() = prev_dir;
                         state.stack.push(plain(atoms));
@@ -2774,16 +2851,11 @@ fn run_vm_inner(
                         results.extend(sub_results);
                     }
                     CallFrameKind::Case { results, .. } => {
-                        results.extend(sub_results);
+                        let merged: Vec<(Atom, Env)> = sub_results.into_iter().map(|(atom, env)| (atom, prepend_chain(env, &base_env))).collect();
+                        results.extend(merged);
                     }
                     CallFrameKind::Call { results, .. } => {
-                        let merged: Vec<(Atom, Env)> = sub_results
-                            .into_iter()
-                            .map(|(atom, env)| {
-                                let merged_env = prepend_chain(env, &base_env);
-                                (atom, merged_env)
-                            })
-                            .collect();
+                        let merged: Vec<(Atom, Env)> = sub_results.into_iter().map(|(atom, env)| (atom, prepend_chain(env, &base_env))).collect();
                         results.extend(merged);
                     }
                     CallFrameKind::Eval { results, .. } => {
@@ -3214,46 +3286,52 @@ fn dispatch_call(
 
 /// Run the next iteration of the Let opcode in flat frame-based control flow.
 fn run_next_let_iteration(state: &mut VMState, funcs: &FnTable) -> Result<Option<Env>, String> {
+    let saved_base_env = state.frames.last().map(|f| f.saved_base_env.clone()).unwrap_or_else(Env::new);
+    let Some(frame) = state.frames.last_mut() else { return Ok(None); };
+    let CallFrameKind::Let {
+        value_rs,
+        next_idx,
+        pattern,
+        pattern_vars,
+        seed_vars,
+        free_vars_map,
+        body_code,
+        results: _,
+    } = &mut frame.kind else {
+        return Ok(None);
+    };
+
     let mut to_run = None;
-    if let Some(frame) = state.frames.last_mut() {
-        if let CallFrameKind::Let {
-            value_rs,
-            next_idx,
-            pattern,
-            pattern_vars,
-            free_vars_map,
-            body_code,
-            results: _,
-        } = &mut frame.kind
-        {
-            while *next_idx < value_rs.len() {
-                let (value, value_env) = &value_rs[*next_idx];
-                *next_idx += 1;
-                if let Some(match_env) = try_match_one(pattern, value, &Env::new(), funcs)? {
-                    let body_env = prepend_chain(match_env, value_env);
-                    let mut locals_to_push = Vec::new();
-                    for var in pattern_vars {
-                        let bound = body_env.get(var).unwrap_or(Atom::sym("()"));
-                        locals_to_push.push((bound, Env::new()));
-                    }
-                    frame.locals_to_pop = locals_to_push.len();
-                    to_run = Some((
-                        body_code.clone(),
-                        free_vars_map.clone(),
-                        body_env,
-                        locals_to_push,
-                    ));
-                    break;
-                } else {
-                    logical_failure(|| {
-                        format!(
-                            "warn: let pattern {} does not match value {}",
-                            pattern.to_string(),
-                            value.to_sexpr_string(),
-                        )
-                    });
-                }
+    while *next_idx < value_rs.len() {
+        let (value, value_env) = &value_rs[*next_idx];
+        *next_idx += 1;
+        let mut seed_env = Env::new();
+        for var in seed_vars.iter() {
+            if let Some(bound) = lookup(&saved_base_env, var) { seed_env = bind(&seed_env, var, bound); }
+        }
+        if let Some(match_env) = try_match_one(pattern, value, &seed_env, funcs)? {
+            let body_env = prepend_chain(match_env, value_env);
+            let mut locals_to_push = Vec::new();
+            for var in pattern_vars {
+                let bound = body_env.get(var).unwrap_or(Atom::sym("()"));
+                locals_to_push.push((bound, Env::new()));
             }
+            frame.locals_to_pop = locals_to_push.len();
+            to_run = Some((
+                body_code.clone(),
+                free_vars_map.clone(),
+                body_env,
+                locals_to_push,
+            ));
+            break;
+        } else {
+            logical_failure(|| {
+                format!(
+                    "warn: let pattern {} does not match value {}",
+                    pattern.to_string(),
+                    value.to_sexpr_string(),
+                )
+            });
         }
     }
 
@@ -3529,6 +3607,8 @@ fn body_has_side_effect(body_code: &[Opcode]) -> bool {
             Opcode::AddAtom { .. }
                 | Opcode::RemAtom { .. }
                 | Opcode::PythonImport { .. }
+                | Opcode::PrologImport { .. }
+                | Opcode::TranslatePredicate { .. }
                 | Opcode::ImportDynamic
                 | Opcode::Println
                 | Opcode::Readln

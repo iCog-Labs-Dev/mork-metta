@@ -381,6 +381,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlopen2"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e2c5bd4158e66d1e215c49b837e11d62f3267b30c92f1d171c4d3105e3dc4d4"
+dependencies = [
+ "dlopen2_derive",
+ "libc",
+ "once_cell",
+ "winapi",
+]
+
+[[package]]
+name = "dlopen2_derive"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fbbb781877580993a8707ec48672673ec7b81eeba04cfd2310bd28c08e47c8f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -848,6 +871,7 @@ name = "mork-metta"
 version = "0.1.0"
 dependencies = [
  "dashu",
+ "dlopen2",
  "lasso",
  "libloading 0.8.9",
  "memmap2",
@@ -859,6 +883,7 @@ dependencies = [
  "rand 0.8.6",
  "rayon",
  "rustc-hash",
+ "thiserror",
 ]
 
 [[package]]

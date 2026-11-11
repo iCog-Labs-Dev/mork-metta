@@ -17,4 +17,6 @@ pub fn register_builtins(funcs: &FnTable) {
     io::register_io_builtins(funcs);
     state::register_state_builtins(funcs);
     types::register_type_builtins(funcs);
+    #[cfg(feature = "prolog-bridge")]
+    crate::eval::prolog::builtins::register_prolog_builtins(funcs);
 }

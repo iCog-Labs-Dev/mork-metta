@@ -9,6 +9,8 @@
 pub mod forms;
 pub mod io;
 pub mod machine;
+#[cfg(feature = "prolog-bridge")]
+pub mod prolog;
 pub mod python;
 pub mod runtime;
 pub mod shared;

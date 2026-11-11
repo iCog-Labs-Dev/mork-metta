@@ -10,6 +10,7 @@
     profile = []
     python-bridge = ["dep:pyo3"]
     plugins = ["dep:libloading"]
+    prolog-bridge = ["dep:dlopen2"]
 [dependencies]
     mork = { git = "https://github.com/iCog-Labs-Dev/MORK", branch = "chore/cleanup" }
     mork-expr = { git = "https://github.com/iCog-Labs-Dev/MORK", branch = "chore/cleanup" }
@@ -17,6 +18,8 @@
     pathmap = { git = "https://github.com/DagmawiKK/PathMap" }
     pyo3 = { version = "0.23", optional = true, features = ["auto-initialize"] }
     libloading = { version = "0.8", optional = true }
+    dlopen2 = { version = "0.8", optional = true }
+    thiserror = "2"
     rayon = "1"
     dashu = "0.4"
     rand = "0.8"
